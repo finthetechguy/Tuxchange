@@ -118,7 +118,7 @@ EOF
     done
   fi
   if [ ! -f "$KEYDIR/aes_keys.txt" ]; then
-    echo "NOTE: no $KEYDIR/aes_keys.txt, so the daemon will not derive a link key."
+    echo "WARNING: no $KEYDIR/aes_keys.txt, so the daemon cannot derive a link key."
     echo "      See the wiki page \"Getting your keys\"."
   fi
 
@@ -126,12 +126,11 @@ EOF
   systemd-analyze verify "$UNIT" 2>&1 | grep -v '^$' && echo "(verify emitted the above)"
   systemctl enable tuxchange.service
   echo
-  echo "installed to $LIB. Re-run this after updating the checkout. Nothing is running yet:"
+  echo "INSTALLED to $LIB."
+  echo "To start tuxchange from CLI:"
   echo "  sudo systemctl start tuxchange      # or: sudo $0 start"
   echo "  systemctl status tuxchange"
   echo "  journalctl -u tuxchange -f"
-  echo
-  echo "This unit can restart itself; it cannot reboot the machine."
   ;;
 uninstall)
   need_root
