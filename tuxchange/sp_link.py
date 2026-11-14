@@ -658,10 +658,12 @@ class Link:
                 ch = self.channels[self.chan_idx]
                 ok = T.tune(self.a.iface, ch, lambda m, l=2: self.log(m, l))
                 heard, actual = ok, None
-                if ok is None:
-                    # iw reports no channel for a monitor vif; measure where the radio went.
+                if not ok:
+                    # iw reports no channel for a monitor vif and in mixed mode it refuses the change with
+                    # (EBUSY) while the radio stays on channel 1
                     actual = self.detect_channel(1.0, enough=5)
-                    ok = actual in (None, ch)     # hearing nothing is not proof it stayed put
+                    if ok is None:
+                        ok = actual in (None, ch)
                     heard = actual is not None
                 if ok:
                     self.log('  hunting on channel %d%s'

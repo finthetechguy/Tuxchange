@@ -10,7 +10,8 @@
 #   mixed   a plain monitor vif sends and sniffs while a station vif of our own ($MON-sta) carries
 #           our MAC, unassociated, so the chip ACKs it. For adapters without active monitor support.
 #           The adapter's own vif is left down with its MAC untouched; a station vif we create is
-#           one that neither iwd nor wpa_supplicant will try to connect.
+#           one that neither iwd nor wpa_supplicant will try to connect. Channel 1 only: an
+#           unassociated station holds no channel
 # SP_MODE=auto (default) uses active when the adapter supports it and mixed otherwise.
 set -u
 ACTION=${1:-}
@@ -169,9 +170,10 @@ up)
     timeout 10 ip link set "$MON" mtu 2000 2>/dev/null \
       || echo "WARNING: could not raise $MON MTU; 1452-byte segments will fail with EMSGSIZE"
     timeout 15 ip link set "$MON" up || { echo "could not bring $MON up"; exit 1; }
-    # Tune while the monitor is alone on the radio, so the station vif comes up on this channel.
-    timeout 10 iw dev "$MON" set channel "${CHANNELS%%,*}" 2>/dev/null \
-      || echo "WARNING: could not tune $MON to channel ${CHANNELS%%,*}"
+    # No tuning here: an unassociated station holds no channel, so once it is up mac80211 puts the
+    # radio on its default channel (channel 1) and refuses monitor retunes with EBUSY.
+    [ "$CHANNELS" = 1 ] \
+      || echo "NOTE: mixed mode works on channel 1 only; the rest of SP_CHANNELS=$CHANNELS is ignored"
     if ! timeout 15 iw phy "$PHY" interface add "$ACKV" type managed; then
       echo "could not create a station interface on $IFACE"; exit 1
     fi
