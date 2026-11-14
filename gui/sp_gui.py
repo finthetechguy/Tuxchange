@@ -442,7 +442,11 @@ class HomePage(Page):
         every = int(s.get('rotate_every_s') or 0)
         if not every:
             return 'fixed, derived from the store path'
-        held = human_secs(s.get('identity_age_s') or 0)
+        age = s.get('identity_age_s')
+        if age is None:              # a change is already due at the next pass boundary
+            return 'on a timer: change due at the end of this listening pass (%d change(s) so far)' \
+                   % (s.get('rotations') or 0)
+        held = human_secs(age)
         return 'on a timer: in use for %s (%d change(s) so far)' \
                % (held, s.get('rotations') or 0)
 

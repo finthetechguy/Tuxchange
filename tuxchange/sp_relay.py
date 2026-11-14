@@ -1090,7 +1090,8 @@ class Relay:
                            if self.settings_file() else self.a.store),
             'rotate_identity': bool(self.a.rotate_identity),
             'rotate_every_s': self.rotate_seconds(),
-            'identity_age_s': round(time.time() - self.identity_since, 1),
+            'identity_age_s': (round(time.time() - self.identity_since, 1)
+                               if self.identity_since > 0 else None),  # 0.0 means 'due now'
             'next_rotation_s': (None if (self.a.rotate_identity or not self.rotate_seconds())
                                 else max(0.0, round(self.identity_since + self.rotate_seconds()
                                                     - time.time(), 1))),
