@@ -10,7 +10,7 @@ _If your adapter is not listed, it is unlikely to work, although you can test an
 | ✅ Tested, works | Realtek RTL8192EU, e.g. TP-Link TL-WN823N v2/v3 (USB) | `rtl8xxxu` | Mixed | Slower, successfully exchanges. |
 | 🟡 Expected, untested | MediaTek MT7610U / MT7612U, e.g. Alfa AWUS036ACHM, AWUS036ACM, Netgear A6210 (USB) | `mt76x0u`, `mt76x2u` | Active monitor | Others report active monitor ACKing correctly on these. |
 | 🟡 Expected, untested | MediaTek MT7601U, cheap 2.4 GHz "150 Mbps" USB sticks | `mt7601u` | Active monitor | Only one interface can be up at a time. |
-| 🟡 Untested | Realtek RTL8188EU/CU/FU, RTL8192CU, RTL8723BU | `rtl8xxxu` | Mixed | Same driver as the tested RTL8192EU, so mixed mode might work. |
+| 🟡 Untested | Realtek RTL8188EU/CU/FU, RTL8192CU, RTL8723BU, etc... | `rtl8xxxu` | Mixed | Same driver as the tested RTL8192EU, so mixed mode might work. |
 | 🟡 Untested | Realtek RTL8812BU / RTL8822BU / RTL8821CU / RTL8822CU (USB) | `rtw88` | Mixed | The driver programs the station's MAC into hardware, so mixed mode should ACK. |
 | 🟡 Untested | Ralink RT3070 / RT5370 / RT5572 (USB) | `rt2800usb` | Mixed | The hardware can ACK a set MAC; not tried through the kernel driver yet. |
 | 🟡 Untested | Atheros AR9271, e.g. Alfa AWUS036NHA, TP-Link TL-WN722N v1 (USB) | `ath9k_htc` | Mixed | No active monitor (unlike PCIe `ath9k`). |
