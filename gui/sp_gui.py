@@ -533,6 +533,13 @@ class EncountersPage(Page):
         total = max(rep.get('total', len(enc)), len(enc))
         g = self.group('Encounters', ('%d recorded, newest first.' % total) if total == len(enc)
                        else '%d recorded; the newest %d are shown.' % (total, len(enc)))
+        if enc:
+            g.set_header_suffix(Gtk.Button(
+                label='Clear', valign=Gtk.Align.CENTER, margin_bottom=6,
+                tooltip_text='Delete the recorded encounter history',
+                css_classes=['destructive-action']))
+            g.get_header_suffix().connect(
+                'clicked', lambda _b, n=total: self.app.dialog_clear_encounters(n))
         if not enc:
             g.add(row('Nothing yet',
                       'A console has to be in range and past its own StreetPass '
@@ -917,6 +924,17 @@ class RelayApp(Adw.Application):
                 self.act('block', then='Blocked', mac=e.get_text().strip(),
                          note=n.get_text().strip())
         d.connect('response', resp)
+        d.present(self.win)
+
+    def dialog_clear_encounters(self, n):
+        d = Adw.AlertDialog(heading='Clear the encounter history?',
+                            body='All %d recorded encounter(s) will be deleted. Messages in the '
+                                 'inbox and outbox are not touched.\n\nThis cannot be undone.' % n)
+        d.add_response('cancel', 'Cancel')
+        d.add_response('ok', 'Clear')
+        d.set_response_appearance('ok', Adw.ResponseAppearance.DESTRUCTIVE)
+        d.connect('response', lambda _d, r: r == 'ok' and self.act(
+            'encounters_clear', then='Encounters cleared'))
         d.present(self.win)
 
     def dialog_clear_filter(self, n):

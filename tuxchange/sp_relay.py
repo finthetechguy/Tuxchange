@@ -590,6 +590,10 @@ class Control:
         if cmd == 'encounters':
             return {'ok': True, 'encounters': r.encounters(int(req.get('limit', 200))),
                     'total': r.encounter_count()}
+        if cmd == 'encounters_clear':
+            n = r.clear_encounters()
+            r.log('  cleared %d encounter(s) from the history' % n)
+            return {'ok': True, 'cleared': n}
         if cmd == 'denylist':
             now = time.time()
             return {'ok': True,
@@ -1202,6 +1206,18 @@ class Relay:
                 return sum(1 for ln in f if ln.strip())
         except OSError:
             return 0
+
+    def clear_encounters(self):
+        """Forget the encounter history; returns how many records went."""
+        n = self.encounter_count()
+        try:
+            os.remove(self.encounters_path())
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            self.log('  could not clear the encounters: %s' % e)
+            return 0
+        return n
 
     def _decline(self, link, reason, msg):
         """Serve this peer nothing, and make sure the reason reaches both logs."""
@@ -2079,6 +2095,12 @@ def _selftest():
                 and any(not m['servable'] for tt in st_['store']['titles']
                         for m in tt['messages']) if len(st_['store']['titles']) > 1 else True)
 
+            r.note_encounter({'peer': 'aa:bb:cc:dd:ee:ff', 'result': 'blocked'})
+            ec = send_command(sockp, 'encounters_clear')
+            chk('the encounter history can be cleared from the socket',
+                ec['ok'] and ec['cleared'] >= 1
+                and send_command(sockp, 'encounters')['encounters'] == [])
+
             chk('the denylist view has the blocklist and the filter',
                 {'blocked', 'filter', 'filter_max', 'backing_off'}
                 <= set(send_command(sockp, 'denylist')))
@@ -2473,7 +2495,7 @@ def main():
 
     ct = sub.add_parser('ctl', help='talk to a running daemon')
     ct.add_argument('command', choices=['status', 'pause', 'resume', 'toggle', 'stop', 'import',
-                                        'forget', 'seed', 'store', 'encounters', 'denylist',
+                                        'forget', 'seed', 'store', 'encounters', 'encounters_clear', 'denylist',
                                         'log', 'block', 'unblock', 'unfilter', 'title_remove',
                                         'message_remove', 'rotate', 'set_adapter', 'set_logs',
                                         'set_store'])
