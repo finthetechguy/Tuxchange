@@ -322,8 +322,7 @@ class HomePage(Page):
         if unit.get('UnitFileState'):
             g.add(row('Starts at boot', unit['UnitFileState']))
         if unit.get('NRestarts', '0') not in ('0', ''):
-            g.add(row('Automatic restarts', '%s since it was last started by hand. The watchdog '
-                                            'restarts only the service.'
+            g.add(row('Automatic restarts', '%s since it was last started manually.'
                       % unit['NRestarts']))
         return active
 
@@ -402,7 +401,7 @@ class HomePage(Page):
 
         if st is None:
             g = self.group('Exchanges')
-            g.add(row('The daemon is not answering on its control socket',
+            g.add(row('The daemon is not responding',
                       why if active else 'Start the service above.'))
             return
         s = st['status']
@@ -439,12 +438,12 @@ class HomePage(Page):
     @staticmethod
     def _identity_mode(s):
         if s.get('rotate_identity'):
-            return 'a new MAC every pass, which no real console can do'
+            return 'a new MAC every pass'
         every = int(s.get('rotate_every_s') or 0)
         if not every:
             return 'fixed, derived from the store path'
         held = human_secs(s.get('identity_age_s') or 0)
-        return 'on a timer: this one has been in use for %s (%d change(s) so far)' \
+        return 'on a timer: in use for %s (%d change(s) so far)' \
                % (held, s.get('rotations') or 0)
 
     def _rotation_row(self, s):
@@ -541,9 +540,8 @@ class EncountersPage(Page):
             g.get_header_suffix().connect(
                 'clicked', lambda _b, n=total: self.app.dialog_clear_encounters(n))
         if not enc:
-            g.add(row('Nothing yet',
-                      'A console has to be in range and past its own StreetPass '
-                      'rate limit before it will engage.'))
+            g.add(row('None yet',
+                      'Exchanges will appear here.'))
             return
         for e in enc:
             when = time.strftime('%d %b %H:%M:%S', time.localtime(e.get('when', 0)))
@@ -634,11 +632,11 @@ class OutboxPage(StorePage):
         super().__init__(app, 'Outbox', 'document-send-symbolic')
 
     def header(self, st, titles):
-        shown, registered, cap = len(titles), len(st['titles']), st['max_titles']
-        note = ('%d title(s) served, %d registered in the store, %d is the format\'s limit.'
-                % (shown, registered, cap))
+        shown, registered = len(titles), len(st['titles'])
+        note = ('%d title(s) served, %d registered in the store.'
+                % (shown, registered))
         if registered > SOFT_TITLE_CAP:
-            note += (' No console we have dumped enables more than %d.' % SOFT_TITLE_CAP)
+            note += (' Software title cap reached: %d.' % SOFT_TITLE_CAP)
         g = self.group('Served to consoles', 'CEC data served to consoles. ' + note)
         box = Gtk.Box(spacing=6, halign=Gtk.Align.END, valign=Gtk.Align.CENTER, margin_bottom=6)
         for label, cb in (('Create Mii Plaza Message', self.app.dialog_identity),
@@ -733,7 +731,7 @@ class DenylistPage(Page):
                        'Like a 3DS, Tuxchange refuses a MAC once it has exchanged with it, and '
                        'exchanges with that console again when it rotates it\'s MAC.\n Max: %d' % rep['filter_max'])
         if rep['filter']:
-            b = Gtk.Button(label='Clear filter', valign=Gtk.Align.CENTER, margin_bottom=6)
+            b = Gtk.Button(label='Clear', valign=Gtk.Align.CENTER, margin_bottom=6)
             b.connect('clicked', lambda *_a: self.app.dialog_clear_filter(len(rep['filter'])))
             g.set_header_suffix(b)
         else:
@@ -874,9 +872,9 @@ class RelayApp(Adw.Application):
         """Fire a control command, report the outcome, refresh."""
         def done(rep):
             if isinstance(rep, Exception):
-                self.error('The relay did not accept that', str(rep))
+                self.error('Not accepted', str(rep))
             elif not rep.get('ok', False):
-                self.error('The relay refused', rep.get('error', 'no reason given'))
+                self.error('Error', rep.get('error', 'no reason given'))
             else:
                 self.toast(then or ('%s done' % cmd))
             self.refresh_now()
