@@ -49,11 +49,10 @@ Working end to end:
 
 | | |
 |---|---|
-| Radio | An Wi-Fi chipset that supports active monitor mode. **`ath9k` recommended** |
+| Radio | An compatible Wi-Fi chipset that supports active monitor or mixed mode. **`ath9k` recommended** |
 | Console | Any 3DS-family console. Exchanging does not require homebrew, but dumping the keys needs GodMode9. |
 
-Active monitor mode matters because the card must send hardware ACKs for the console's frames.
-Without them the console gives up partway through the handshake.
+See [COMPATIBILITY](COMPATIBILITY.md) for a list of tested, untested, known-incompatible devices.
 
 ## Dependencies
 
