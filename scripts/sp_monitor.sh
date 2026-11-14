@@ -4,7 +4,9 @@
 # Settings come from SP_IFACE, SP_MON, SP_STORE, SP_MAC, SP_MODE and SP_CHANNELS in the environment.
 #
 # Two ways to make the hardware ACK the console:
-#   active  an active monitor vif carries our MAC (ath9k, most mt76).
+#   active  an active monitor vif carries our MAC (ath9k, most mt76). A plain monitor ($MON-ctx) is
+#           brought up first and mac80211 gives an active monitor no channel of its
+#           own, so without the plain one every channel change is silently ignored.
 #   mixed   a plain monitor vif sends and sniffs while a station vif of our own ($MON-sta) carries
 #           our MAC, unassociated, so the chip ACKs it. For adapters without active monitor support.
 #           The adapter's own vif is left down with its MAC untouched; a station vif we create is
@@ -16,6 +18,7 @@ IFACE=${SP_IFACE:-}
 MON=${SP_MON:-mon0}
 MODE=${SP_MODE:-auto}
 ACKV=$MON-sta                       # mixed mode's station vif; 15 characters at most
+CTXV=$MON-ctx                       # active mode's plain monitor that holds the channel
 CHANNELS=${SP_CHANNELS:-1}
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/.." && pwd)
@@ -60,7 +63,7 @@ pick_iface() {
   # can do mixed mode, but never one that is connected, so the machine's own Wi-Fi is left alone.
   local i first= mixed=
   for i in $(iw dev 2>/dev/null | sed -n 's/^\tInterface //p'); do
-    [ "$i" = "$MON" ] || [ "$i" = "$ACKV" ] && continue
+    [ "$i" = "$MON" ] || [ "$i" = "$ACKV" ] || [ "$i" = "$CTXV" ] && continue
     if [ "$MODE" != mixed ] && can_active_monitor "$i"; then
       if [ "$(iface_driver "$i")" = "ath9k" ]; then
         echo "$i"
@@ -155,6 +158,7 @@ up)
   release_iwd
   timeout 10 iw dev "$MON" del 2>/dev/null
   timeout 10 iw dev "$ACKV" del 2>/dev/null
+  timeout 10 iw dev "$CTXV" del 2>/dev/null
   if [ "$MODE" = mixed ]; then
     can_monitor "$IFACE" || { echo "$IFACE cannot run a monitor interface"; exit 1; }
     PHY=$(cat "/sys/class/net/$IFACE/phy80211/name")
@@ -200,6 +204,16 @@ up)
   # Down before the monitor comes up: the managed vif holds the channel otherwise, some drivers
   # program the full MAC only for the first vif up (mt76x0/mt76x2), and some allow one vif (mt7601u).
   timeout 15 ip link set "$IFACE" down 2>/dev/null
+  # The plain monitor must be up before the active one
+  PHY=$(cat "/sys/class/net/$IFACE/phy80211/name")
+  if timeout 15 iw phy "$PHY" interface add "$CTXV" type monitor \
+      && timeout 15 ip link set "$CTXV" up; then
+    timeout 10 iw dev "$CTXV" set channel "${CHANNELS%%,*}" 2>/dev/null \
+      || echo "WARNING: could not tune $CTXV to channel ${CHANNELS%%,*}"
+  else
+    timeout 10 iw dev "$CTXV" del 2>/dev/null
+    echo "WARNING: no plain monitor beside $MON; the radio will stay on one channel"
+  fi
   timeout 15 ip link set "$MON" up || { echo "could not bring $MON up"; exit 1; }
   echo "active monitor $MON up as $MAC (the hardware will ACK frames addressed to it)"
   ;;
@@ -208,6 +222,7 @@ down)
   [ -r "$RUN_IFACE" ] && IFACE=$(cat "$RUN_IFACE")
   timeout 10 iw dev "$MON" del 2>/dev/null
   timeout 10 iw dev "$ACKV" del 2>/dev/null
+  timeout 10 iw dev "$CTXV" del 2>/dev/null
   restore_radio
   if [ -e "$WAS_UP" ] && [ -n "$IFACE" ]; then
     if timeout 15 ip link set "$IFACE" up 2>/dev/null; then

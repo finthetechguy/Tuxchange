@@ -531,11 +531,13 @@ class Link:
         self.session = None
         self.abandon_attempt()
 
-    def detect_channel(self, secs=2.0):
+    def detect_channel(self, secs=2.0, enough=None):
         """The channel the radio is really on, from the radiotap of received frames."""
         from collections import Counter
         c, end = Counter(), time.time() + secs
         while time.time() < end:
+            if enough and c and c.most_common(1)[0][1] >= enough:
+                break
             if not select.select([self.sock], [], [], 0.2)[0]:
                 continue
             try:
@@ -654,16 +656,25 @@ class Link:
                     and time.time() >= self.next_hop):
                 self.chan_idx = (self.chan_idx + 1) % len(self.channels)
                 ch = self.channels[self.chan_idx]
-                if T.tune(self.a.iface, ch, lambda m, l=2: self.log(m, l)):
-                    self.log('  hunting on channel %d' % ch, 2)
+                ok = T.tune(self.a.iface, ch, lambda m, l=2: self.log(m, l))
+                heard, actual = ok, None
+                if ok is None:
+                    # iw reports no channel for a monitor vif; measure where the radio went.
+                    actual = self.detect_channel(1.0, enough=5)
+                    ok = actual in (None, ch)     # hearing nothing is not proof it stayed put
+                    heard = actual is not None
+                if ok:
+                    self.log('  hunting on channel %d%s'
+                             % (ch, '' if heard else ' (unconfirmed: nothing heard)'), 2)
                 else:
-                    # An active monitor interface ignores later channel changes.
+                    # The radio ignores channel changes: an active monitor without a passive
+                    # monitor beside it (sp_monitor.sh adds one), or mixed mode's station vif.
+                    stay = actual if actual is not None else self.channels[0]
                     self.chan_locked = True
-                    self.channels = [self.channels[0]]
+                    self.channels = [stay]
                     self.chan_idx = 0
                     self.log('  CHANNEL LOCKED to %d: this vif cannot be retuned, so the rest '
-                             'of the channel list is ignored.'
-                             % self.channels[0])
+                             'of the channel list is ignored.' % stay)
                 self.next_hop = time.time() + self.a.dwell
             r, _, _ = select.select([self.sock], [], [], 0.02)
             if not r:

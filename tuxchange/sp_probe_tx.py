@@ -160,7 +160,11 @@ def iface_type(mon):
 
 
 def tune(mon, ch, log):
-    """Tune and VERIFY by reading the frequency back."""
+    """Tune and VERIFY by reading the frequency back.
+
+    True: confirmed. False: the radio reports another frequency, or every command failed.
+    None: the command was accepted but iw reports no channel at all for this vif, as it does for
+    monitor vifs on current kernels, so only the radiotap of received frames can confirm it."""
     want = CH_FREQ[ch]
     for arg in ('set channel %d' % ch, 'set channel %d NOHT' % ch,
                 'set freq %d' % want, 'set freq %d NOHT' % want):
@@ -170,6 +174,8 @@ def tune(mon, ch, log):
             return True
         if rc != 0:
             log('    tune: `%s` -> %s' % (arg, err or 'failed'), 2)
+        elif got is None:
+            return None
         else:
             log('    tune: `%s` returned 0 but radio reports %s MHz' % (arg, got), 2)
     return False
@@ -435,11 +441,16 @@ class Runner:
             return 2
         acks, engages = [], []
         for ch in self.a.channels:
-            if not tune(self.a.iface, ch, self.log):
+            ok = tune(self.a.iface, ch, self.log)
+            if ok is False:
                 self.log('  cannot tune ch %d, skipping' % ch)
                 continue
             self.log('')
-            self.log('### channel %d (%d MHz) confirmed by readback' % (ch, iface_freq(self.a.iface)))
+            if ok:
+                self.log('### channel %d (%d MHz) confirmed by readback' % (ch, CH_FREQ[ch]))
+            else:
+                self.log('### channel %d (%d MHz) set; iw cannot read a monitor vif back, so '
+                         'unconfirmed' % (ch, CH_FREQ[ch]))
             self.phase_listen(ch, self.a.listen)
             if self.consoles or self.a.force:
                 acks += self.phase_ack(ch, self.a.ack_secs)
