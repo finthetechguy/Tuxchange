@@ -404,19 +404,14 @@ class Link:
                          % (otype, whose, i, tid, mode, hflags, size, code,
                             self.EE_CODE.get(code, '?')))
                 if otype == 0x34 and code == 2:
-                    self.log('  *** the console REFUSED title %08X. The usual cause is a send-mode '
-                             'mismatch: our ee entry +0x04 must equal the message header +0x35 '
-                             '(cecd 0x1094F8 / 0x1031D0).' % tid)
+                    self.log('  *** the console REFUSED title %08X.' % tid)
         if otype == 0x32 and len(ee) >= 0x2C and ee[0:2] == b'ee':
             offered = [struct.unpack_from('<I', ee, 0x2C + i * 0x20)[0]
                        for i in range(min(struct.unpack_from('<I', ee, 8)[0],
                                           (len(ee) - 0x2C) // 0x20))]
             ours = [t for t, _f, _tr in self.services]
             if sorted(offered) != sorted(ours):
-                self.log('  *** OFFER MISMATCH: the console offers %s, we declared %s. cecd '
-                         '0x1148C0 requires equal counts and pairwise-equal titles, so this '
-                         'exchange will fail. A title it has not enabled, or has no message '
-                         'queued for, never appears in its offer.'
+                self.log('  *** OFFER MISMATCH: the console offers %s, declared %s.'
                          % (['%08X' % t for t in offered], ['%08X' % t for t in ours]))
         if not self.a.mirror_offer or otype != 0x32:
             return
