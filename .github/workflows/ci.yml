@@ -51,6 +51,8 @@ jobs:
           python tuxchange/sp_aes.py --selftest
           python tuxchange/sp_identity.py selftest
           python tuxchange/sp_plugin.py --selftest
+          python tuxchange/sp_plaza.py
+          python tuxchange/sp_create.py --selftest
           python tools/macfilter_decode.py --selftest
 
       - name: No key material has crept into the tree

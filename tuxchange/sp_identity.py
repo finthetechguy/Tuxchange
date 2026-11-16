@@ -39,6 +39,7 @@ def build_message(store_path, mii_name='Relay', author_name='Tuxchange',
                   title_short='Tuxchange', title_long='StreetPass from Linux',
                   title_publisher='Tuxchange', when=None, **extra):
     """-> a complete Mii Plaza wire message that is this relay's own."""
+    import sp_plaza
     if len(mii_name) > MII_NAME_MAX:
         raise ValueError('a Mii name is at most %d characters, got %d (%r)'
                          % (MII_NAME_MAX, len(mii_name), mii_name))
@@ -48,18 +49,30 @@ def build_message(store_path, mii_name='Relay', author_name='Tuxchange',
     if len(greeting) > GREETING_MAX:
         raise ValueError('a greeting is at most %d characters, got %d (%r)'
                          % (GREETING_MAX, len(greeting), greeting))
-    ident = derive(store_path)
-    mii = sp_build.build_cfl(mii_name=mii_name, author_name=author_name,
-                             mii_id=ident['mii_id'], creator_mac=ident['creator_mac'],
-                             face_shape=ident['face_shape'],
-                             gender=ident['gender'])
-    profile = sp_build.build_profile(streetpass_hits=hits, plaza_population=population,
-                                     hat=ident['hat'], pet=pet,
-                                     dream=ident['dream'], hobby=ident['hobby'])
-    body = sp_build.build_body(mii, greeting=greeting, profile=profile,
-                               title_short=title_short, title_long=title_long,
-                               title_publisher=title_publisher, **extra)
-    return sp_build.build_message(body, when=when)
+    v = sp_plaza.default_values(store_path)
+    v['mii'].update(mii_name=mii_name, author_name=author_name)
+    v['greeting'] = greeting
+    v['profile'].update(streetpass_hits=hits, plaza_population=population, pet=pet)
+    f = v['featured']
+    f['short_name'], f['long_name'], f['publisher'] = (
+        [title_short] * 16, [title_long] * 16, [title_publisher] * 16)
+    for k, (group, key) in EXTRA_FIELDS.items():
+        if k in extra:
+            val = extra.pop(k)
+            if key in ('country', 'region') and isinstance(val, str):
+                val = [val] * 16
+            (v[group] if group else v)[key] = val
+    if extra:
+        raise ValueError('unknown field(s) %s' % ', '.join(sorted(extra)))
+    sp_plaza.validate(v)
+    return sp_build.build_message(sp_plaza.build_body(v), when=when)
+
+
+# build_message's older keyword arguments -> where they live in the Plaza values.
+EXTRA_FIELDS = {'country': ('sender', 'country'), 'region': ('sender', 'region'),
+                'address_code': ('sender', 'address_code'), 'bubble': (None, 'bubble'),
+                'title_id': ('featured', 'title_id'), 'icon_small': ('featured', 'small_icon'),
+                'icon_large': ('featured', 'large_icon')}
 
 
 def seed(store, store_path=None, replace=False, log=print, **kw):

@@ -8,3 +8,6 @@ scapy>=2.5 ; extra == "pcap"
 
 # The GUI. Prefer your distribution's package, because it needs GTK and libadwaita too.
 PyGObject>=3.42 ; extra == "gui"
+
+# Reading 3DS Mii QR codes in the Mii Plaza plugin.
+zxing-cpp>=2.2 ; extra == "qr"

@@ -183,6 +183,8 @@ def run(plugin, argv, out=print):
     if a.info:
         describe(plugin, out)
         return 0
+    import sp_relay
+    plugin.context['store'] = sp_relay.resolve_store(a.store)
     values = plugin.defaults()
     if a.edit or a.edit_file:
         if a.edit_file:
@@ -288,7 +290,165 @@ def main(argv=None, out=print):
         return 1
 
 
+def _selftest():
+    import tempfile, shutil
+    import lp_keys as _k, sp_cec, sp_build, sp_mii
+    if _k.selftest_keys():
+        print('  (no console keys found, so running on generated throwaway keys)')
+    ok = tot = skipped = 0
+
+    def chk(n, c, g=''):
+        nonlocal ok, tot
+        tot += 1; ok += bool(c)
+        print('  [%s] %s%s' % ('PASS' if c else 'FAIL', n, ('  %s' % (g,)) if g else ''))
+
+    def skip(n, why):
+        nonlocal skipped
+        skipped += 1
+        print('  [SKIP] %s  (%s)' % (n, why))
+
+    tmp = tempfile.mkdtemp()
+    old_xdg = os.environ.get('XDG_DATA_HOME')
+    os.environ['XDG_DATA_HOME'] = os.path.join(tmp, 'xdg')      # no user plugins in the way
+    lines = []
+    quiet = lines.append
+    try:
+        plugins, broken = P.discover()
+        chk('the built-in Mii Plaza plugin loads cleanly',
+            [p.id for p in plugins] == ['miiplaza'] and not broken,
+            [str(b) for b in broken])
+        plaza = P.find('miiplaza', plugins)
+        store = os.path.join(tmp, 'store')
+
+        def go(*argv):
+            del lines[:]
+            return run(plaza, ['--store', store] + list(argv), quiet)
+
+        out = os.path.join(tmp, 'm.bin')
+        chk('--out builds a message without a daemon',
+            go('--greeting', 'From the CLI', '--profile.hat', '150', '--sender.country', 'France',
+               '--set', 'history.met16.1.name-a=Tux', '--out', out) == 0)
+        msg = open(out, 'rb').read()
+        h, ex, body = sp_cec.split_message(msg)
+        import sp_plaza
+        v = sp_plaza.parse_body(body)
+        chk('it is a Plaza message carrying what was asked for',
+            h['cec_title_id'] == 0x00020800 and v['greeting'] == 'From the CLI'
+            and v['profile']['hat'] == 150 and v['sender']['country'] == ['France'] * 16
+            and v['history']['met16'][1]['name_a'] == 'Tux')
+        chk('with the Plaza\'s icon and info text in its ex-headers',
+            [e['type'] for e in ex] == [2, 4] and h['send_mode'] == 0)
+        import hmac, hashlib
+        chk('signed with the Plaza key', msg[-0x20:] == hmac.new(
+            sp_build.plaza_hmac_key(), body, hashlib.sha256).digest())
+        chk('the default Mii is the store\'s own, as `seed` makes it',
+            v['mii']['mii_id'] == sp_plaza.default_values(store)['mii']['mii_id'])
+
+        js = os.path.join(tmp, 'v.json')
+        chk('--edit-file reads a message back and --dump-json writes its values',
+            go('--edit-file', out, '--dump-json', js) == 0
+            and json.load(open(js))['greeting'] == 'From the CLI')
+        obj = json.load(open(js))
+        obj['greeting'] = 'From JSON'
+        json.dump(obj, open(js, 'w'))
+        out2 = os.path.join(tmp, 'm2.bin')
+        go('--from-json', js, '--out', out2)
+        v2 = sp_plaza.parse_body(sp_cec.split_message(open(out2, 'rb').read())[2])
+        chk('--from-json takes values back in, hidden ones included',
+            v2['greeting'] == 'From JSON' and v2['history']['met16'][1]['name_a'] == 'Tux')
+
+        other = sp_build.build_cfl(mii_name='Imported', author_name='Elsewhere',
+                                   mii_id=0x10203090, creator_mac='b8:ae:6e:01:02:03')
+        rawp = os.path.join(tmp, 'mii.bin')
+        open(rawp, 'wb').write(other)
+        go('--import-mii', rawp, '--out', out2)
+        cfl = sp_mii.read_plaza_mii(sp_cec.split_message(open(out2, 'rb').read())[2])[0]
+        chk('--import-mii takes a raw Mii', cfl == sp_mii.reseal_cfl(other))
+        open(rawp, 'wb').write(sp_mii.wrap_entry(other))
+        go('--import-mii', rawp, '--mii.mii-name', 'Renamed', '--out', out2)
+        cfl = sp_mii.read_plaza_mii(sp_cec.split_message(open(out2, 'rb').read())[2])[0]
+        chk('and a wrapped one, with a flag still overriding its name',
+            sp_mii.parse_cfl(cfl)['mii_name'] == 'Renamed'
+            and sp_mii.parse_cfl(cfl)['author_name'] == 'Elsewhere')
+        go('--import-mii-from', out, '--out', out2)
+        cfl = sp_mii.read_plaza_mii(sp_cec.split_message(open(out2, 'rb').read())[2])[0]
+        chk('--import-mii-from takes the Mii out of a message file',
+            sp_mii.parse_cfl(cfl)['mii_name'] == 'Relay')
+        try:
+            import zxingcpp, segno          # noqa: F401  (optional)
+            qr = segno.make_qr(sp_mii.wrap_entry(other), mode='byte')
+            qp = os.path.join(tmp, 'qr.png')
+            qr.save(qp, scale=5)
+            go('--import-mii-qr', qp, '--out', out2)
+            cfl = sp_mii.read_plaza_mii(sp_cec.split_message(open(out2, 'rb').read())[2])[0]
+            chk('--import-mii-qr reads a Mii QR code', cfl == sp_mii.reseal_cfl(other))
+        except ImportError:
+            skip('--import-mii-qr reads a Mii QR code', 'zxing-cpp and segno not installed')
+
+        def refused(*argv):
+            try:
+                go(*argv)
+            except P.PluginError:
+                return True
+            return False
+        chk('a value the game refuses is an error', refused('--profile.hat', '69', '--out', out2))
+        chk('so is an unknown --set path', refused('--set', 'nope=1', '--out', out2))
+        chk('so is junk given as a Mii', refused('--import-mii', js, '--out', out2))
+        chk('so is a file that is not a message, given to --edit-file',
+            refused('--edit-file', js, '--out', out2))
+
+        calls = []
+        held = {'n': 1}
+
+        def fake_call(_store, cmd, **kw):
+            calls.append((cmd, kw))
+            if cmd == 'outbox_put':
+                if held['n'] and not kw['replace']:
+                    return {'ok': False, 'exists': held['n']}
+                held['n'] = 1
+                return {'ok': True, 'bytes': 32732, 'replaced': 1}
+            if cmd == 'outbox_get':
+                return {'ok': True, 'messages': [
+                    {'data': base64.b64encode(msg[sp_build.ENVELOPE_LEN:]).decode()}]}
+            return {'ok': False, 'error': 'unexpected'}
+        real = globals()['daemon_call']
+        globals()['daemon_call'] = fake_call
+        try:
+            chk('without a terminal to ask on, an overwrite is not done', go() == 1
+                and [c[1]['replace'] for c in calls] == [False])
+            del calls[:]
+            chk('--replace overwrites without asking', go('--replace') == 0
+                and [c[1]['replace'] for c in calls] == [True])
+            del calls[:]
+            chk('--no-replace fails rather than overwrite',
+                refused('--no-replace') and len(calls) == 1)
+            del calls[:]
+            go('--edit', '--greeting', 'Edited', '--replace')
+            sent = base64.b64decode(calls[-1][1]['body'])
+            ev = sp_plaza.parse_body(sent)
+            chk('--edit starts from the outbox message and changes only what was asked',
+                calls[0][0] == 'outbox_get' and ev['greeting'] == 'Edited'
+                and ev['history']['met16'][1]['name_a'] == 'Tux')
+            chk('the daemon is sent the body and hints, never a finished message',
+                set(calls[-1][1]) == {'title', 'plugin', 'name', 'body', 'send_mode', 'replace',
+                                      'info_text', 'icon'} and calls[-1][1]['plugin'] == 'miiplaza')
+        finally:
+            globals()['daemon_call'] = real
+        chk('--info describes the plugin', go('--info') == 0
+            and any('--profile.hat' in ln for ln in lines))
+    finally:
+        if old_xdg is None:
+            os.environ.pop('XDG_DATA_HOME', None)
+        else:
+            os.environ['XDG_DATA_HOME'] = old_xdg
+        shutil.rmtree(tmp, ignore_errors=True)
+    print('\n%d/%d checks passed%s' % (ok, tot, ', %d skipped' % skipped if skipped else ''))
+    return 0 if ok == tot else 1
+
+
 if __name__ == '__main__':
     sys.modules.setdefault('sp_create', sys.modules[__name__])
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    if sys.argv[1:2] == ['--selftest']:
+        sys.exit(_selftest())
     sys.exit(main())

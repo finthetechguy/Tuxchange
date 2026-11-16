@@ -38,7 +38,7 @@ class PluginParseError(PluginError):
     """A plugin could not read an existing body. Editing starts fresh or is abandoned."""
 
 
-class ValidationError(PluginError):
+class ValidationError(PluginError, ValueError):
     def __init__(self, path, msg):
         self.path, self.msg = path, msg
         super().__init__('%s: %s' % (path, msg) if path else msg)
@@ -56,14 +56,17 @@ class Field:
     """One value in a plugin's schema. Subclasses define what a valid value is."""
     kind = 'field'
 
-    def __init__(self, key, label=None, default=None, help='', advanced=False):
+    def __init__(self, key, label=None, default=None, help='', advanced=False, hidden=False):
         if not key or '.' in key or '=' in key:
             raise ValueError('bad field key %r' % (key,))
         self.key = key
         self.label = label or key.replace('_', ' ').capitalize()
         self.default = default
         self.help = help
+        # advanced: tucked away in the GUI. hidden: never shown or given a flag, but kept
+        # in the values, JSON and --set (state a plugin carries between parse and build).
         self.advanced = advanced
+        self.hidden = hidden
 
     def make_default(self):
         d = self.default
@@ -239,6 +242,44 @@ class Bytes(Field):
 
     def describe(self):
         return '%d bytes of hex' % self.length
+
+
+class Blob(Field):
+    """Bytes of any length up to max_len, base64 in JSON. Usually hidden: for example the
+    original body, so the bytes a plugin does not expose survive an edit unchanged."""
+    kind = 'blob'
+
+    def __init__(self, key, label=None, max_len=0x18000, default=b'', **kw):
+        kw.setdefault('hidden', True)
+        super().__init__(key, label, bytes(default), **kw)
+        self.max_len = max_len
+
+    def validate(self, v, path):
+        if isinstance(v, str):
+            return self.from_text(v, path)
+        if not isinstance(v, (bytes, bytearray)) or len(v) > self.max_len:
+            raise ValidationError(path, 'expected at most %d bytes' % self.max_len)
+        return bytes(v)
+
+    def from_text(self, text, path):
+        import base64, binascii
+        try:
+            return self.validate(base64.b64decode(text, validate=True), path)
+        except (binascii.Error, ValueError):
+            raise ValidationError(path, 'expected base64')
+
+    def to_text(self, v):
+        import base64
+        return base64.b64encode(v).decode()
+
+    def to_json(self, v):
+        return self.to_text(v)
+
+    def make_default(self):
+        return bytes(self.default)
+
+    def describe(self):
+        return 'base64 data (max %d bytes)' % self.max_len
 
 
 class Mac(Bytes):
@@ -437,19 +478,22 @@ def set_path(values, keys, v):
     values[keys[-1]] = v
 
 
-def leaves(fields, path='', in_list=False):
-    """Every settable path in the schema -> [(path, field, in_list)]."""
+def leaves(fields, path='', in_list=False, hidden=False):
+    """Every settable path in the schema -> [(path, field, in_list)]. Hidden fields are
+    left out unless `hidden`."""
     out = []
     for f in fields:
+        if f.hidden and not hidden:
+            continue
         p = _join(path, f.key)
         if isinstance(f, Group):
-            out += leaves(f.fields, p, in_list)
+            out += leaves(f.fields, p, in_list, hidden)
         elif isinstance(f, List):
             if f.broadcast:
                 out.append((p, f, in_list))
             if isinstance(f.item, Group):
                 for i in range(f.count):
-                    out += leaves(f.item.fields, _join(p, str(i)), True)
+                    out += leaves(f.item.fields, _join(p, str(i)), True, hidden)
             else:
                 for i in range(f.count):
                     out.append((_join(p, str(i)), f.item, True))
@@ -509,6 +553,11 @@ class Plugin:
 
     path = None               # set by the loader
     source = None             # 'builtin' or 'user'
+
+    def __init__(self):
+        # Set by the GUI or CLI before defaults() is called. 'store' is the daemon's store
+        # path, which some plugins derive a stable default identity from.
+        self.context = {}
 
     def defaults(self):
         return {f.key: f.make_default() for f in self.fields}
@@ -572,15 +621,18 @@ def check(p):
     if not p.title_ids or not all(isinstance(t, int) and 0 < t <= 0xFFFFFFFF
                                   for t in p.title_ids):
         raise PluginError('title_ids must list at least one CEC title id')
+    if not isinstance(getattr(p, 'context', None), dict):
+        p.context = {}
     if p.gui not in (None, 'form', 'custom'):
         raise PluginError("gui must be None, 'form' or 'custom'")
     _check_unique(list(p.fields))
-    keys = {f.key for f in p.fields}
+    seen = set()
     for imp in p.importers:
         if not isinstance(imp, Importer):
             raise PluginError('importers must be sp_plugin.Importer instances')
-        if imp.key in keys:
-            raise PluginError('importer %r has the same name as a field' % imp.key)
+        if imp.key in seen:
+            raise PluginError('two importers are called %r' % imp.key)
+        seen.add(imp.key)
     _validate_fields(list(p.fields), p.defaults())
 
 
@@ -1068,6 +1120,17 @@ PLUGIN = Dummy()
         chk('wrong JSON types are refused',
             raises(lambda: values_from_json(d, {'score': 'nine'}))
             and raises(lambda: values_from_json(d, {'names': ['a']})))
+
+        hid = Group('g', 'G', [Int('shown', 'S'), Blob('raw', 'Raw', max_len=8)])
+        chk('hidden fields get no flag', [p for p, _f, _l in leaves([hid])] == ['g.shown'])
+        chk('but are still there when asked for',
+            [p for p, _f, _l in leaves([hid], hidden=True)] == ['g.shown', 'g.raw'])
+        bl = Blob('raw', 'Raw', max_len=8)
+        chk('a Blob takes base64 text', bl.from_text('AAEC', 'raw') == b'\x00\x01\x02')
+        chk('and refuses too much, or bad base64',
+            raises(lambda: bl.from_text('A' * 16, 'raw'), ValidationError)
+            and raises(lambda: bl.from_text('!!', 'raw'), ValidationError))
+        chk('and goes to JSON as base64', bl.to_json(b'\x00\x01\x02') == 'AAEC')
 
         all_paths = [p for p, _f, _l in leaves(list(d.fields))]
         chk('leaves() lists every settable path',
