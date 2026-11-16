@@ -938,6 +938,25 @@ class Control:
                 return {'ok': True, 'servable': len(r.servable())}
             except Exception as e:
                 return {'ok': False, 'error': '%s: %s' % (type(e).__name__, e)}
+        if cmd == 'outbox_put':
+            try:
+                return outbox_put(r, req)
+            except Exception as e:
+                return {'ok': False, 'error': '%s: %s' % (type(e).__name__, e)}
+        if cmd == 'outbox_get':
+            try:
+                tid = parse_titles([req.get('title')])[0]
+                with r.lock:
+                    msgs = r.store.messages(tid, 'outbox')
+                    og = r.store.origins()
+                return {'ok': True, 'title': '%08x' % tid, 'name': r.store.title_name(tid),
+                        'messages': [{'id': c[0x20:0x28].hex(),
+                                      'data': base64.b64encode(c).decode(),
+                                      'origin': (og.get(r.store._okey(c[0x20:0x28], 'outbox'))
+                                                 or {}).get('source')}
+                                     for _t, _b, c in msgs]}
+            except Exception as e:
+                return {'ok': False, 'error': '%s: %s' % (type(e).__name__, e)}
         if cmd == 'inbox':
             try:
                 titles = parse_titles(req.get('titles'))
@@ -992,7 +1011,7 @@ class Control:
                 break
             with conn:
                 try:
-                    data = conn.recv(65536).decode('utf-8', 'replace').strip()
+                    data = read_request(conn).decode('utf-8', 'replace').strip()
                     reply = self.handle(json.loads(data) if data else {}, peer_uid)
                 except Exception as e:
                     reply = {'ok': False, 'error': '%s: %s' % (type(e).__name__, e)}
@@ -1013,6 +1032,74 @@ class Control:
         self.stop.set()
         if self.thread:
             self.thread.join(timeout=2.0)
+
+
+MAX_REQUEST = 1 << 20          # a plugin's body is up to 0x18000 B, ~131 kB as base64
+REQUEST_TIMEOUT = 5.0
+
+
+def read_request(conn, limit=MAX_REQUEST):
+    """One newline-terminated request. A slow or silent client times out rather than
+    holding the (single-threaded) control socket."""
+    conn.settimeout(REQUEST_TIMEOUT)
+    buf = b''
+    while not buf.endswith(b'\n'):
+        chunk = conn.recv(65536)
+        if not chunk:
+            break
+        buf += chunk
+        if len(buf) > limit:
+            raise ValueError('request over %d bytes' % limit)
+    return buf
+
+
+PLUGIN_ID_RE = re.compile(r'[a-z0-9_-]{1,32}')
+
+
+def outbox_put(r, req):
+    """A plugin's body -> a signed message filed in the outbox. The daemon runs no plugin
+    code: it is handed the body and the envelope hints, and builds the envelope itself."""
+    import sp_build, lp_keys
+    tid = parse_titles([req.get('title')])[0]
+    try:
+        body = base64.b64decode(req.get('body') or '', validate=True)
+    except ValueError:
+        raise ValueError('body is not base64')
+    plugin = str(req.get('plugin') or 'unknown')
+    if not PLUGIN_ID_RE.fullmatch(plugin):
+        raise ValueError('bad plugin id %r' % plugin)
+    name = req.get('name')
+    if name is not None and (not isinstance(name, str) or len(name) > 64):
+        raise ValueError('name must be text of at most 64 characters')
+    ex = []
+    if req.get('icon'):
+        ex.append(sp_build.exheader_icon(base64.b64decode(req['icon'], validate=True)))
+    if req.get('info_text') is not None:
+        if not isinstance(req['info_text'], str) or len(req['info_text']) > 64:
+            raise ValueError('info_text must be text of at most 64 characters')
+        ex.append(sp_build.exheader_info_text(req['info_text']))
+    send_mode = int(req.get('send_mode', 0))
+    with r.lock:
+        existing = r.store.messages(tid, 'outbox')
+        if existing and not req.get('replace'):
+            return {'ok': False, 'exists': len(existing), 'title': '%08x' % tid,
+                    'error': 'the outbox already holds %d message(s) for title %08X; '
+                             'send replace to overwrite' % (len(existing), tid)}
+        key = r.store.title_key(tid)
+        if key is None:
+            try:
+                key = lp_keys.title_hmac_key(tid)
+            except lp_keys.MissingKey as e:
+                return {'ok': False, 'error': 'no HMAC key for title %08X: %s' % (tid, e)}
+        msg = sp_build.build_envelope(body, tid, key=key, ex_headers=ex, send_mode=send_mode)
+        container = msg[sp_build.ENVELOPE_LEN:]
+        n = r.store.replace_outbox(container, name=name, key=key,
+                                   origin='authored:plugin:%s' % plugin)
+    r.log('  filed a %s message for title %08X from plugin %s (%d B)%s'
+          % (name or 'new', tid, plugin, len(container),
+             ', replacing %d' % n if n else ''))
+    return {'ok': True, 'title': '%08x' % tid, 'id': container[0x20:0x28].hex(),
+            'bytes': len(container), 'replaced': n, 'servable': len(r.servable())}
 
 
 def credited_objects(sess, log=print):
@@ -2242,6 +2329,37 @@ def _selftest():
         chk('a title filter that matches nothing returns nothing',
             sc.handle({'cmd': 'inbox', 'titles': ['00030600']})['messages'] == [])
         chk('a malformed title is refused', not sc.handle({'cmd': 'inbox', 'titles': ['zz']})['ok'])
+        pbody = sp_cec.split_message(_spb.build(mii_name='Put', greeting='plugin'))[2]
+        put = dict(cmd='outbox_put', title='00020800', plugin='test', name='StreetPass Mii Plaza',
+                   body=base64.b64encode(pbody).decode(), info_text='hello')
+        rep = sc.handle(put)
+        chk('outbox_put will not overwrite unasked, and says how many are there',
+            not rep['ok'] and rep.get('exists') == 1, rep)
+        rep = sc.handle(dict(put, replace=True))
+        chk('with replace it files the plugin\'s body as the title\'s only message',
+            rep['ok'] and rep['replaced'] == 1 and len(sr.store.messages(0x00020800, 'outbox')) == 1,
+            rep)
+        filed = sr.store.messages(0x00020800, 'outbox')[0][2]
+        fh, fex, fb = sp_cec.split_message(filed)
+        chk('the daemon built the envelope around the body it was given, unchanged',
+            fb == pbody and [e['type'] for e in fex] == [4])
+        chk('and signed it so the store verifies it', sr.store.verify(0x00020800, filed) is True)
+        rep = sc.handle({'cmd': 'outbox_get', 'title': '00020800'})
+        chk('outbox_get hands it back for editing, with its origin',
+            rep['ok'] and base64.b64decode(rep['messages'][0]['data']) == filed
+            and rep['messages'][0]['origin'] == 'authored:plugin:test', rep.get('error'))
+        chk('outbox_get on an empty title is an empty list',
+            sc.handle({'cmd': 'outbox_get', 'title': '00141000'})['messages'] == [])
+        for what, bad in (('a body that is not base64', {'body': '!!'}),
+                          ('an unaligned body', {'body': base64.b64encode(b'abc').decode()}),
+                          ('an empty body', {'body': ''}),
+                          ('a bad plugin id', {'plugin': '../x'}),
+                          ('a bad title', {'title': 'zz'}),
+                          ('a wrong-sized icon', {'icon': base64.b64encode(b'x' * 8).decode()}),
+                          ('send mode 4', {'send_mode': 4})):
+            chk('outbox_put refuses %s' % what, not sc.handle(dict(put, replace=True, **bad))['ok'])
+        chk('and a refused put leaves the outbox as it was',
+            sr.store.messages(0x00020800, 'outbox')[0][2] == filed)
         got = messages_for_export(sr.a.store, [0x00020800])
         chk('export reads the same from the store directly', [c for c, _w in got] == [inb])
         chk('parse_titles takes hex with or without 0x',
@@ -2377,6 +2495,8 @@ def _selftest():
         time.sleep(0.3)
         try:
             chk('status answers over the socket', send_command(sockp, 'status')['ok'])
+            big = send_command(sockp, 'outbox_get', title='00020800', pad='x' * 200000)
+            chk('a request far over one recv() still arrives whole', big.get('ok'), big)
             chk('the control socket is private to its owner',
                 stat.S_IMODE(os.stat(sockp).st_mode) == 0o600,
                 oct(stat.S_IMODE(os.stat(sockp).st_mode)))
@@ -2737,8 +2857,16 @@ def _selftest():
 
 
 def main():
+    # A plugin's flags depend on the plugin, so `create` parses its own arguments.
+    if len(sys.argv) > 1 and sys.argv[1] == 'create':
+        sys.modules.setdefault('sp_relay', sys.modules[__name__])
+        import sp_create
+        return sp_create.main(sys.argv[2:])
     ap = argparse.ArgumentParser(description='Tuxchange: StreetPass a Nintendo 3DS from Linux.')
     sub = ap.add_subparsers(dest='cmd')
+    sub.add_parser('create', add_help=False,
+                   help='make or edit an outbox message with a game plugin '
+                        '(`create --list`, `create <plugin> --info`)')
 
     run = sub.add_parser('run', help='the daemon')
     run.add_argument('--store', default='relay_store')
