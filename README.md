@@ -33,6 +33,7 @@ Working end to end:
   console offers, for every title both sides have enabled.
 - Keeps received messages in a local store you can inspect.
 - Runs as a **systemd daemon/service**, with a GTK4 **GUI** on top.
+- Execute callback scripts on various events, like a successful exchange.
 
 #### Extra
 
