@@ -34,6 +34,9 @@ Environment=SP_ROTATE=0
 Environment=SP_LOGS=on
 # Empty the MAC filter whenever the MAC rotates: on or off.
 Environment=SP_CLEAR_FILTER=on
+# Directory of event scripts (exchange, rotate, error, start, stop), run as the control user.
+# Empty turns hooks off.
+Environment=SP_HOOKS_DIR=/etc/tuxchange-hooks
 Environment=SP_EXTRA=
 # The one desktop user allowed to use the control socket; empty means root only.
 Environment=SP_CONTROL_USER=__GUI_USER__
@@ -42,7 +45,7 @@ EnvironmentFile=-/var/lib/tuxchange/relay.env
 
 # Rebuilt on every (re)start, so a restart is also the recovery for a wedged interface.
 ExecStartPre=__ROOT__/scripts/sp_monitor.sh up
-ExecStart=/bin/sh -c 'exec __PY__ __ROOT__/tuxchange/sp_relay.py run --store "$SP_STORE" --iface "$SP_MON" --channel "$SP_CHANNELS" --window "$SP_WINDOW" --idle "$SP_IDLE" --rotate-every "$SP_ROTATE" --run-logs "$SP_LOGS" --clear-filter-on-rotate "$SP_CLEAR_FILTER" --control-user "$SP_CONTROL_USER" --settings-file /var/lib/tuxchange/relay.env $SP_EXTRA'
+ExecStart=/bin/sh -c 'exec __PY__ __ROOT__/tuxchange/sp_relay.py run --store "$SP_STORE" --iface "$SP_MON" --channel "$SP_CHANNELS" --window "$SP_WINDOW" --idle "$SP_IDLE" --rotate-every "$SP_ROTATE" --run-logs "$SP_LOGS" --clear-filter-on-rotate "$SP_CLEAR_FILTER" --hooks-dir "$SP_HOOKS_DIR" --control-user "$SP_CONTROL_USER" --settings-file /var/lib/tuxchange/relay.env $SP_EXTRA'
 ExecStopPost=__ROOT__/scripts/sp_monitor.sh down
 
 # The daemon sends WATCHDOG=1 from inside its sniffing loop, at most every 5 s.

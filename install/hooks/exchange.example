@@ -1,0 +1,15 @@
+#!/bin/sh
+# Example Tuxchange event hook. To use it: copy it to the name of the event (no extension),
+# then make it executable, and keep it owned by you and not writable by any other users:
+#   sudo cp exchange.example /etc/tuxchange-hooks/exchange
+#   sudo chmod 0755 /etc/tuxchange-hooks/exchange
+#
+# Runs as the control user (not root), after every completed exchange.
+# NOTE: An event hook that takes longer than 10 seconds is killed.
+#
+# Available: TUXCHANGE_EVENT, TUXCHANGE_PEER, TUXCHANGE_SENT, TUXCHANGE_RECEIVED,
+#            TUXCHANGE_EXCHANGES
+# Other events: rotate (TUXCHANGE_MAC, _OLD_MAC, _ROTATIONS), error (TUXCHANGE_ERROR),
+#               start (TUXCHANGE_MAC, _STORE), stop (TUXCHANGE_EXCHANGES, _PASSES)
+
+notify-send "Tuxchange" "Exchanged with $TUXCHANGE_PEER: sent $TUXCHANGE_SENT, got $TUXCHANGE_RECEIVED" 2>/dev/null

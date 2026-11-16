@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Tuxchange: a daemon that exchanges with any 3DS that passes."""
 import contextlib, os, sys, json, time, socket, stat, struct, threading, random, argparse, re, pwd
-import base64
+import base64, subprocess, queue, signal, tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import sp_store, sp_cecstore, sp_cec, sp_harvest_air, sp_build
@@ -226,6 +226,169 @@ def declared_length(msg):
 def message_is_whole(msg):
     """Does a CEC message contain exactly as many bytes as its header claims?"""
     return declared_length(msg) == len(msg)
+
+# Events a hook can be written for. TODO: add more?
+HOOK_EVENTS = ('exchange', 'rotate', 'error', 'start', 'stop')
+HOOK_QUEUE_MAX = 16          # max events waiting for the worker
+HOOK_OUTPUT_MAX = 2000       # bytes of a hook's output kept for the log
+HOOK_FIELD_MAX = 500
+
+
+class HookRunner:
+    """Runs user scripts on daemon events.
+
+    One executable per event in `directory`, named after the event (`exchange`, `rotate`, ...).
+    As the daemon is root, a hook is NEVER run as root: it is ran by the control user, and a
+    script that user could not have written themselves (wrong owner, or writable by anyone else)
+    is refused. Event details go in TUXCHANGE_* environment variables, not on the command line.
+    A failing/hanging hook is killed after `timeout` seconds.
+    """
+
+    def __init__(self, directory, user, timeout=10.0, log=print):
+        self.dir = os.path.abspath(directory) if directory else None
+        self.timeout = max(1.0, float(timeout))
+        self.log = log
+        self.pw = None
+        self.last_failure = None
+        self.q = queue.Queue(HOOK_QUEUE_MAX)
+        self.thread = None
+        self.warned = set()
+        if not self.dir:
+            return
+        if not user:
+            self.log('  event hooks are OFF (--control-user)')
+            return
+        try:
+            self.pw = pwd.getpwnam(user)
+        except KeyError:
+            self.log('  event hooks are OFF: no such user %r' % (user,))
+
+    @property
+    def enabled(self):
+        return bool(self.dir and self.pw)
+
+    def _warn_once(self, key, msg):
+        if key not in self.warned:
+            self.warned.add(key)
+            self.log(msg)
+
+    def _trusted(self, st):
+        """A file or directory only root or the hook user could have written."""
+        return st.st_uid in (0, self.pw.pw_uid) and not st.st_mode & 0o022
+
+    def find(self, event, quiet=False):
+        """-> the path of a runnable hook for `event`, or None. Refusals are logged once."""
+        if not self.enabled or event not in HOOK_EVENTS:
+            return None
+        path = os.path.join(self.dir, event)
+        try:
+            dst, st = os.lstat(self.dir), os.lstat(path)
+        except OSError:
+            return None
+        why = None
+        if not stat.S_ISDIR(dst.st_mode) or not self._trusted(dst):
+            why = 'the hooks directory %s is not safe (owner or writable by others)' % self.dir
+        elif not stat.S_ISREG(st.st_mode):
+            why = 'not a regular file (symlinks refused)'
+        elif not st.st_mode & 0o111:
+            return None                  # not executable: how the shipped examples wait
+        elif not self._trusted(st):
+            why = 'owned by uid %d or writable by group/others' % st.st_uid
+        if why:
+            if not quiet:
+                self._warn_once(('refuse', event, why), '  hook %s refused: %s' % (path, why))
+            return None
+        return path
+
+    def fire(self, event, **fields):
+        """Queue `event` for its hook, if there is one. Never blocks. -> True if queued."""
+        path = self.find(event)
+        if not path:
+            return False
+        try:
+            self.q.put_nowait((event, path, fields))
+        except queue.Full:
+            self.log('  hook queue is full; dropped the %s event' % event)
+            return False
+        if self.thread is None:
+            self.thread = threading.Thread(target=self._work, name='hooks', daemon=True)
+            self.thread.start()
+        return True
+
+    def close(self, wait=None):
+        """Let queued hooks finish (up to `wait` s), so a `stop` hook still runs at shutdown."""
+        if self.thread is None:
+            return
+        try:
+            self.q.put(None, timeout=1.0)
+        except queue.Full:
+            return
+        self.thread.join(self.timeout + 2 if wait is None else wait)
+
+    def describe(self):
+        """For the status reply: which events would run a script right now."""
+        return {'dir': self.dir, 'enabled': self.enabled,
+                'events': [e for e in HOOK_EVENTS if self.find(e, quiet=True)],
+                'last_failure': self.last_failure}
+
+    def _work(self):
+        while True:
+            item = self.q.get()
+            if item is None:
+                return
+            event, path, fields = item
+            try:
+                self._run(event, path, fields)
+            except Exception as e:           # a bad hook must never reach the relay
+                self._fail(event, '%s: %s' % (type(e).__name__, e))
+
+    def _fail(self, event, why):
+        self.last_failure = {'event': event, 'why': why, 'when': time.time()}
+        self._warn_once(('fail', event), '  hook %s failed: %s' % (event, why))
+
+    @staticmethod
+    def _clean(v):
+        return re.sub(r'[\x00-\x1f\x7f]', ' ', str(v))[:HOOK_FIELD_MAX]
+
+    def _env(self, event, fields):
+        pw = self.pw
+        env = {'PATH': '/usr/local/bin:/usr/bin:/bin', 'HOME': pw.pw_dir, 'USER': pw.pw_name,
+               'LOGNAME': pw.pw_name, 'TUXCHANGE_EVENT': event,
+               'XDG_RUNTIME_DIR': '/run/user/%d' % pw.pw_uid}
+        bus = '/run/user/%d/bus' % pw.pw_uid
+        if os.path.exists(bus):
+            env['DBUS_SESSION_BUS_ADDRESS'] = 'unix:path=' + bus
+        for k, v in fields.items():
+            env['TUXCHANGE_' + k.upper()] = self._clean(v)
+        return env
+
+    def _run(self, event, path, fields):
+        pw = self.pw
+        drop = {}
+        if pw.pw_uid != os.geteuid():
+            drop = {'user': pw.pw_uid, 'group': pw.pw_gid,
+                    'extra_groups': os.getgrouplist(pw.pw_name, pw.pw_gid)}
+        # Output goes to a file, not a pipe: a hook that leaves a background child holding a
+        # pipe open would otherwise block after the hook itself has exited.
+        with tempfile.TemporaryFile() as out:
+            p = subprocess.Popen([path], cwd='/', env=self._env(event, fields),
+                                 stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT,
+                                 start_new_session=True, **drop)
+            try:
+                rc = p.wait(self.timeout)
+            except subprocess.TimeoutExpired:
+                with contextlib.suppress(OSError):
+                    os.killpg(p.pid, signal.SIGKILL)
+                p.wait()
+                rc = None
+            out.seek(0)
+            text = out.read(HOOK_OUTPUT_MAX + 1).decode('utf-8', 'replace').strip()
+        for line in text[:HOOK_OUTPUT_MAX].splitlines():
+            self.log('    hook %s: %s' % (event, line))
+        if rc is None:
+            self._fail(event, 'killed after %g s' % self.timeout)
+        elif rc != 0:
+            self._fail(event, 'exit status %d' % rc)
 
 
 class PeerBook:
@@ -878,6 +1041,9 @@ class Relay:
         self.identity = args.mac or self.fixed_identity()
         self.identity_since = time.time()
         self.rotations = 0
+        self.hooks = HookRunner(getattr(args, 'hooks_dir', None),
+                                getattr(args, 'control_user', None),
+                                getattr(args, 'hook_timeout', 10.0), self.log)
         self.exchange_gap = getattr(args, 'exchange_gap', 0.0)
         # The fix is rebuilding the interface, so exit and let systemd restart us.
         self.iface_failures = 0
@@ -1043,6 +1209,7 @@ class Relay:
         """Record that we now transmit from `mac`. Only ever called once the vif agrees."""
         if mac != self.identity:
             self.rotations += 1
+            self.hooks.fire('rotate', mac=mac, old_mac=self.identity, rotations=self.rotations)
             # A real console's filter is gone once its MAC has changed.
             if self.clear_filter_on_rotate():
                 n = self.book.unfilter()
@@ -1112,6 +1279,7 @@ class Relay:
                         if self.settings_file() else ''),
             'run_logs': self.run_logs(),
             'clear_filter_on_rotate': self.clear_filter_on_rotate(),
+            'hooks': self.hooks.describe(),
             'store_next': (read_env_file(self.settings_file()).get('SP_STORE') or self.a.store
                            if self.settings_file() else self.a.store),
             'rotate_identity': bool(self.a.rotate_identity),
@@ -1344,6 +1512,7 @@ class Relay:
         except Exception as e:
             self.last_error = '%s: %s' % (type(e).__name__, e)
             self.log('  exchange failed: %s' % self.last_error)
+            self.hooks.fire('error', error=self.last_error)
             return False
         # rc 1 is a quiet pass. rc 2 means the interface is gone or no longer a monitor.
         if rc == 2:
@@ -1351,6 +1520,7 @@ class Relay:
             self.last_error = '%s is not a usable monitor interface (%d in a row)' \
                               % (self.a.iface, self.iface_failures)
             self.log('  ' + self.last_error)
+            self.hooks.fire('error', error=self.last_error)
             return False
         self.iface_failures = 0
         peer = sp_link.T.macstr(link.peer) if link.peer else None
@@ -1397,6 +1567,8 @@ class Relay:
                                  'received': got_detail})
             self.log('  exchanged with %s: sent %d, received %d (store now holds %d)'
                      % (peer, len(self._pending_sent), len(got), len(self.store.messages())))
+            self.hooks.fire('exchange', peer=peer, sent=len(self._pending_sent),
+                            received=len(got), exchanges=self.exchanges)
             return True
         # A declined peer did not fail, so do not re-arm its retry backoff.
         if self._declined or self.book.is_blocked(peer):
@@ -1466,6 +1638,7 @@ class Relay:
         if sd_notify('READY=1'):
             self.log('  systemd is watching this process; a stall restarts THE SERVICE, '
                      'never the machine')
+        self.hooks.fire('start', mac=self.identity, store=self.a.store)
         rc_exit = 0
         try:
             while self.running:
@@ -1502,6 +1675,8 @@ class Relay:
             self.book.save()
             self.log('relay down after %d exchange(s) in %d pass(es)'
                      % (self.exchanges, self.passes))
+            self.hooks.fire('stop', exchanges=self.exchanges, passes=self.passes)
+            self.hooks.close()
         return rc_exit
 
 
@@ -1909,6 +2084,81 @@ def _selftest():
         sr._adopt('ba:ae:6e:00:00:0a')
         chk('and with it off the filter survives a rotation', len(sr.book.filter) == 1)
         sr.book.unfilter()
+        # Event hooks. They run as the current user here, so no privilege drop is exercised.
+        hd, hout = os.path.join(tmp, 'hooks'), os.path.join(tmp, 'hookout')
+        os.makedirs(hd, mode=0o755, exist_ok=True); os.chmod(hd, 0o755)
+        me = pwd.getpwuid(os.getuid()).pw_name
+
+        def hook(name, body, mode=0o755):
+            fp = os.path.join(hd, name)
+            if os.path.lexists(fp):
+                os.remove(fp)
+            with open(fp, 'w') as f:
+                f.write('#!/bin/sh\n' + body)
+            os.chmod(fp, mode)
+            return fp
+
+        def runner(timeout=10.0, user=me):
+            return HookRunner(hd, user, timeout, lambda m: None)
+        off = HookRunner(None, me, 10, lambda m: None)
+        chk('hooks are off without a directory', not off.enabled and not off.fire('exchange'))
+        chk('and without a user to run them as',
+            not HookRunner(hd, '', 10, lambda m: None).enabled
+            and not HookRunner(hd, 'no-such-user-xyz', 10, lambda m: None).enabled)
+        hr = runner()
+        chk('an event with no script does nothing', not hr.fire('exchange'))
+        hook('exchange', 'echo "$TUXCHANGE_EVENT $TUXCHANGE_PEER $TUXCHANGE_SENT" > %s\n' % hout)
+        hook('bogus', 'true\n')
+        chk('an event that is not in the list is ignored', not hr.fire('bogus'))
+        chk('a hook is queued, not run inline', hr.fire('exchange', peer='aa:bb', sent=3))
+        hr.close(15)
+        chk('it receives the event details in its environment',
+            open(hout).read().strip() == 'exchange aa:bb 3', open(hout).read())
+        hook('exchange', 'echo "$TUXCHANGE_PEER" > %s\n' % hout)
+        hr = runner(); hr.fire('exchange', peer='x\ny\x00z'); hr.close(15)
+        chk('control characters in a value are stripped', open(hout).read().strip() == 'x y z')
+        hook('exchange', 'exit 3\n')
+        hr = runner(); hr.fire('exchange'); hr.close(15)
+        chk('a failing hook is recorded and nothing else happens',
+            hr.last_failure and hr.last_failure['why'] == 'exit status 3', hr.last_failure)
+        hook('exchange', 'sleep 30\n')
+        hr = runner(1.0)
+        t0 = time.time()
+        queued = hr.fire('exchange')
+        chk('firing a slow hook returns at once', queued and time.time() - t0 < 0.5)
+        hr.close(15)
+        chk('and it is killed at the timeout',
+            time.time() - t0 < 10 and hr.last_failure and 'killed' in hr.last_failure['why'],
+            hr.last_failure)
+        hook('exchange', 'true\n', 0o757)
+        chk('a hook writable by others is refused', not runner().fire('exchange'))
+        hook('exchange', 'true\n', 0o644)
+        chk('a hook that is not executable is ignored', not runner().fire('exchange'))
+        real = hook('realhook', 'true\n')
+        os.remove(os.path.join(hd, 'exchange')); os.symlink(real, os.path.join(hd, 'exchange'))
+        chk('a symlinked hook is refused', not runner().fire('exchange'))
+        os.remove(os.path.join(hd, 'exchange'))
+        hook('exchange', 'true\n')
+        os.chmod(hd, 0o777)
+        chk('a hooks directory writable by others disables every hook',
+            not runner().fire('exchange'))
+        os.chmod(hd, 0o755)
+        hook('exchange', 'sleep 2\n')
+        hr = runner(5.0)
+        n_ok = sum(hr.fire('exchange') for _ in range(HOOK_QUEUE_MAX + 8))
+        chk('a full queue drops events instead of blocking',
+            HOOK_QUEUE_MAX <= n_ok < HOOK_QUEUE_MAX + 8, n_ok)
+        hr.thread = None          # abandon the sleeping hooks; the worker is a daemon thread
+        hook('rotate', 'echo "$TUXCHANGE_MAC $TUXCHANGE_OLD_MAC" > %s\n' % hout)
+        sr.hooks = runner()
+        old = sr.identity
+        sr._adopt('ba:ae:6e:00:00:0b')
+        sr.hooks.close(15)
+        chk('a rotation fires the rotate hook',
+            open(hout).read().split() == ['ba:ae:6e:00:00:0b', old], open(hout).read())
+        chk('status lists the events that have a runnable script',
+            sr.status()['hooks']['events'] == ['exchange', 'rotate'], sr.status()['hooks'])
+        sr.hooks = HookRunner(None, None, 10, lambda m: None)
         chk('the store stays put until something sets it', sr.status()['store_next'] == sr.a.store)
         mine = os.path.join(tmp, 'mine'); os.makedirs(mine); os.chmod(mine, 0o755)
         for bad, why in ((mine, 'not owned by root' if os.getuid() else None),
@@ -2485,6 +2735,12 @@ def main():
                      help='write a log per listening pass to <store>/runs (default on).')
     run.add_argument('--clear-filter-on-rotate', default='off', metavar='on|off',
                      help='empty the MAC filter whenever the MAC rotates (default off).')
+    run.add_argument('--hooks-dir', default='', metavar='DIR',
+                     help='run DIR/<event> on exchange, rotate, error, start and stop, as the '
+                          'control user (empty = no hooks). Event details are in TUXCHANGE_* '
+                          'environment variables.')
+    run.add_argument('--hook-timeout', type=float, default=10.0, metavar='SECONDS',
+                     help='kill an event hook that runs longer than this (default 10)')
     run.add_argument('--start-paused', action='store_true')
     run.add_argument('--yy-rate', type=float, default=11.0, metavar='MBPS',
                      help='802.11b rate for the encrypted payload frames (default 11, what two '

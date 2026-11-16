@@ -54,6 +54,11 @@ install)
   fi
   install_code
   install -d -o root -g root -m 0755 "$STATE"
+  # Event hook scripts. Not /etc/tuxchange as that is 0700 for keys etc, and hooks run as the desktop user.
+  install -d -o root -g root -m 0755 /etc/tuxchange-hooks
+  for f in "$HERE"/hooks/*.example; do
+    [ -f "$f" ] && install -o root -g root -m 0644 "$f" "/etc/tuxchange-hooks/$(basename "$f")"
+  done
   sed -e "s|__ROOT__|$LIB|g" -e "s|__PY__|$PY|g" -e "s|__GUI_USER__|$GUI_USER|g" \
       "$HERE/tuxchange.service.in" > "$UNIT"
   chmod 0644 "$UNIT"
