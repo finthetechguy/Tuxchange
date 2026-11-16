@@ -9,8 +9,8 @@ a StreetPass message, blinks its notification LED green, and exchanges title-spe
 
 ## Status
 
-This is a hobby project and yet a completely stable solution, I likely won't be viewing bug
-reports or pull requests, if you have changes, make a fork.
+This is a hobby project and not yet a completely stable solution, further updates will be made
+along the way as I continue developing this project.
 
 **Tuxchange does successfully exchange against retail consoles many times.** However, it
 can take a few tries/passes for a full successful exchange depending on what wireless chipset
@@ -115,9 +115,13 @@ That is expected. The console goes quiet after an aborted attempt and has to be 
 into rescanning, which Tuxchange does automatically. If the first try does nothing, leave
 it running and it should eventually exchange.
 
-The 3DS has a MAC filter, which prevents exchanging with the same MAC address again, there
-are homebrew tools to clear this filter however. Tuxchange can rotate its MAC address to
-work around this, it is off by default.
+Every 8 hours, the 3DS triggers a rotation of it's MAC address, and clears a list of MAC
+addresses that it exchanged with. During the period of 8 hours, the peer console's MAC
+is added to this list, meaning it can't exchange again until the filter is cleared.
+
+Tuxchange uses the same concept, with a MAC filter and rotating MAC address, clear the
+filter and rotate the MAC on either (or both) consoles, this should allow them to exchange
+again.
 
 ### Why only Linux + specific chipsets?
 
