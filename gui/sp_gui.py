@@ -10,6 +10,7 @@ from gi.repository import Gtk, Adw, GLib, Gio, Gdk        # noqa: E402
 sys.path.insert(0, os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'tuxchange'))
 import sp_relay                                            # noqa: E402
+import sp_plugin_gui                                       # noqa: E402
 
 def default_store():
     """Where the store lives when nobody says otherwise: $XDG_DATA_HOME/tuxchange/store."""
@@ -643,7 +644,7 @@ class OutboxPage(StorePage):
             note += (' Software title cap reached: %d.' % SOFT_TITLE_CAP)
         g = self.group('Served to consoles', 'CEC data served to consoles. ' + note)
         box = Gtk.Box(spacing=6, halign=Gtk.Align.END, valign=Gtk.Align.CENTER, margin_bottom=6)
-        for label, cb in (('Create Mii Plaza Message', self.app.dialog_identity),
+        for label, cb in (('Create', self.app.plugins.picker),
                           ('Import', self.app.dialog_import)):
             b = Gtk.Button(label=label)
             b.connect('clicked', lambda _b, f=cb: f())
@@ -651,10 +652,15 @@ class OutboxPage(StorePage):
         g.set_header_suffix(box)
         if not titles:
             g.add(row('Nothing to serve',
-                      'Give the relay some data: author its Mii Plaza identity, or import a '
+                      'Create a message with Create, or import a '
                       'console dump or an Azahar/Citra NAND.'))
 
     def decorate_title(self, ex, t):
+        plugin = self.app.plugins.for_title(int(t['title'], 16))
+        if plugin is not None and plugin.gui is not None:
+            ex.add_suffix(icon_button('document-edit-symbolic',
+                                      'Edit this message with the %s plugin' % plugin.game,
+                                      lambda tt=t: self.app.plugins.edit(tt['title'])))
         ex.add_suffix(icon_button('user-trash-symbolic',
                                   'Remove this title, its messages, its name and its HMAC key',
                                   lambda tt=t: self.app.confirm_remove_title(tt),
@@ -834,18 +840,21 @@ class RelayWindow(Adw.ApplicationWindow):
                                     policy=Adw.ViewSwitcherPolicy.WIDE)
         header = Adw.HeaderBar(title_widget=switcher)
         self.banner = Adw.Banner(revealed=False)
-        self.toasts = Adw.ToastOverlay()
         inner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         inner.append(self.banner)
         inner.append(self.stack)
         self.stack.set_vexpand(True)
-        self.toasts.set_child(inner)
-        tv = Adw.ToolbarView(content=self.toasts)
+        tv = Adw.ToolbarView(content=inner)
         tv.add_top_bar(header)
         bar = Adw.ViewSwitcherBar(stack=self.stack)
         tv.add_bottom_bar(bar)
         bar.set_reveal(False)
-        self.set_content(tv)
+        # The tabs are the root page; a plugin's page is pushed over the whole window.
+        self.nav = Adw.NavigationView()
+        self.nav.add(Adw.NavigationPage(child=tv, title='Tuxchange', tag='main'))
+        self.toasts = Adw.ToastOverlay(child=self.nav)
+        self.set_content(self.toasts)
+        self.nav.connect('popped', lambda *_a: app.refresh_now())
         self.stack.connect('notify::visible-child', lambda *_a: app.refresh_now())
 
 
@@ -859,6 +868,7 @@ class RelayApp(Adw.Application):
 
     def do_startup(self):
         Adw.Application.do_startup(self)
+        self.plugins = sp_plugin_gui.Plugins(self)
         self.pages = [HomePage(self), EncountersPage(self), OutboxPage(self),
                       InboxPage(self), DenylistPage(self), LogPage(self)]
 
@@ -876,6 +886,8 @@ class RelayApp(Adw.Application):
     def refresh_now(self):
         if self.win is None:
             return
+        if self.win.nav.get_visible_page().get_tag() != 'main':
+            return                      # a plugin page covers the tabs
         cur = self.win.stack.get_visible_child()
         if isinstance(cur, Page):
             cur.refresh()
@@ -965,57 +977,6 @@ class RelayApp(Adw.Application):
         d.set_response_appearance('ok', Adw.ResponseAppearance.DESTRUCTIVE)
         d.connect('response', lambda _d, r: r == 'ok' and self.act('unfilter',
                                                                    then='Filter cleared'))
-        d.present(self.win)
-
-    def dialog_identity(self):
-        import sp_identity
-        ident = sp_identity.derive(self.daemon.store)
-        rows, fields = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8), {}
-        for key, label, default in (('mii_name', 'Mii name (max 10)', 'Relay'),
-                                    ('author_name', 'Author (max 10)', 'Tuxchange'),
-                                    ('greeting', 'Greeting (max 16)', 'Hello from Linux')):
-            e = Gtk.Entry(text=default, placeholder_text=label)
-            fields[key] = e
-            rows.append(Gtk.Label(label=label, xalign=0, css_classes=['dim-label']))
-            rows.append(e)
-        adv = Gtk.Expander(label='Advanced')
-        ab = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, margin_top=6)
-        for key, label, up in (('hits', 'StreetPass hits on the card', 999999),
-                               ('population', 'Plaza population', 3000),
-                               ('pet', 'Pet (0 none, 1 dog, 2 cat)', 2)):
-            sp = Gtk.SpinButton(adjustment=Gtk.Adjustment(value=0, lower=0, upper=up,
-                                                          step_increment=1, page_increment=10),
-                                digits=0)
-            fields[key] = sp
-            ab.append(Gtk.Label(label=label, xalign=0, css_classes=['dim-label']))
-            ab.append(sp)
-        ab.append(Gtk.Label(
-            xalign=0, wrap=True, css_classes=['dim-label'],
-            label='Derived from the store path and not editable: creator MAC %s, Mii id %08x, '
-                  'face %d, hat %d, dream %d, hobby %d. Like a real console, the creator MAC '
-                  'stays the same whichever MAC this relay transmits from.'
-                  % (ident['creator_mac'], ident['mii_id'], ident['face_shape'], ident['hat'],
-                     ident['dream'], ident['hobby'])))
-        adv.set_child(ab)
-        rows.append(adv)
-
-        d = Adw.AlertDialog(
-            heading='Author this relay\'s Mii Plaza identity',
-            body='Builds a StreetPass Mii Plaza message without any captured data and replaces the one in '
-                 'the outbox.')
-        d.set_extra_child(rows)
-        d.add_response('cancel', 'Cancel')
-        d.add_response('ok', 'Write it')
-        d.set_response_appearance('ok', Adw.ResponseAppearance.SUGGESTED)
-
-        def resp(_d, r):
-            if r != 'ok':
-                return
-            kw = {'replace': True}
-            for k, w in fields.items():
-                kw[k] = int(w.get_value()) if isinstance(w, Gtk.SpinButton) else w.get_text()
-            self.act('seed', then='Identity written to the outbox', **kw)
-        d.connect('response', resp)
         d.present(self.win)
 
     def dialog_store(self, current):
