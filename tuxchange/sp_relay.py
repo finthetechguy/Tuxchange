@@ -350,6 +350,34 @@ class HookRunner:
     def _clean(v):
         return re.sub(r'[\x00-\x1f\x7f]', ' ', str(v))[:HOOK_FIELD_MAX]
 
+    PROC = '/proc'
+    SESSION_VARS = ('DBUS_SESSION_BUS_ADDRESS', 'DISPLAY', 'XAUTHORITY', 'WAYLAND_DISPLAY')
+
+    def session_env(self):
+        uid = self.pw.pw_uid
+        try:
+            pids = sorted((n for n in os.listdir(self.PROC) if n.isdigit()), key=int)
+        except OSError:
+            return {}
+        for n in pids:
+            try:
+                if os.stat(os.path.join(self.PROC, n)).st_uid != uid:
+                    continue
+                with open(os.path.join(self.PROC, n, 'environ'), 'rb') as f:
+                    raw = f.read(65536)
+            except OSError:
+                continue
+            have = dict(kv.split('=', 1) for kv in raw.decode('utf-8', 'replace').split('\0')
+                        if '=' in kv)
+            bus = have.get('DBUS_SESSION_BUS_ADDRESS', '')
+            if not bus or not (have.get('DISPLAY') or have.get('WAYLAND_DISPLAY')):
+                continue
+            m = re.match(r'unix:path=([^,]+)', bus)
+            if m and not os.path.exists(m.group(1)):
+                continue
+            return {k: self._clean(have[k]) for k in self.SESSION_VARS if have.get(k)}
+        return {}
+
     def _env(self, event, fields):
         pw = self.pw
         env = {'PATH': '/usr/local/bin:/usr/bin:/bin', 'HOME': pw.pw_dir, 'USER': pw.pw_name,
@@ -358,6 +386,7 @@ class HookRunner:
         bus = '/run/user/%d/bus' % pw.pw_uid
         if os.path.exists(bus):
             env['DBUS_SESSION_BUS_ADDRESS'] = 'unix:path=' + bus
+        env.update(self.session_env())
         for k, v in fields.items():
             env['TUXCHANGE_' + k.upper()] = self._clean(v)
         return env
@@ -2149,6 +2178,23 @@ def _selftest():
         chk('a full queue drops events instead of blocking',
             HOOK_QUEUE_MAX <= n_ok < HOOK_QUEUE_MAX + 8, n_ok)
         hr.thread = None          # abandon the sleeping hooks; the worker is a daemon thread
+        fake = os.path.join(tmp, 'proc'); sock = os.path.join(tmp, 'fakebus')
+        open(sock, 'w').close()
+        for pid, env in (('100', 'DISPLAY=:9\0DBUS_SESSION_BUS_ADDRESS=unix:path=/gone/bus\0'),
+                         ('200', 'PATH=/bin\0DBUS_SESSION_BUS_ADDRESS=unix:path=%s\0' % sock),
+                         ('300', 'DISPLAY=:10.0\0XAUTHORITY=/h/.Xauthority\0'
+                                 'DBUS_SESSION_BUS_ADDRESS=unix:path=%s,guid=ab\0' % sock)):
+            os.makedirs(os.path.join(fake, pid)); open(os.path.join(fake, pid, 'environ'), 'w').write(env)
+        hs = runner(); hs.PROC = fake
+        se = hs.session_env()
+        chk('the desktop session bus is found in a graphical process, not guessed',
+            se.get('DBUS_SESSION_BUS_ADDRESS', '').startswith('unix:path=' + sock)
+            and se.get('DISPLAY') == ':10.0' and se.get('XAUTHORITY') == '/h/.Xauthority', se)
+        chk('and it reaches the hook, skipping ended and non-graphical sessions',
+            hs._env('exchange', {})['DISPLAY'] == ':10.0')
+        hs.PROC = os.path.join(tmp, 'noproc')
+        chk('with no desktop session the hook still gets a sane environment',
+            hs.session_env() == {} and 'TUXCHANGE_EVENT' in hs._env('exchange', {}))
         hook('rotate', 'echo "$TUXCHANGE_MAC $TUXCHANGE_OLD_MAC" > %s\n' % hout)
         sr.hooks = runner()
         old = sr.identity
