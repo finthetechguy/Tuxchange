@@ -103,6 +103,11 @@ def on_off(value):
     return str(value).strip().lower() not in ('off', '0', 'no', 'false')
 
 
+def on_only(value):
+    """-> True only for an explicit on. Unlike on_off, an empty or missing value means off."""
+    return str(value).strip().lower() in ('on', '1', 'yes', 'true')
+
+
 def store_problem(path):
     """-> None if root alone can change `path` and everything above it, else why not.
 
@@ -604,6 +609,7 @@ class Control:
                                 'last': r.book.peers.get(m, {}).get('last', 0)}
                                for m in reversed(r.book.filter)],
                     'filter_max': r.book.filter_max,
+                    'clear_filter_on_rotate': r.clear_filter_on_rotate(),
                     'backing_off': [{'mac': m, 'attempts': e.get('attempts', 0),
                                      'remaining_s': w}
                                     for m, e in sorted(r.book.peers.items())
@@ -626,6 +632,17 @@ class Control:
             r.log('  removed %d MAC(s) from the filter%s'
                   % (n, ' (%s)' % req['mac'] if req.get('mac') else ''))
             return {'ok': True, 'removed': n}
+
+        if cmd == 'set_clear_filter':
+            on = req.get('enabled')
+            if not isinstance(on, bool):
+                return {'ok': False, 'error': 'enabled must be true or false'}
+            r.a.clear_filter_on_rotate = on
+            r.log('  MAC filter %s when the MAC rotates' % ('will be CLEARED' if on else 'kept'))
+            err = r.save_setting('SP_CLEAR_FILTER', 'on' if on else 'off')
+            if err:
+                return {'ok': False, 'error': 'applied, but not saved for restarts: %s' % err}
+            return {'ok': True, 'clear_filter_on_rotate': on}
 
         if cmd == 'rotate':
             if 'seconds' in req:
@@ -921,6 +938,10 @@ class Relay:
     def run_logs(self):
         return on_off(getattr(self.a, 'run_logs', True))
 
+    def clear_filter_on_rotate(self):
+        raw = getattr(self.a, 'clear_filter_on_rotate', False)
+        return raw if isinstance(raw, bool) else on_only(raw)
+
     def save_setting(self, key, value):
         """Keep a setting for the next service start. -> None, or why it could not be saved."""
         path = self.settings_file()
@@ -1022,6 +1043,10 @@ class Relay:
         """Record that we now transmit from `mac`. Only ever called once the vif agrees."""
         if mac != self.identity:
             self.rotations += 1
+            # A real console's filter is gone once its MAC has changed.
+            if self.clear_filter_on_rotate():
+                n = self.book.unfilter()
+                self.log('  MAC rotated: cleared %d MAC(s) from the filter' % n)
         self.identity = mac
         self.identity_since = time.time()
         if self.rotate_seconds():
@@ -1086,6 +1111,7 @@ class Relay:
             'adapter': (read_env_file(self.settings_file()).get('SP_IFACE', '')
                         if self.settings_file() else ''),
             'run_logs': self.run_logs(),
+            'clear_filter_on_rotate': self.clear_filter_on_rotate(),
             'store_next': (read_env_file(self.settings_file()).get('SP_STORE') or self.a.store
                            if self.settings_file() else self.a.store),
             'rotate_identity': bool(self.a.rotate_identity),
@@ -1866,6 +1892,23 @@ def _selftest():
         chk('a non-boolean is refused', not sc.handle({'cmd': 'set_logs', 'enabled': 'off'})['ok'])
         chk('a typo in SP_LOGS keeps logs on', on_off('of') and not on_off('OFF'))
         sc.handle({'cmd': 'set_logs', 'enabled': True})
+        chk('clearing the filter on rotation is off by default', not sr.clear_filter_on_rotate())
+        chk('it can be turned on, applied and saved',
+            sc.handle({'cmd': 'set_clear_filter', 'enabled': True})['ok']
+            and sr.clear_filter_on_rotate() and sr.status()['clear_filter_on_rotate']
+            and read_env_file(envp).get('SP_CLEAR_FILTER') == 'on')
+        chk('a non-boolean is refused', not sc.handle({'cmd': 'set_clear_filter', 'enabled': 'on'})['ok'])
+        chk('an empty value from an old unit means off', not on_only('') and on_only('on'))
+        sr.book.record('aa:bb:cc:00:00:01')
+        sr._adopt(sr.identity)
+        chk('re-adopting the same MAC leaves the filter alone', len(sr.book.filter) == 1)
+        sr._adopt('ba:ae:6e:00:00:09')
+        chk('a rotation then empties the filter', sr.book.filter == [])
+        sc.handle({'cmd': 'set_clear_filter', 'enabled': False})
+        sr.book.record('aa:bb:cc:00:00:01')
+        sr._adopt('ba:ae:6e:00:00:0a')
+        chk('and with it off the filter survives a rotation', len(sr.book.filter) == 1)
+        sr.book.unfilter()
         chk('the store stays put until something sets it', sr.status()['store_next'] == sr.a.store)
         mine = os.path.join(tmp, 'mine'); os.makedirs(mine); os.chmod(mine, 0o755)
         for bad, why in ((mine, 'not owned by root' if os.getuid() else None),
@@ -2440,6 +2483,8 @@ def main():
                           '180 s pass still writes ~50 kB.')
     run.add_argument('--run-logs', default='on', metavar='on|off',
                      help='write a log per listening pass to <store>/runs (default on).')
+    run.add_argument('--clear-filter-on-rotate', default='off', metavar='on|off',
+                     help='empty the MAC filter whenever the MAC rotates (default off).')
     run.add_argument('--start-paused', action='store_true')
     run.add_argument('--yy-rate', type=float, default=11.0, metavar='MBPS',
                      help='802.11b rate for the encrypted payload frames (default 11, what two '

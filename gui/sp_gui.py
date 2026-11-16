@@ -702,9 +702,25 @@ class DenylistPage(Page):
         if rep is None:
             return 'offline:%s' % why
         d = {'blocked': rep['blocked'], 'filter': rep['filter'],
+             'clear_filter_on_rotate': rep.get('clear_filter_on_rotate'),
              'backing_off': [{**c, 'remaining_s': human_secs(c['remaining_s'])}
                              for c in rep['backing_off']]}
         return json.dumps(d, sort_keys=True, default=str)
+
+    def _clear_on_rotate_row(self, rep):
+        on = bool(rep.get('clear_filter_on_rotate'))
+        sw = Gtk.Switch(active=on, valign=Gtk.Align.CENTER)
+        sw.connect('state-set', self._clear_on_rotate_toggle)
+        r = row('Clear on MAC rotation',
+                'clearing on next rotation' if on else "filter won't clear on rotation")
+        r.add_suffix(sw)
+        r.set_activatable_widget(sw)
+        return r
+
+    def _clear_on_rotate_toggle(self, _sw, want):
+        self.app.act('set_clear_filter', then='Filter %s on rotation'
+                     % ('will clear' if want else 'will be kept'), enabled=bool(want))
+        return False
 
     def _draw(self, res):
         if self.unchanged(res):
@@ -734,6 +750,7 @@ class DenylistPage(Page):
         g = self.group('MAC filter',
                        'Like a 3DS, Tuxchange refuses a MAC once it has exchanged with it, and '
                        'exchanges with that console again when it rotates it\'s MAC.\n Max: %d' % rep['filter_max'])
+        g.add(self._clear_on_rotate_row(rep))
         if rep['filter']:
             b = Gtk.Button(label='Clear', valign=Gtk.Align.CENTER, margin_bottom=6)
             b.connect('clicked', lambda *_a: self.app.dialog_clear_filter(len(rep['filter'])))
