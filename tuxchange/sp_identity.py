@@ -25,7 +25,9 @@ def derive(store_path):
         # Bit 5 of the first byte must be clear, or the plaza drops the message after the green LED.
         'mii_id': (0x90 | (h[3] & 0x0F)) | (int.from_bytes(h[4:7], 'little') << 8),
         'face_shape': h[7] % 12,
-        'hat': h[8] % 76,
+        # % 76 is kept so existing identities do not change; the two ids the game
+        # refuses already showed as no hat, so mapping them to 0 changes nothing visible.
+        'hat': 0 if h[8] % 76 in sp_build.HAT_EXCLUDED else h[8] % 76,
         'dream': h[9] % 20,
         'hobby': h[10] % 27,
         'gender': h[11] & 1,
@@ -65,14 +67,15 @@ def seed(store, store_path=None, replace=False, log=print, **kw):
     store_path = store_path or store.root
     msg = build_message(store_path, **kw)
     container = msg[sp_build.ENVELOPE_LEN:] if msg[:2] == b'\x61\x61' else msg
+    meta = dict(name='StreetPass Mii Plaza', key=sp_build.plaza_hmac_key(),
+                origin='authored:%s' % os.path.basename(__file__))
     if replace:
-        n = 0
-        for t, b, c in store.messages(sp_build.PLAZA_TITLE, 'outbox'):
-            n += bool(store.remove_message(t, b, c))
+        n = store.replace_outbox(container, **meta)
         log('  removed %d existing Mii Plaza message(s) from the outbox' % n)
-    p = store.add_message(container, 'outbox', name='StreetPass Mii Plaza',
-                          key=sp_build.plaza_hmac_key(),
-                          origin='authored:%s' % os.path.basename(__file__))
+    else:
+        store.add_message(container, 'outbox', **meta)
+    p = os.path.join(store._box_dir(sp_build.PLAZA_TITLE, 'outbox'),
+                     sp_store.message_filename(container))
     ident = derive(store_path)
     log('  filed this relay\'s own Mii Plaza message (%d B)' % len(container))
     log('    Mii %r by %r, id %08x, creator MAC %s'

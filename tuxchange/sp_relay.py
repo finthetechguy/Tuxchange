@@ -1752,7 +1752,8 @@ def _selftest():
         if src is None:
             import sp_build
             for tid, origin in ((0x00020800, None), (0x00030600, 'air:96:58:cb:00:11:22')):
-                m = sp_build.build(mii_name='Tux', greeting='self-test', cec_title_id=tid)
+                m = sp_build.build(mii_name='Tux', greeting='self-test', cec_title_id=tid,
+                                   key=b'\x11' * 32)
                 st.add_message(m[sp_build.ENVELOPE_LEN:], 'outbox', name='Self-test title',
                                key=b'\x11' * 32, origin=origin)
             chk('a store seeded from scratch has both titles',

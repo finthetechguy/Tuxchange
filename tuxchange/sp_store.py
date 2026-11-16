@@ -211,6 +211,26 @@ class Store:
             self._save_meta(m)
         return p
 
+    def replace_outbox(self, container, name=None, key=None, origin=None):
+        """Make `container` its title's only outbox message. -> how many it replaced.
+
+        The new message is written before the old ones go, so a failure leaves the
+        outbox as it was rather than empty.
+        """
+        if container[:2] != b'\x60\x60':
+            raise ValueError('replace_outbox takes a bare 0x6060 container')
+        tid = sp_cec.parse_header(container)['cec_title_id']
+        old = self.messages(tid, 'outbox')
+        if tid in self.titles() and (key is not None or name is not None):
+            self.add_title(tid, name=name, hmac_key=key)
+        self.add_message(container, 'outbox', name=name, key=key, origin=origin)
+        keep = container[0x20:0x28]
+        n = 0
+        for t, b, c in old:
+            if c[0x20:0x28] != keep:
+                n += bool(self.remove_message(t, b, c))
+        return n
+
     def _trim_inbox(self, tid, keep):
         """Hold a title's inbox to the limits BoxInfo declares, dropping the oldest. -> dropped."""
         d = self._box_dir(tid, 'inbox')
@@ -382,6 +402,27 @@ def _selftest():
         chk('a title past the store limit is refused',
             _raises(lambda: cap.add_message(_synthetic(over, 1), 'inbox')))
         chk('and leaves no directories behind', not os.path.exists(cap._title_dir(over)))
+
+        rp = Store(os.path.join(tmp, 'replace'))
+        rp.add_message(_synthetic(0x00030600, 1), 'outbox')
+        rp.add_message(_synthetic(0x00030600, 2), 'outbox')
+        rp.add_message(_synthetic(0x00020800, 3), 'outbox')
+        rp.add_message(_synthetic(0x00030600, 4), 'inbox')
+        n = rp.replace_outbox(_synthetic(0x00030600, 5), key=b'r' * 32, origin='authored:test')
+        out = [int.from_bytes(c[0x20:0x28], 'little') for _t, _b, c in rp.messages(0x00030600, 'outbox')]
+        chk('replace_outbox leaves exactly the new message', out == [5], out)
+        chk('and reports the two it replaced', n == 2, n)
+        chk('other titles and the inbox are untouched',
+            len(rp.messages(0x00020800, 'outbox')) == 1 and len(rp.messages(0x00030600, 'inbox')) == 1)
+        chk('the key it was given is recorded on an existing title', rp.title_key(0x00030600) == b'r' * 32)
+        chk('and the origin', rp.origin(_synthetic(0x00030600, 5))['source'] == 'authored:test')
+        chk('replacing a message with itself keeps it',
+            rp.replace_outbox(_synthetic(0x00030600, 5)) == 0
+            and len(rp.messages(0x00030600, 'outbox')) == 1)
+        chk('replace_outbox on a new title adds it', rp.replace_outbox(_synthetic(0x00141000, 1)) == 0
+            and 0x00141000 in rp.titles())
+        chk('an enveloped message is refused by replace_outbox',
+            _raises(lambda: rp.replace_outbox(b'\x61\x61' + b'\x00' * 200)))
 
         import lp_corpus as corpus
         src = corpus.path('console_nand') or ''

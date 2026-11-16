@@ -116,6 +116,28 @@ def parse_message(buf):
     return out
 
 
+def split_message(message):
+    """A wire message or bare container -> (header, exheaders, body) for one container.
+
+    Raises ValueError on anything that is not a whole, well-formed CEC message, so a
+    caller handing the body to a plugin never gets a truncated one.
+    """
+    message = bytes(message)
+    if message[:2] == b'\x61\x61':
+        if len(message) < 0x14 + HDR_LEN:
+            raise ValueError('envelope too short')
+        if u32(message, 0x10) > 1:
+            raise ValueError('envelope carries %d containers; split them first'
+                             % u32(message, 0x10))
+        message = message[0x14:]
+    if message[:2] != b'\x60\x60':
+        raise ValueError('not a CEC message (no 6060 or 6161 magic)')
+    m = parse_message(message)
+    if m['problems']:
+        raise ValueError('malformed CEC message: %s' % '; '.join(m['problems']))
+    return m['header'], m['exheaders'], m['body']
+
+
 # [P] means proven from the title's code. [?] means inferred.
 PLAZA_MAP = [
     (0x0000, 0x2038, 'region_a',       '[P] title info: u64 titleId | 0x30 hdr | 16 x 0x200 SMDH '
@@ -165,8 +187,10 @@ PLAZA_MAP = [
     (0x727C, 0x0004, 'x_727C',  '[P] u32; ends the body at 0x7280 exactly'),
 ]
 
-PLAZA_CLAMPS = {0x3F66: 0x4C, 0x3F67: 0x03, 0x3F68: 0x14, 0x3F69: 0x1C,
+PLAZA_CLAMPS = {0x3F66: 0xCC, 0x3F67: 0x03, 0x3F68: 0x14, 0x3F69: 0x1C,
                 0x4482: 0x65, 0x45D2: 0x04}
+# Values under the clamp that the expansion build still resets to 0 (hat validator 0x12AC50).
+PLAZA_EXCLUDED = {0x3F66: (69, 75, 168, 169)}
 
 
 def _utf16z(b):
@@ -184,6 +208,9 @@ def parse_plaza_body(body):
     for off, bound in PLAZA_CLAMPS.items():
         if off < len(body) and body[off] >= bound:
             out['problems'].append(f"+{off:#06x} = {body[off]} >= {bound} (receiver would zero it)")
+    for off, bad in PLAZA_EXCLUDED.items():
+        if off < len(body) and body[off] in bad:
+            out['problems'].append(f"+{off:#06x} = {body[off]} is refused (receiver would zero it)")
     if 0x36BC <= len(body):
         out['greeting'] = _utf16z(body[0x3F70:0x3F92]) if len(body) >= 0x3F92 else None
         out['country'] = [_utf16z(body[0x3760 + i * 0x40: 0x3760 + (i + 1) * 0x40])

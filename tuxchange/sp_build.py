@@ -86,7 +86,7 @@ def build_cfl(mii_name='Linux', author_name='', mii_id=None, creator_mac='b8:ae:
     for nm in (mii_name, author_name):
         bad = set(nm) & {'%', '\\'}
         if bad:
-            raise ValueError('Mii names may not contain %s (0x189F94 rejects them)' % sorted(bad))
+            raise ValueError('Mii names may not contain %s' % sorted(bad))
     if not (1 <= device_origin <= 3):
         raise ValueError('device_origin must be 1..3 (struct+0x104)')
     vals = dict(DEFAULT_FACE)
@@ -127,8 +127,12 @@ def build_cfl(mii_name='Linux', author_name='', mii_id=None, creator_mac='b8:ae:
 
 # Mii-card profile block at body+0x3F60. Bounds are the receive-side clamps.
 PROFILE = [('streetpass_hits', 0x00, 4, 999999), ('plaza_population', 0x04, 2, 3000),
-           ('hat', 0x06, 1, 75), ('pet', 0x07, 1, 2),
+           ('hat', 0x06, 1, 203), ('pet', 0x07, 1, 2),
            ('dream', 0x08, 1, 19), ('hobby', 0x09, 1, 27)]
+
+# The expansion build's hat validator resets these ids to 0.
+HAT_EXCLUDED = frozenset((69, 75, 168, 169))
+PROFILE_EXCLUDED = {'hat': HAT_EXCLUDED}
 
 DREAM_OPTIONS = ['big', 'champ', 'fly', 'hero', 'long', 'love', 'magic', 'marry', 'master', 'nice',
                  'president', 'princess', 'rich', 'secret', 'space', 'sports', 'star',
@@ -151,6 +155,9 @@ def build_profile(**kw):
         v = int(kw.pop(name, 0))
         if not (0 <= v <= ub):
             raise ValueError('%s = %d out of range [0, %d]' % (name, v, ub))
+        if v in PROFILE_EXCLUDED.get(name, ()):
+            raise ValueError('%s = %d is one the game resets to 0 (it refuses %s)'
+                             % (name, v, sorted(PROFILE_EXCLUDED[name])))
         if size == 4:   struct.pack_into('<I', b, off, v)
         elif size == 2: struct.pack_into('<H', b, off, v)
         else:           b[off] = v
@@ -202,30 +209,70 @@ def build_body(mii_cfl, greeting='Sent from Linux', title_id=0x0004000000000000,
     return body
 
 
-def build_message(body, message_id=None, when=None, info_text=INFO_TEXT, icon=None,
-                  cec_title_id=PLAZA_TITLE):
-    """Envelope + container header + ex-headers + body + HMAC trailer -> the wire object."""
+EXH_ICON, EXH_INFO_TEXT = 2, 4
+MAX_EXHEADERS = 16
+
+
+def exheader_icon(icon=None):
+    """Ex-header type 2: the 0xC80-byte 40x40 CEC icon (the drawn penguin if None)."""
+    icon = icon if icon is not None else cec_icon()
+    if len(icon) != 0xC80:
+        raise ValueError('a CEC icon is 0xC80 bytes, got %#x' % len(icon))
+    return (EXH_ICON, bytes(icon))
+
+
+def exheader_info_text(text):
+    """Ex-header type 4: the UTF-16 info text, NUL-terminated."""
+    return (EXH_INFO_TEXT, text.encode('utf-16-le') + b'\x00\x00')
+
+
+def build_envelope(body, cec_title_id, key=None, ex_headers=None, message_id=None, when=None,
+                   send_mode=0, flags=3):
+    """Any title's body -> the wire object: envelope, header, ex-headers, body, HMAC trailer.
+
+    `key` is the title's 32-byte HMAC key; None reads it from the key files.
+    `ex_headers` is a list of (type, bytes); None gives the icon and default info text.
+    """
     import time, random
-    if len(body) != BODY_LEN:
-        raise ValueError('body must be %#x bytes' % BODY_LEN)
+    body = bytes(body)
+    if not (0 < len(body) <= sp_cec.MAX_BODY) or len(body) & 3:
+        raise ValueError('a CEC body must be 4-byte aligned and in (0, %#x] bytes, got %#x'
+                         % (sp_cec.MAX_BODY, len(body)))
+    if not (0 < cec_title_id <= 0xFFFFFFFF):
+        raise ValueError('bad CEC title id %#x' % cec_title_id)
+    if not (0 <= send_mode < 4):
+        raise ValueError('send mode must be 0..3, got %r' % (send_mode,))
+    if key is None:
+        key = _keys.title_hmac_key(cec_title_id)
+    if len(key) != 0x20:
+        raise ValueError('an HMAC key is 32 bytes, got %d' % len(key))
+    if ex_headers is None:
+        ex_headers = [exheader_icon(), exheader_info_text(INFO_TEXT)]
+    if len(ex_headers) > MAX_EXHEADERS:
+        raise ValueError('at most %d ex-headers, got %d' % (MAX_EXHEADERS, len(ex_headers)))
     if message_id is None:
         message_id = random.getrandbits(64)
     if when is None:
         when = time.gmtime()
-    icon = icon if icon is not None else cec_icon()
 
     ex = b''
-    for t, d in ((2, icon), (4, info_text.encode('utf-16-le') + b'\x00\x00')):
-        ex += struct.pack('<II', t, len(d)) + d + b'\x00' * ((-len(d)) % 4)
+    for t, d in ex_headers:
+        if not t:
+            raise ValueError('ex-header type 0 ends the table and cannot be sent')
+        ex += struct.pack('<II', t, len(d)) + bytes(d) + b'\x00' * ((-len(d)) % 4)
     header_size = HDR_LEN + len(ex)
     total = header_size + len(body) + TRAILER_LEN
+    if total > sp_cec.MAX_TOTAL:
+        raise ValueError('message is %#x bytes, over the %#x cecd accepts'
+                         % (total, sp_cec.MAX_TOTAL))
 
     h = bytearray(HDR_LEN)
     struct.pack_into('<HH', h, 0x00, 0x6060, 0)
     struct.pack_into('<III', h, 0x04, total, header_size, len(body))
     struct.pack_into('<I', h, 0x10, cec_title_id)
     struct.pack_into('<Q', h, 0x20, message_id)
-    h[0x34] = 3
+    h[0x34] = flags
+    h[0x35] = send_mode
     struct.pack_into('<I', h, 0x60, when.tm_year)
     h[0x64] = when.tm_mon; h[0x65] = when.tm_mday
     h[0x66] = (when.tm_wday + 1) % 7              # console stores 0=Sunday
@@ -233,8 +280,8 @@ def build_message(body, message_id=None, when=None, info_text=INFO_TEXT, icon=No
     struct.pack_into('<H', h, 0x6A, 0)
     h[0x6C] = 0xFF; h[0x6D] = 1
 
-    container = bytes(h) + ex + bytes(body)
-    container += hmac.new(plaza_hmac_key(), bytes(body), hashlib.sha256).digest()
+    container = bytes(h) + ex + body
+    container += hmac.new(bytes(key), body, hashlib.sha256).digest()
 
     env = bytearray(ENVELOPE_LEN)
     struct.pack_into('<HH', env, 0x00, 0x6161, 0)
@@ -242,6 +289,15 @@ def build_message(body, message_id=None, when=None, info_text=INFO_TEXT, icon=No
     struct.pack_into('<I', env, 0x08, cec_title_id)
     struct.pack_into('<I', env, 0x10, 1)
     return bytes(env) + container
+
+
+def build_message(body, message_id=None, when=None, info_text=INFO_TEXT, icon=None,
+                  cec_title_id=PLAZA_TITLE, key=None):
+    """A Mii Plaza body -> the wire object, with the Plaza's icon and info text."""
+    if cec_title_id == PLAZA_TITLE and len(body) != BODY_LEN:
+        raise ValueError('body must be %#x bytes' % BODY_LEN)
+    return build_envelope(body, cec_title_id, key=key, message_id=message_id, when=when,
+                          ex_headers=[exheader_icon(icon), exheader_info_text(info_text)])
 
 
 def parse_appearance(cfl):
@@ -453,7 +509,7 @@ def build(**kw):
                        ('mii_name', 'author_name', 'mii_id', 'creator_mac', 'face_shape', 'kind')
                        if k in kw})
     msg_kw = {k: kw.pop(k) for k in
-              ('message_id', 'when', 'info_text', 'icon', 'cec_title_id') if k in kw}
+              ('message_id', 'when', 'info_text', 'icon', 'cec_title_id', 'key') if k in kw}
     return build_message(build_body(mii, **kw), **msg_kw)
 
 
@@ -465,6 +521,7 @@ def _raises(fn):
 
 
 def _selftest():
+    import time
     ok = tot = skipped = 0
 
     def chk(name, cond, got=''):
@@ -644,9 +701,12 @@ def _selftest():
     chk('author name is the card Creator field',
         sp_mii.parse_cfl(sp_mii.read_plaza_mii(build_body(
             build_cfl(mii_name='Tux', author_name='Tuxchange')))[0])['author_name'] == 'Tuxchange')
-    for k, v in (('streetpass_hits', 1000000), ('plaza_population', 3001), ('hat', 76),
+    for k, v in (('streetpass_hits', 1000000), ('plaza_population', 3001), ('hat', 204),
+                 ('hat', 69), ('hat', 75), ('hat', 168), ('hat', 169),
                  ('pet', 3), ('dream', 20), ('hobby', 28)):
         chk('profile %s=%d rejected' % (k, v), _raises(lambda: build_profile(**{k: v})))
+    chk('expansion hat ids above the old 75 limit are accepted',
+        build_profile(hat=76)[6] == 76 and build_profile(hat=203)[6] == 203)
     chk('unknown profile field rejected', _raises(lambda: build_profile(favourite_snack=1)))
     chk('birthday 0/0 accepted', build_cfl(birthday_month=0, birthday_day=0) is not None)
     for m_, d_ in ((13, 1), (0, 5), (2, 30), (1, 0)):
@@ -795,6 +855,33 @@ def _selftest():
                 struct.unpack_from('<I', mixed[2][0x10:], 0x2C)[0] == 0x0008C500)
             chk('an envelope will not mix titles', _raises(lambda: envelope([t1, mk7])))
         chk('an empty message list is rejected', _raises(lambda: build_outbox([], console_id=1)))
+
+    kx = bytes(range(32))
+    gb = bytes(range(256)) * 4
+    gen = build_envelope(gb, 0x00030600, key=kx, message_id=7, send_mode=3,
+                         ex_headers=[exheader_info_text('Hi'), (9, b'abcde')])
+    gh, gex, gbody = sp_cec.split_message(gen)
+    chk('build_envelope: any title, any aligned body size, round-trips through split_message',
+        gh['cec_title_id'] == 0x00030600 and gbody == gb)
+    chk('its ex-headers come back in order with their own sizes',
+        [(e['type'], e['data']) for e in gex]
+        == [(4, 'Hi'.encode('utf-16-le') + b'\x00\x00'), (9, b'abcde')])
+    chk('its send mode is the one asked for', header_send_mode(gen) == 3)
+    chk('its HMAC is under the key it was given, not the Plaza key',
+        gen[-0x20:] == hmac.new(kx, gb, hashlib.sha256).digest())
+    chk('split_message takes a bare container too', sp_cec.split_message(gen[ENVELOPE_LEN:])[2] == gb)
+    chk('an unaligned body is refused', _raises(lambda: build_envelope(b'abc', 0x00030600, key=kx)))
+    chk('an empty body is refused', _raises(lambda: build_envelope(b'', 0x00030600, key=kx)))
+    chk('a body over cecd\'s limit is refused',
+        _raises(lambda: build_envelope(b'\x00' * (sp_cec.MAX_BODY + 4), 0x00030600, key=kx)))
+    chk('a short key is refused', _raises(lambda: build_envelope(gb, 0x00030600, key=b'k')))
+    chk('send mode 4 is refused', _raises(lambda: build_envelope(gb, 0x00030600, key=kx, send_mode=4)))
+    chk('a truncated message is refused by split_message',
+        _raises(lambda: sp_cec.split_message(gen[:-0x40])))
+    chk('build_message is build_envelope with the Plaza icon and info text',
+        build_message(body, message_id=1, when=time.gmtime(0))
+        == build_envelope(body, PLAZA_TITLE, message_id=1, when=time.gmtime(0),
+                          ex_headers=[exheader_icon(), exheader_info_text(INFO_TEXT)]))
 
     import hmac as _h2, hashlib as _hh2
     fresh = set_message_id(msg, 0x0102030405060708)
