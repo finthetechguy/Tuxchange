@@ -35,7 +35,10 @@ tuxchange = "tuxchange._entry:relay"
 tuxchange-gui = "tuxchange._entry:gui"
 
 [tool.setuptools]
-packages = ["tuxchange", "tuxchange.gui"]
+packages = ["tuxchange", "tuxchange.gui", "tuxchange.plugins", "tuxchange.plugins.miiplaza"]
+
+[tool.setuptools.package-data]
+"tuxchange.plugins.miiplaza" = ["*.png"]
 
 [tool.setuptools.package-dir]
 "tuxchange.gui" = "gui"

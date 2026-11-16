@@ -1186,6 +1186,17 @@ PLUGIN = Dummy()
         chk('palette PNGs decode, with transparency over white',
             read_png(pal)[2] == [[(255, 0, 0), (255, 255, 255)]])
         chk('the built-in plugins directory sits beside this module', BUILTIN_DIR.startswith(HERE))
+        ex = load_path(os.path.join(BUILTIN_DIR, '_example.py'), 'builtin')
+        chk('the example plugin loads and keeps to the contract', isinstance(ex, Plugin),
+            getattr(ex, 'error', ''))
+        if isinstance(ex, Plugin):
+            ev = ex.defaults()
+            set_text(ex, ev, 'score', '42')
+            set_text(ex, ev, 'card.console', '01:02:03:04:05:06')
+            er = build(ex, ev)
+            chk('and its build and parse round-trip', parse(ex, er.body) == validate(ex, ev))
+        chk('but discover() does not list it', all(
+            p.id != 'example' for p in discover([(BUILTIN_DIR, 'builtin')])[0]))
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
         for k in [k for k in sys.modules if k.startswith('tuxchange_plugins.')]:

@@ -16,6 +16,16 @@ import os, sys, json, base64, argparse
 import sp_plugin as P
 
 
+INSTALLED_STORE = '/var/lib/tuxchange'      # where install/install.sh puts the service's store
+
+
+def default_store():
+    """./relay_store when there is one (a checkout), else the installed service's store."""
+    if not os.path.isdir('relay_store') and os.path.isdir(INSTALLED_STORE):
+        return INSTALLED_STORE
+    return 'relay_store'
+
+
 def daemon_call(store, cmd, **kw):
     import sp_relay
     sock = sp_relay.control_socket_path(sp_relay.resolve_store(store))
@@ -110,7 +120,9 @@ def make_parser(plugin):
     ap = argparse.ArgumentParser(prog='tuxchange create %s' % plugin.id,
                                  description='Make a %s message. --info lists every field.'
                                              % plugin.game)
-    ap.add_argument('--store', default='relay_store')
+    ap.add_argument('--store', default=None,
+                    help='the daemon\'s store (default: ./relay_store if present, else %s)'
+                         % INSTALLED_STORE)
     ap.add_argument('--info', action='store_true', help='describe the plugin and its fields')
     ap.add_argument('--edit', action='store_true',
                     help="start from the message already in the daemon's outbox")
@@ -180,6 +192,8 @@ def confirm(question):
 
 def run(plugin, argv, out=print):
     a = make_parser(plugin).parse_args(argv)
+    if a.store is None:
+        a.store = default_store()
     if a.info:
         describe(plugin, out)
         return 0
