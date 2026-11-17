@@ -61,17 +61,20 @@ class Link:
         self.a = a
         self.t0 = time.time()
         self.sock = None
-        self.pcap = Pcap(a.pcap) if a.pcap else None
+        self.pcap = None
         self.src = T.macbytes(a.mac) if a.mac else T.Runner._random_console_mac(self)
         self.token = (bytes.fromhex(a.token) if a.token
                       else bytes(random.getrandbits(8) for _ in range(8)))
         self.services = T.SERVICES_FULL if a.full_services else T.SERVICES_MIIPLAZA
         self.seq = random.randrange(0, 4096)
-        self.pn = 1
+        # Next transmit PN per key. It is never rewound: a key outlives the attempt that made it.
+        self.tx_pn = {}
+        self.rx_pn = {}
         self.state = self.IDLE
         self.max_state = self.IDLE
         self.attempts = 0
         self.peer = None
+        self.last_peer = None
         self.peer_token = None
         self.keys = []              # [(label, key)]
         self.events = []
@@ -201,6 +204,8 @@ class Link:
         # hook(link, peer_mac, peer_services) -> (services, outbox) or None.
         self.peer_hook = None
         self.declined = None
+        self.declined_peers = set()
+        self.advert = None
         # Liveness signal: if the radio wedges this stops, and the watchdog restarts the service.
         self.tick_hook = None
         self.sightings = {}          # mac -> {'n','first','last','token','rssi'}
@@ -213,6 +218,7 @@ class Link:
         self.chan_locked = False
         self.retune_proven = False
         self.next_hop = 0.0
+        self.pcap = Pcap(a.pcap) if a.pcap else None
 
     def log(self, msg, level=1):
         line = '[%8.3f] %s' % (time.time() - self.t0, msg)
@@ -252,6 +258,16 @@ class Link:
             return False
         self.sock = s
         return True
+
+    def close(self):
+        if self.sock is not None:
+            try:
+                self.sock.close()
+            except OSError:
+                pass
+            self.sock = None
+        if self.pcap:
+            self.pcap.close()
 
     def send(self, mpdu, rate=1.0, noack=True, what=''):
         rt = T.radiotap_tx(rate, noack=noack)
@@ -301,28 +317,52 @@ class Link:
                 continue
         return None, None, None
 
+    def advertised(self):
+        """(services, outbox) as configured for the broadcast probe, before any peer narrowed them."""
+        if self.advert is None:
+            self.advert = (list(self.services), list(self.outbox))
+        return self.advert
+
+    def reset_attempt(self):
+        """Forget everything that belonged to one console's engagement."""
+        services, outbox = self.advertised()
+        self.services, self.outbox = list(services), list(outbox)
+        self.peer = self.peer_token = None
+        self.keys = []
+        self.session = None
+        self.rx_pn = {}
+        self.t_engaged = self.pending_poll = self.linkbss_giveup = self.t_first_poll = None
+
     def on_probe_response(self, f, mpdu, inf):
         """The console engaged us. Reply with the action frame, then the directed probe."""
         if self.state >= self.LINKBSS:
             return
-        self.peer = T.macbytes(f['addr2'])
+        mac = f['addr2']
+        if mac in self.declined_peers:
+            self.log('  probe response from %s, declined earlier this pass, ignoring' % mac, 2)
+            return
+        self.reset_attempt()
+        self.peer = self.last_peer = T.macbytes(mac)
         self.peer_token = bytes.fromhex(inf['token']) if inf.get('token') else None
         self.t_engaged = time.time()
-        self.log('  *** CONSOLE ENGAGED: %s' % f['addr2'])
+        self.log('  *** CONSOLE ENGAGED: %s' % mac)
         self.log('      token %s   DS=ch%s   %d services'
                  % (inf.get('token'), inf.get('ds'), len(inf.get('services') or [])))
         # The broadcast probe declares everything held. From here, narrow to what this console has.
         if self.peer_hook is not None:
             try:
-                picked = self.peer_hook(self, f['addr2'], inf.get('services') or [])
-                if picked:
-                    self.services, self.outbox = picked
-                    self.log('      serving %d title(s), %d object(s)'
-                             % (len(self.services), len(self.outbox)))
-                    self.log_our_lists()
+                picked = self.peer_hook(self, mac, inf.get('services') or [])
             except Exception as e:
-                self.log('      peer hook failed (%s: %s), serving the default outbox'
-                         % (type(e).__name__, e))
+                picked = None
+                self.declined = 'selection failed'
+                self.log('      peer hook failed (%s: %s)' % (type(e).__name__, e))
+            if not picked:
+                self.decline_peer(mac)
+                return
+            self.services, self.outbox = picked
+            self.log('      serving %d title(s), %d object(s)'
+                     % (len(self.services), len(self.outbox)))
+            self.log_our_lists()
         self.setstate(self.ENGAGED)
         self.derive_keys()
         for _ in range(2):
@@ -435,27 +475,33 @@ class Link:
                              'flags=%d size=%#x  code=%d (%s)'
                              % (i, tid, mode, hf, size, code, self.EE_CODE.get(code, '?')))
 
+    def decline_peer(self, mac):
+        """Serve this console nothing for the rest of the pass, and stop its handshake now."""
+        self.declined_peers.add(mac)
+        self.log('      not engaging %s for the rest of this pass' % mac)
+        self.abandon_attempt()
+
     def send_yy(self, flags, seq, ack, payload=b''):
         """Encrypt one YY segment and put it on the air. The Stage 3 session's only outlet."""
         if not self.keys:
             return False
         _lbl, key = self.keys[0]
+        pn = self.tx_pn.get(key, 1)
+        self.tx_pn[key] = pn + 1
         pt = sp_yysession.build_yy_frame(flags, seq, ack, payload)
-        mpdu = build_encrypted_data(key, self.src, self.peer, self.peer, self.pn, pt,
+        mpdu = build_encrypted_data(key, self.src, self.peer, self.peer, pn, pt,
                                     seq=self.next_seq())
         # 11 Mbps saves most of the airtime and keeps CCK link margin.
-        ok = self.send(mpdu, rate=self.a.yy_rate, noack=False,
-                       what='YY %s' % sp_yy.flagstr(flags).replace('|', '+'))
-        self.pn += 1
-        return ok
+        return self.send(mpdu, rate=self.a.yy_rate, noack=False,
+                         what='YY %s' % sp_yy.flagstr(flags).replace('|', '+'))
 
     def send_syn(self):
         if not self.keys:
             self.log('  cannot send SYN: no key (never saw the console token)')
             return
-        lbl, _key = self.keys[0]
+        lbl, key = self.keys[0]
         self.log('  opening the YY exchange  PN=%d  key[%s]  bssid=%s'
-                 % (self.pn, lbl, T.macstr(self.peer)))
+                 % (self.tx_pn.get(key, 1), lbl, T.macstr(self.peer)))
         if self.outbox:
             self.session = sp_yysession.YYSession(self.send_yy, self.log, self.outbox,
                                                   on_received=self.on_object_received)
@@ -488,6 +534,10 @@ class Link:
         self.setstate(self.SYNSENT)
 
     def on_protected(self, f, mpdu):
+        if not self.peer or f['addr2'] != T.macstr(self.peer) or f['addr1'] != T.macstr(self.src):
+            self.log('  protected data %s -> %s is not for this attempt, ignoring'
+                     % (f['addr2'], f['addr1']), 2)
+            return
         self.protected_seen += 1
         pt, lbl, key = self.try_decrypt(mpdu)
         if pt is None:
@@ -496,12 +546,21 @@ class Link:
             self.events.append({'t': time.time() - self.t0, 'kind': 'protected-undecryptable',
                                 'from': f['addr2'], 'len': len(mpdu)})
             return
+        pn = sp_ccmp.pn_of(mpdu)
+        rk = (key, f['addr2'], sp_ccmp.tid_of(mpdu))
+        if pn <= self.rx_pn.get(rk, 0):
+            self.log('  protected data from %s: PN %d replayed (last accepted %d), dropped'
+                     % (f['addr2'], pn, self.rx_pn[rk]), 2)
+            self.events.append({'t': time.time() - self.t0, 'kind': 'replay',
+                                'from': f['addr2'], 'pn': pn})
+            return
+        self.rx_pn[rk] = pn
         self.log('')
         self.log('  ############################################################')
         self.log('  ###  DECRYPTED A FRAME FROM THE CONSOLE                  ###')
         self.log('  ############################################################')
         self.log('      key      : %s  [%s]' % (key.hex(), lbl))
-        self.log('      PN       : %d' % sp_ccmp.pn_of(mpdu))
+        self.log('      PN       : %d' % pn)
         self.log('      plaintext: %s' % pt.hex())
         y = sp_yy.parse(pt)
         if y:
@@ -753,67 +812,69 @@ class Link:
                  % (self.token.hex(), ['%08x' % s[0] for s in self.services]))
         if self.a.pcap:
             self.log('  writing %s' % self.a.pcap)
-        if not self.open_socket():
-            return 2
-        T.tune(self.a.iface, self.channels[0], self.log)
-        # Read the channel from radiotap, because iw cannot report it for an active monitor.
-        actual = self.detect_channel(2.0)
-        if actual is None:
-            self.log('WARNING: no frames received, cannot confirm the channel. Continuing blind.')
-        else:
-            if actual != self.channels[0]:
-                self.log('NOTE: asked for channel %d but the radio is on channel %d.'
-                         % (self.channels[0], actual))
-                self.log('      An active monitor vif cannot be retuned; working on %d instead.'
-                         % actual)
-                self.channels = [actual]
-                self.chan_locked = True
-            self.log('  channel %d (%d MHz) CONFIRMED by measuring received frames'
-                     % (actual, T.CH_FREQ[actual]))
-        self.next_hop = time.time() + self.a.dwell
-        before, csrc = T.read_tx_counters(self.a.iface)
+        self.advertised()
+        try:
+            if not self.open_socket():
+                return 2
+            T.tune(self.a.iface, self.channels[0], self.log)
+            # Read the channel from radiotap, because iw cannot report it for an active monitor.
+            actual = self.detect_channel(2.0)
+            if actual is None:
+                self.log('WARNING: no frames received, cannot confirm the channel. '
+                         'Continuing blind.')
+            else:
+                if actual != self.channels[0]:
+                    self.log('NOTE: asked for channel %d but the radio is on channel %d.'
+                             % (self.channels[0], actual))
+                    self.log('      An active monitor vif cannot be retuned; working on %d instead.'
+                             % actual)
+                    self.channels = [actual]
+                    self.chan_locked = True
+                self.log('  channel %d (%d MHz) CONFIRMED by measuring received frames'
+                         % (actual, T.CH_FREQ[actual]))
+            self.next_hop = time.time() + self.a.dwell
+            before, csrc = T.read_tx_counters(self.a.iface)
 
-        deadline = time.time() + self.a.secs
-        nxt = 0.0
-        while time.time() < deadline and self.state != self.DONE:
-            if self.tick_hook is not None:
-                self.tick_hook(self)
-            if self.state in (self.IDLE,) and time.time() >= nxt:
-                self.send(sp_parse.build_probe(self.src, self.token, self.services,
-                                               seq=self.next_seq()),
-                          rate=1.0, noack=True, what='broadcast probe')
-                nxt = time.time() + self.a.probe_interval
-            self.pump(min(deadline, nxt if self.state == self.IDLE else time.time() + 0.2))
-            if self.state != self.IDLE and not self.t_engaged:
-                self.log('  in state %s with no engagement in flight, resetting to IDLE'
-                         % self.STATE_NAME[self.state])
-                self.setstate(self.IDLE)
-            if self.session and (time.time() - self.session.last_activity) < 3.0:
-                self.t_engaged = time.time()      # transfer in progress: do not time it out
-            if self.state in (self.REPLIED, self.LINKBSS, self.SYNSENT) and self.t_engaged \
-                    and time.time() - self.t_engaged > self.a.attempt_timeout:
-                self.log('  attempt timed out after %.1f s in state %s, re-advertising'
-                         % (self.a.attempt_timeout, self.STATE_NAME[self.state]))
-                self.abandon_attempt()
-                nxt = 0.0
-        after, _ = T.read_tx_counters(self.a.iface)
-        return self.verdict(before, after, csrc)
+            deadline = time.time() + self.a.secs
+            nxt = 0.0
+            while time.time() < deadline and self.state != self.DONE:
+                if self.tick_hook is not None:
+                    self.tick_hook(self)
+                if self.state in (self.IDLE,) and time.time() >= nxt:
+                    self.send(sp_parse.build_probe(self.src, self.token, self.services,
+                                                   seq=self.next_seq()),
+                              rate=1.0, noack=True, what='broadcast probe')
+                    nxt = time.time() + self.a.probe_interval
+                self.pump(min(deadline, nxt if self.state == self.IDLE else time.time() + 0.2))
+                if self.state != self.IDLE and not self.t_engaged:
+                    self.log('  in state %s with no engagement in flight, resetting to IDLE'
+                             % self.STATE_NAME[self.state])
+                    self.setstate(self.IDLE)
+                if self.session and (time.time() - self.session.last_activity) < 3.0:
+                    self.t_engaged = time.time()      # transfer in progress: do not time it out
+                if self.state in (self.REPLIED, self.LINKBSS, self.SYNSENT) and self.t_engaged \
+                        and time.time() - self.t_engaged > self.a.attempt_timeout:
+                    self.log('  attempt timed out after %.1f s in state %s, re-advertising'
+                             % (self.a.attempt_timeout, self.STATE_NAME[self.state]))
+                    self.abandon_attempt()
+                    nxt = 0.0
+            after, _ = T.read_tx_counters(self.a.iface)
+            return self.verdict(before, after, csrc)
+        finally:
+            self.close()
 
     def abandon_attempt(self):
         """Drop the current engagement and go back to advertising."""
         self.setstate(self.IDLE)
-        self.t_engaged = None
-        self.pending_poll = None
-        self.linkbss_giveup = None
-        self.pn = 1
+        self.reset_attempt()
 
     def verdict(self, before, after, csrc):
         self.banner('VERDICT')
         self.log('  furthest state reached : %s   (%d engagement attempt(s))'
                  % (self.STATE_NAME[self.max_state], self.attempts))
         if self.declined:
-            self.log('  offered nothing     : %s  (this pass ended by choice, not the '
-                     "console's)" % self.declined)
+            self.log('  we offered nothing     : %s  (declined by us, not refused by the '
+                     'console)' % self.declined)
         # `sightings` counts probe requests, which consoles may never send, so NONE proves nothing.
         if self.sightings:
             for m, c in sorted(self.sightings.items(), key=lambda kv: -kv[1]['n']):
@@ -858,9 +919,10 @@ class Link:
         if getattr(self, 'acks_baseline', 0):
             self.log('     (a non-zero baseline means this channel has a repeater echoing, so an')
             self.log('      ACK alone does not prove console contact here)')
-        if self.peer:
+        if self.peer or self.last_peer:
             self.log('  console                : %s  token=%s'
-                     % (T.macstr(self.peer), self.peer_token.hex() if self.peer_token else '-'))
+                     % (T.macstr(self.peer or self.last_peer),
+                        self.peer_token.hex() if self.peer_token else '-'))
         d = T.diff_counters(before, after)
         if d:
             self.log('  TX proof (%s): %s' % (csrc, {k: v for k, v in list(d.items())[:6]}))
@@ -1240,12 +1302,28 @@ class _FakeSock:
         return bool(self.script) and (time.time() - self.t0) >= self.script[0][0]
 
     def close(self):
-        pass
+        self.closed = True
 
 
 def _rt(mpdu):
     """Radiotap with Flags present and the FCS bit CLEAR, plus a 4-byte fake FCS omitted."""
     return struct.pack('<BBHIBB', 0, 0, 10, (1 << 1) | (1 << 2), 0x00, 2) + mpdu
+
+
+def _sim_args(**over):
+    """A Link's arguments for driving it without a radio."""
+    a = dict(
+        iface='sim', channel=11, secs=8.0, probe_interval=0.25, poll_delay=0.05, poll_burst=2,
+        linkbss_wait=0.15, linkbss_patience=1.0, attempt_timeout=6.0, mac=None, token=None,
+        full_services=False, pcap=None, pcap_all=False, log=None, verbose=0, reactive=False,
+        min_gap=0.5, heartbeat=1e9, objects=None, dwell=6.0, yy_idle=0.4, yy_rate=11.0,
+        fresh_msgid=False, fresh_consoleid=False, empty_offer=False, mirror_offer=False,
+        full_sequence=False, greeting=None, fresh_mii=False, mii_name=None, author_name=None,
+        from_scratch=False, forward=None, keep_msgid=False, title_id=None, title_name=None,
+        hits=0, population=0, hat=0, pet=0, dream=0, hobby=0, birthday=None, colour=0,
+        gender=0, bubble=0)
+    a.update(over)
+    return argparse.Namespace(**a)
 
 
 def simulate(verbose=1, peer_hook=None, out=None, link_at=0.60):
@@ -1265,12 +1343,7 @@ def simulate(verbose=1, peer_hook=None, out=None, link_at=0.60):
     SIM_NORMALKEY = bytes(range(16))
     use_real_keys = bool(V.get('synack'))
 
-    a = argparse.Namespace(
-        iface='sim', channel=11, secs=8.0, probe_interval=0.25, poll_delay=0.05, poll_burst=2,
-        linkbss_wait=0.15, linkbss_patience=1.0, attempt_timeout=6.0, mac=US, token=US_TOK, full_services=False,
-        pcap=None, pcap_all=False, log=None, verbose=verbose, reactive=False, min_gap=0.5,
-        heartbeat=1e9, objects=None, dwell=6.0, yy_idle=0.4, yy_rate=11.0,
-        fresh_msgid=False, fresh_consoleid=False, empty_offer=False, mirror_offer=False, full_sequence=False, greeting=None, fresh_mii=False, mii_name=None, author_name=None, from_scratch=False, forward=None, keep_msgid=False, title_id=None, title_name=None, hits=0, population=0, hat=0, pet=0, dream=0, hobby=0, birthday=None, colour=0, gender=0, bubble=0)
+    a = _sim_args(mac=US, token=US_TOK, verbose=verbose)
     L = Link(a)
     if not use_real_keys:
         L.key17, L.normalkey_2e = SIM_KEY17, SIM_NORMALKEY
@@ -1539,7 +1612,7 @@ def selftest():
             self.src = T.macbytes('ba:ae:6e:01:02:03')
             self.peer = T.macbytes('96:58:cb:0a:0b:0c')
             self.keys = [('t', bytes(range(16)))]
-            self.seq = 0; self.pn = 1; self.sent = {}; self.sent_frames = []
+            self.seq = 0; self.tx_pn = {}; self.sent = {}; self.sent_frames = []
             self.sock = None
         def send(self, mpdu, rate=1.0, noack=True, what=''):
             self.sent_frames.append((what, mpdu, rate)); return True
@@ -1553,7 +1626,7 @@ def selftest():
     y = sp_yy.parse(pt)
     chk('it decrypts back to the exact YY segment we asked for',
         y and y['ok'] and y['seq'] == 1452 and y['payload'] == payload, y and y['payload_len'])
-    chk('PN advanced after sending', L2.pn == 2, L2.pn)
+    chk('PN advanced after sending', L2.tx_pn[L2.keys[0][1]] == 2, L2.tx_pn)
     L2.send_yy(sp_yy.ACK, 2476, 0, b'z')
     chk('consecutive frames use consecutive PNs',
         sp_ccmp.pn_of(L2.sent_frames[-1][1]) == 2, sp_ccmp.pn_of(L2.sent_frames[-1][1]))
@@ -1664,6 +1737,7 @@ def selftest():
             self.max_state = self.state = self.IDLE
             self.attempts = self.rx_total = self.echoes = self.protected_seen = 0
             self.declined = self.session = self.peer = self.pcap = self.decrypted = None
+            self.last_peer = None
             self.sent = {}
             self.outbox = []
             self.t0 = time.time() - 30
@@ -1697,9 +1771,160 @@ def selftest():
     chk('the receive loop feeds note_on_air only for non-probe console frames',
         'elif is_console_frame:' in rx and 'self.note_on_air(' in rx)
 
+    attempt_checks(chk)
+
     print('\n%d/%d checks passed%s' % (ok, tot,
           '' if not skipped else ', %d skipped (no test corpus)' % skipped))
     return 0 if ok == tot else 1
+
+
+def attempt_checks(chk):
+    """Per-attempt state, transmit PN lifetime, replay rejection and cleanup."""
+    US, US_TOK = 'ba:ae:6e:44:55:66', '8899aabbccddeeff'
+    A, B, C = '96:58:cb:00:00:0a', '96:58:cb:00:00:0b', '96:58:cb:00:00:0c'
+    A_TOK = '0011223344556677'
+    base_svc = [(0x00020800, 0x00, b''), (0x00030600, 0x30, b'')]
+    a_pick = ([(0x00020800, 0x00, b'')], [cec_object(0x41, b'A' * 0x28)])
+
+    def new_link():
+        L = Link(_sim_args(mac=US, token=US_TOK))
+        L.key17, L.normalkey_2e = b'TuxchangeSelfTest', bytes(range(16))
+        L.services, L.outbox = list(base_svc), []
+        L.sock = _FakeSock([])
+        return L
+
+    def engage(L, mac, tok=A_TOK):
+        f = {'addr2': mac, 'addr1': US}
+        L.on_probe_response(f, b'', {'token': tok, 'ds': 11, 'services': []})
+
+    def sent_to(L, mac):
+        return [w for w, m in L.sent_frames if m[4:10] == T.macbytes(mac)]
+
+    def blocked(link, mac, svc):
+        link.declined = 'blocked'
+        return None
+
+    def nothing(link, mac, svc):
+        return None
+
+    def broken(link, mac, svc):
+        raise RuntimeError('selection exploded')
+
+    for name, second in (('blocked', blocked), ('no common title', nothing),
+                         ('selection exception', broken)):
+        calls = []
+
+        def hook(link, mac, svc, second=second):
+            calls.append(mac)
+            return a_pick if mac == A else second(link, mac, svc)
+        L = new_link()
+        L.peer_hook = hook
+        engage(L, A)
+        served_a = L.outbox == a_pick[1] and L.state == Link.REPLIED
+        L.session = object()
+        L.abandon_attempt()
+        engage(L, B)
+        chk('A served, then B %s: B is not handed A\'s outbox' % name,
+            served_a and L.outbox == [] and L.services == base_svc, (L.outbox, L.services))
+        chk('B %s: its handshake stops at once' % name,
+            L.state == Link.IDLE and L.peer is None and not L.keys and L.session is None
+            and not sent_to(L, B), (Link.STATE_NAME[L.state], sent_to(L, B)))
+        engage(L, B)
+        chk('B %s: it is not asked about again in the same pass' % name,
+            calls == [A, B], calls)
+        chk('B %s: the pass still records who engaged last' % name, L.last_peer == T.macbytes(B))
+    L = new_link()
+    L.peer_hook = lambda link, mac, svc: a_pick
+    engage(L, A)
+    L.abandon_attempt()
+    chk('abandoning restores the broadcast advertisement',
+        L.services == base_svc and L.outbox == [] and L.t_engaged is None and not L.keys)
+    engage(L, C)
+    chk('and a later allowed peer is still served', L.state == Link.REPLIED
+        and L.outbox == a_pick[1] and C not in L.declined_peers)
+
+    L = new_link()
+    engage(L, A)
+    key = L.keys[0][1]
+    L.send_yy(sp_yy.SYN, 0, 0)
+    first = L.sent_frames[-1][1]
+    L.abandon_attempt()
+    engage(L, A)
+    L.send_yy(sp_yy.SYN, 0, 0)
+    second = L.sent_frames[-1][1]
+    chk('same peer, same token: the retry derives the same key', L.keys[0][1] == key)
+    chk('and its SYN does not reuse the PN (no CCMP nonce reuse)',
+        sp_ccmp.pn_of(second) > sp_ccmp.pn_of(first), (sp_ccmp.pn_of(first),
+                                                       sp_ccmp.pn_of(second)))
+    L2 = new_link()
+    engage(L2, B)
+    L2.send_yy(sp_yy.SYN, 0, 0)
+    chk('a different key still starts at PN 1', sp_ccmp.pn_of(L2.sent_frames[-1][1]) == 1)
+
+    L = new_link()
+    engage(L, A)
+    L.setstate(Link.SYNSENT)
+    L.session = sp_yysession.YYSession(lambda *x: True, lambda m, l=1: None, [b'x' * 64])
+    key = L.keys[0][1]
+
+    def from_a(pn, flags, payload=b'', src=A, dst=US):
+        return build_encrypted_data(key, T.macbytes(src), T.macbytes(dst), T.macbytes(src), pn,
+                                    sp_yysession.build_yy_frame(flags, 0, 0, payload), seq=pn)
+
+    def feed(m):
+        L.on_protected(T.parse_mpdu(m), m)
+
+    syn = from_a(1, sp_yy.SYN)
+    feed(syn)
+    rx0 = L.session.stats['rx_frames']
+    L.session.rx_buf += b'partial object'
+    feed(syn)
+    chk('a replayed SYN is dropped before it reaches the session',
+        L.session.stats['rx_frames'] == rx0 and bytes(L.session.rx_buf) == b'partial object',
+        bytes(L.session.rx_buf))
+    chk('and the drop is recorded', any(e['kind'] == 'replay' for e in L.events))
+    retry = bytearray(syn)
+    retry[1] |= 0x08
+    feed(bytes(retry))
+    chk('an 802.11 retry of an accepted PN is dropped too', L.session.stats['rx_frames'] == rx0)
+    feed(from_a(2, sp_yy.ACK))
+    chk('the next PN is accepted', L.session.stats['rx_frames'] == rx0 + 1)
+    stale = from_a(1, sp_yy.ACK)
+    feed(stale)
+    chk('an older PN is rejected even with a valid MIC', L.session.stats['rx_frames'] == rx0 + 1)
+    seen = L.protected_seen
+    feed(from_a(9, sp_yy.ACK, src=C))
+    feed(from_a(10, sp_yy.ACK, dst=B))
+    chk('frames from another sender or to another destination are ignored',
+        L.protected_seen == seen and L.session.stats['rx_frames'] == rx0 + 1)
+    L.abandon_attempt()
+    chk('replay state belongs to the attempt', L.rx_pn == {})
+
+    import tempfile
+    tmp = tempfile.mkdtemp(prefix='tuxchange-selftest-')
+    L = Link(_sim_args(mac=US, token=US_TOK, pcap=os.path.join(tmp, 'x.pcap')))
+    fake = _FakeSock([])
+
+    def _open():
+        L.sock = fake
+        return True
+    L.open_socket = _open
+    real_tune = T.tune
+
+    def _boom(*_a, **_k):
+        raise RuntimeError('radio vanished')
+    T.tune = _boom
+    try:
+        L.run()
+    except RuntimeError:
+        pass
+    finally:
+        T.tune = real_tune
+    chk('a link that fails mid-run still closes its socket and pcap',
+        getattr(fake, 'closed', False) and L.sock is None and L.pcap.f.closed)
+    L = Link(_sim_args(mac=US, token=US_TOK, pcap=os.path.join(tmp, 'y.pcap')))
+    L.open_socket = lambda: False
+    chk('and so does one whose interface cannot be opened', L.run() == 2 and L.pcap.f.closed)
 
 
 def build_parser():

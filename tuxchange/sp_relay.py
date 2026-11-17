@@ -1544,6 +1544,7 @@ class Relay:
     def peer_hook(self, link, mac, peer_services):
         """Called the instant a console engages: choose what to serve this console."""
         import sp_link
+        self._pending_sent, self._pending_map, self._detail, self._declined = [], {}, {}, None
         if self.book.is_blocked(mac):
             r = self._decline(link, 'blocked',
                               '  %s is on the denylist; refusing to exchange with it' % mac)
@@ -1639,7 +1640,8 @@ class Relay:
             self.hooks.fire('error', error=self.last_error)
             return False
         self.iface_failures = 0
-        peer = sp_link.T.macstr(link.peer) if link.peer else None
+        peer = link.peer or link.last_peer
+        peer = sp_link.T.macstr(peer) if peer else None
         got = []
         sess = getattr(link, 'session', None)
         # Record only what was delivered, or a failed exchange would use up its messages.
@@ -2801,6 +2803,11 @@ def _selftest():
         chk('declining without a link does not raise',
             rnl.peer_hook(None, 'DE:AD:BE:EF:00:02', [{'titleID': '00020800'}]) is None)
         chk('and still records the reason on the relay', rnl._declined == 'blocked')
+        rnl._pending_sent, rnl._pending_map = [b'A' * 8], {3: [b'A' * 8]}
+        rnl._detail = {b'A' * 8: {'title': '00020800', 'bytes': 1}}
+        rnl.peer_hook(None, 'DE:AD:BE:EF:00:02', [{'titleID': '00020800'}])
+        chk("a decline drops the previous peer's pending deliveries",
+            rnl._pending_sent == [] and rnl._pending_map == {} and rnl._detail == {})
 
         class _NoLog:
             src = b'\x00' * 6

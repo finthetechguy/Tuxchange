@@ -68,6 +68,12 @@ def pn_of(mpdu):
     return int.from_bytes(_pn6_from_ccmphdr(c), 'big')
 
 
+def tid_of(mpdu):
+    """Traffic identifier: the QoS TID, or 0 for a non-QoS frame."""
+    h = _parse_hdr(mpdu)
+    return (h['qos'] & 0x0F) if h['qos'] is not None else 0
+
+
 def decrypt(key, mpdu):
     """Return plaintext body of a CCMP-protected MPDU, verifying the MIC. Raises on MIC failure."""
     h = _parse_hdr(mpdu)
