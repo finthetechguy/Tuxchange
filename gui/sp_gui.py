@@ -1083,7 +1083,8 @@ class RelayApp(Adw.Application):
         rep = Adw.AlertDialog(
             heading='Import CEC data',
             body='A console save image, a mounted dump directory, or an Azahar/Citra NAND.\n\n'
-                 'Replace empties the outbox then replaces it with the new CEC data. '
+                 'Replace swaps the outbox for the new CEC data, and leaves it alone if '
+                 'there is none. '
                  'Otherwise, an import adds to what is already there.')
         rep.add_response('cancel', 'Cancel')
         rep.add_response('add', 'Add to outbox')

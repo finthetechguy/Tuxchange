@@ -4,7 +4,7 @@ import contextlib, os, sys, json, time, socket, stat, struct, threading, random,
 import base64, subprocess, queue, signal, tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import sp_store, sp_cecstore, sp_cec, sp_cecvalid, sp_harvest_air, sp_build
+import sp_store, sp_cec, sp_cecvalid, sp_harvest_air, sp_build, sp_import
 
 # Like a 3DS's own MacFilter: a MAC that has completed an exchange is refused until it changes.
 # The console keeps the last 255 and never expires one; a 3DS presents a new MAC from time to time.
@@ -167,38 +167,6 @@ def write_store_pointer(home, store):
         return None
     except OSError as e:
         return str(e)
-
-
-def peer_can_read(path, uid):
-    """Could `uid` read `path` itself? The daemon is root and must not read on behalf of someone who cannot."""
-    if uid == 0:
-        return True
-    try:
-        user = pwd.getpwuid(uid)
-        groups = set(os.getgrouplist(user.pw_name, user.pw_gid))
-    except KeyError:
-        groups = set()
-
-    def allowed(st, bit):
-        if st.st_uid == uid:
-            return bool((st.st_mode >> 6) & bit)
-        if st.st_gid in groups:
-            return bool((st.st_mode >> 3) & bit)
-        return bool(st.st_mode & bit)
-
-    real = os.path.realpath(path)
-    try:
-        parent = os.path.dirname(real)
-        while True:
-            if not allowed(os.stat(parent), 1):
-                return False
-            if parent == os.path.dirname(parent):
-                break
-            parent = os.path.dirname(parent)
-        st = os.stat(real)
-    except OSError:
-        return False
-    return allowed(st, 4) and (not stat.S_ISDIR(st.st_mode) or allowed(st, 1))
 
 
 def sd_notify(state):
@@ -567,67 +535,80 @@ def select_for_peer(store, peer_titles, book=None, mac=None, max_titles=None, lo
     return out
 
 
-def title_metadata_any(path):
-    """-> {title: {'name', 'hmac_key'}} from a save image OR a directory tree."""
-    if not os.path.isdir(path):
-        import sp_savefs
-        try:
-            return sp_cecstore.title_metadata(sp_savefs.SaveFS(open(path, 'rb').read()))
-        except Exception:
-            return {}
-    out = {}
-    for dirpath, _d, files in os.walk(path):
-        parts = os.path.normpath(dirpath).split(os.sep)
-        if len(parts) < 2 or parts[-2].upper() != 'CEC':
-            continue
-        try:
-            tid = int(parts[-1], 16)
-        except ValueError:
-            continue
-        e = out.setdefault(tid, {'name': None, 'hmac_key': None})
-        if sp_cecstore.CEC_FILENAMES['mboxinfo'] in files:
-            try:
-                e['hmac_key'] = sp_cecstore.parse_mboxinfo(
-                    open(os.path.join(dirpath, sp_cecstore.CEC_FILENAMES['mboxinfo']),
-                         'rb').read())['hmac_key']
-            except (ValueError, OSError):
-                pass
-        if 'MBoxData.010' in files:
-            try:
-                e['name'] = sp_cec.decode_utf16_name(
-                    open(os.path.join(dirpath, 'MBoxData.010'), 'rb').read())
-            except OSError:
-                pass
-    return out
+def import_into(store, path, log=print, replace=False, allow_empty=False, source=None):
+    """Ingest CEC data from a save image, a mounted directory, or an emulator NAND.
 
-
-def import_into(store, path, log=print, replace=False):
-    """Ingest CEC data from a save image, a mounted directory, or an emulator NAND."""
-    found = sp_cecstore.scan_any(path)
-    meta = title_metadata_any(path)
-    if replace:
-        log('  cleared %d message(s) from the outbox first' % store.clear_box('outbox'))
-    n = skipped = 0
-    for m in found:
-        c = m.get('raw')
-        if not c:
-            continue
-        t = m['cec_title_id']
-        md = meta.get(t) or {}
+    Every message is checked, and the store's title limit with it, before anything is
+    written. A replacement keeps the old outbox until the new one is filed, and puts it back
+    if filing fails. -> how many messages were imported; raises sp_import.Refused instead.
+    """
+    if source is None:
+        source = sp_import.read_source(path)
+    meta = source['meta']
+    good, skipped = [], 0
+    for m in source['messages']:
         try:
-            store.add_message(c, m['box'] if m['box'] in ('inbox', 'outbox') else 'outbox',
-                              name=md.get('name'), key=md.get('hmac_key'),
-                              origin=os.path.abspath(path))
-        except sp_cecvalid.Invalid as e:
-            log('  skipped %s (%08X): %s' % (m.get('path', '?'), t, e))
+            c, t = store._checked(m['raw'], (meta.get(sp_cecvalid.parts(m['raw'])[2])
+                                             or {}).get('hmac_key'))
+        except (sp_cecvalid.Invalid, ValueError) as e:
+            log('  skipped %s: %s' % (m.get('path', '?'), e))
             skipped += 1
             continue
+        good.append((t, m['box'] if m['box'] in ('inbox', 'outbox') else 'outbox', c))
+    if not good and not (replace and allow_empty):
+        raise sp_import.Refused(
+            'no_messages', 'found no valid CEC messages in %s%s%s'
+            % (path, '; skipped %d malformed or unauthentic' % skipped if skipped else '',
+               '; the outbox is unchanged' if replace else ''))
+    have = store.titles()
+    titles = have + sorted({t for t, _b, _c in good} - set(have))
+    if len(titles) > sp_store.MBOXLIST_MAX:
+        raise sp_import.Refused(
+            'too_many_titles', 'importing %s would make %d titles, over the limit of %d%s'
+            % (path, len(titles), sp_store.MBOXLIST_MAX,
+               '; the outbox is unchanged' if replace else ''))
+
+    og = store.origins()
+    before = {}
+    for t, b, c in store.messages():
+        mid = c[0x20:0x28]
+        before[(t, b, mid)] = (c, (og.get(store._okey(mid, b)) or {}).get('source'))
+    origin = os.path.abspath(path)
+    added, cleared = [], 0
+    try:
+        for t, box, c in good:
+            md = meta.get(t) or {}
+            store.add_message(c, box, name=md.get('name'), key=md.get('hmac_key'), origin=origin)
+            added.append((t, box, c))
+        if replace:
+            keep = {(t, c[0x20:0x28]) for t, b, c in added if b == 'outbox'}
+            for (t, b, mid), (c, _o) in before.items():
+                if b == 'outbox' and (t, mid) not in keep:
+                    cleared += bool(store.remove_message(t, b, c))
+    except Exception:
+        for t, box, c in added:
+            if (t, box, c[0x20:0x28]) not in before:
+                store.remove_message(t, box, c)
+        now = {(t, b, c[0x20:0x28]): c for t, b, c in store.messages()}
+        for k, (c, o) in before.items():
+            if now.get(k) != c:
+                try:
+                    store.add_message(c, k[1], origin=o)
+                except ValueError as e:
+                    log('  could not put back %08X/%s: %s' % (k[0], k[2].hex(), e))
+        for t in set(store.titles()) - set(have):
+            if not store.messages(t):
+                store.remove_title(t)
+        raise
+    for t in {t for t, _b, _c in added}:
+        md = meta.get(t) or {}
         if md.get('name') or md.get('hmac_key'):
             store.add_title(t, name=md.get('name'), hmac_key=md.get('hmac_key'))
-        n += 1
+    if replace:
+        log('  replaced %d message(s) in the outbox' % cleared)
     log('  imported %d message(s) from %s%s'
-        % (n, path, '; skipped %d malformed or unauthentic' % skipped if skipped else ''))
-    return n
+        % (len(added), path, '; skipped %d malformed or unauthentic' % skipped if skipped else ''))
+    return len(added)
 
 
 def received_messages(store, titles=None):
@@ -772,7 +753,7 @@ class Control:
         self.failed = None
         self.stop = threading.Event()
 
-    def handle(self, req, peer_uid=None):
+    def handle(self, req, peer_uid=None, peer_gid=None):
         cmd = (req.get('cmd') or '').lower()
         r = self.relay
         if cmd == 'status':
@@ -974,15 +955,20 @@ class Control:
             except Exception as e:
                 return {'ok': False, 'error': '%s: %s' % (type(e).__name__, e)}
         if cmd == 'import':
-            if peer_uid is not None and not peer_can_read(req.get('path', ''), peer_uid):
-                return {'ok': False, 'error': 'you cannot read %s' % req.get('path', '')}
+            path = req.get('path')
+            if not isinstance(path, str) or not os.path.isabs(path):
+                return {'ok': False, 'code': 'bad_path', 'error': 'import needs an absolute path'}
             try:
+                source = (sp_import.read_source_as(path, peer_uid, peer_gid)
+                          if peer_uid is not None else None)
                 with r.lock:
-                    n = import_into(r.store, req['path'], r.log,
-                                    replace=bool(req.get('replace')))
+                    n = import_into(r.store, path, r.log, replace=bool(req.get('replace')),
+                                    allow_empty=bool(req.get('allow_empty')), source=source)
                 return {'ok': True, 'imported': n}
+            except sp_import.Refused as e:
+                return {'ok': False, 'code': e.code, 'error': str(e)}
             except Exception as e:
-                return {'ok': False, 'error': '%s: %s' % (type(e).__name__, e)}
+                return {'ok': False, 'code': 'failed', 'error': '%s: %s' % (type(e).__name__, e)}
         return {'ok': False, 'error': 'unknown command %r' % cmd}
 
     def serve_forever(self):
@@ -1010,8 +996,8 @@ class Control:
         while not self.stop.is_set():
             try:
                 conn, _ = self.sock.accept()
-                peer_uid = struct.unpack('3i', conn.getsockopt(
-                    socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize('3i')))[1]
+                _pid, peer_uid, peer_gid = struct.unpack('3i', conn.getsockopt(
+                    socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize('3i')))
             except socket.timeout:
                 continue
             except OSError:
@@ -1019,7 +1005,7 @@ class Control:
             with conn:
                 try:
                     data = read_request(conn).decode('utf-8', 'replace').strip()
-                    reply = self.handle(json.loads(data) if data else {}, peer_uid)
+                    reply = self.handle(json.loads(data) if data else {}, peer_uid, peer_gid)
                 except Exception as e:
                     reply = {'ok': False, 'error': '%s: %s' % (type(e).__name__, e)}
                 try:
@@ -1140,7 +1126,7 @@ def recovery_argv(a):
 def send_command(sock_path, cmd, **kw):
     """-> the daemon's reply dict."""
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
-        s.settimeout(5.0)
+        s.settimeout(sp_import.SECONDS + 10.0 if cmd == 'import' else 5.0)
         with socket_address(sock_path) as addr:
             s.connect(addr)
         s.sendall((json.dumps(dict(cmd=cmd, **kw)) + '\n').encode())
@@ -1840,6 +1826,152 @@ def _scan_code_for_machine_kill(path):
     return [w for w in ('sysrq', 'reboot', 'poweroff', 'systemd-run') if w in code]
 
 
+def _import_selftest(chk, ctl, tmp):
+    """The import boundary: what a caller may make the daemon read, and what replacing keeps."""
+    from sp_store import _synthetic
+    key = b'\x22' * 32
+    mine = _synthetic(0x00030600, 1, key=key)
+    theirs = _synthetic(0x00030600, 2, key=key)
+
+    src = os.path.join(tmp, 'imp-src')
+    os.makedirs(os.path.join(src, 'CEC', '00030600', 'OutBox__'))
+    with open(os.path.join(src, 'CEC', '00030600', 'OutBox__', '_mine'), 'wb') as f:
+        f.write(mine)
+    private = os.path.join(tmp, 'imp-private')
+    with open(private, 'wb') as f:
+        f.write(theirs)
+    os.chmod(private, 0o600)
+    os.symlink(private, os.path.join(src, 'CEC', '00030600', 'OutBox__', '_link'))
+    os.mkfifo(os.path.join(src, 'fifo'))
+    got = sp_import.read_source(src)
+    ids = {m['raw'][0x20:0x28] for m in got['messages']}
+    chk('an import reads the real files under a directory',
+        mine[0x20:0x28] in ids, sorted(i.hex() for i in ids))
+    chk('but never follows a symlink inside it', theirs[0x20:0x28] not in ids)
+
+    def refused(fn):
+        try:
+            fn()
+        except sp_import.Refused as e:
+            return e.code
+        return None
+
+    chk('a FIFO is refused rather than read (and the FIFO in the tree did not block)',
+        refused(lambda: sp_import.read_source(os.path.join(src, 'fifo'))) == 'not_a_file')
+    chk('a tree with more files than the limit is refused',
+        refused(lambda: sp_import.read_source(src, sp_import.Budget(files=1)))
+        == 'too_many_files')
+    chk('so is one that takes longer than the limit',
+        refused(lambda: sp_import.read_source(src, sp_import.Budget(seconds=-1))) == 'timeout')
+    chk('and one with more bytes than the limit',
+        refused(lambda: sp_import.read_source(src, sp_import.Budget(total=16))) == 'too_large')
+
+    via = sp_import.read_source_as(src, os.geteuid())
+    chk('the worker hands back the same messages a direct read finds',
+        sorted(m['raw'] for m in via['messages']) == sorted(m['raw'] for m in got['messages']))
+    chk('a worker reply that is not CEC is refused',
+        refused(lambda: sp_import._decode(json.dumps({'messages': [
+            {'path': 'x', 'box': 'outbox', 'raw': base64.b64encode(b'x' * 200).decode()}],
+            'meta': {}}))) == 'worker_failed')
+
+    if os.geteuid() == 0:
+        nobody = pwd.getpwnam('nobody')
+        os.chmod(tmp, 0o755)
+        os.chmod(src, 0o755)
+        for d, dirs, files in os.walk(src):
+            for n in dirs:
+                os.chmod(os.path.join(d, n), 0o755)
+            for n in files:
+                if not os.path.islink(os.path.join(d, n)) and n != 'fifo':
+                    os.chmod(os.path.join(d, n), 0o644)
+        as_them = sp_import.read_source_as(src, nobody.pw_uid, nobody.pw_gid)
+        chk('as root, a worker reads only what the caller can: not a private file',
+            {m['raw'][0x20:0x28] for m in as_them['messages']} == {mine[0x20:0x28]},
+            [m['path'] for m in as_them['messages']])
+        os.symlink(private, os.path.join(tmp, 'imp-direct'))
+        chk('even when the caller names it directly or through a link',
+            refused(lambda: sp_import.read_source_as(private, nobody.pw_uid)) == 'unreadable'
+            and refused(lambda: sp_import.read_source_as(os.path.join(tmp, 'imp-direct'),
+                                                         nobody.pw_uid)) == 'unreadable')
+        rep = ctl.handle({'cmd': 'import', 'path': private}, nobody.pw_uid, nobody.pw_gid)
+        chk('and the control socket refuses it, saying why',
+            not rep['ok'] and rep.get('code') == 'unreadable', rep)
+    else:
+        rep = ctl.handle({'cmd': 'import', 'path': private}, os.geteuid() + 1)
+        chk('a daemon that is not root will not read for anyone else',
+            not rep['ok'] and rep.get('code') == 'unreadable', rep)
+    chk('import over the socket needs an absolute path',
+        ctl.handle({'cmd': 'import', 'path': 'rel'}, os.geteuid()).get('code') == 'bad_path')
+
+    st = sp_store.Store(os.path.join(tmp, 'imp-store'))
+    keep = _synthetic(0x00020800, 7, key=key)
+    st.add_message(keep, 'outbox', key=key)
+    junk = os.path.join(tmp, 'imp-junk.txt')
+    with open(junk, 'w') as f:
+        f.write('not CEC at all\n' * 20)
+    chk('replacing from a file with no messages is refused',
+        refused(lambda: import_into(st, junk, log=lambda m: None, replace=True)) == 'no_messages')
+    chk('and leaves the outbox as it was',
+        [c for _t, _b, c in st.messages(box='outbox')] == [keep])
+    chk('a plain import of nothing is refused too, not reported as success',
+        refused(lambda: import_into(st, junk, log=lambda m: None)) == 'no_messages')
+    chk('emptying the outbox that way has to be asked for',
+        import_into(st, junk, log=lambda m: None, replace=True, allow_empty=True) == 0
+        and st.messages(box='outbox') == [])
+    st.add_message(keep, 'outbox', key=key)
+
+    for i in range(sp_store.MBOXLIST_MAX - 1):
+        st.add_title(0x00100000 + (i << 8))
+    many = os.path.join(tmp, 'imp-many')
+    with open(many, 'wb') as f:
+        f.write(_synthetic(0x00200000, 1) + _synthetic(0x00200100, 2))
+    chk('a replacement over the title limit is refused before anything is touched',
+        refused(lambda: import_into(st, many, log=lambda m: None, replace=True))
+        == 'too_many_titles'
+        and [c for _t, _b, c in st.messages(box='outbox')] == [keep])
+    for i in range(sp_store.MBOXLIST_MAX - 1):
+        st.remove_title(0x00100000 + (i << 8))
+
+    two = os.path.join(tmp, 'imp-two')
+    with open(two, 'wb') as f:
+        f.write(_synthetic(0x00200000, 1) + _synthetic(0x00200000, 2))
+    real_add, calls = st.add_message, []
+
+    def failing(c, box='inbox', **kw):
+        calls.append(c)
+        if len(calls) == 2:
+            raise OSError('disk full')
+        return real_add(c, box, **kw)
+
+    st.add_message = failing
+    try:
+        import_into(st, two, log=lambda m: None, replace=True)
+        failed = False
+    except OSError:
+        failed = True
+    del st.add_message
+    chk('a replacement that fails partway puts the old outbox back',
+        failed and [c for _t, _b, c in st.messages(box='outbox')] == [keep]
+        and 0x00200000 not in st.titles(),
+        (failed, len(st.messages(box='outbox')), st.titles()))
+    chk('and one that succeeds leaves only the new messages',
+        import_into(st, two, log=lambda m: None, replace=True) == 2
+        and sorted(c[0x20:0x28] for _t, _b, c in st.messages(box='outbox'))
+        == [(1).to_bytes(8, 'little'), (2).to_bytes(8, 'little')])
+
+    a, b = socket.socketpair()
+    with a, b:
+        a.sendall(b'{"cmd": ')
+        t0 = time.monotonic()
+        try:
+            read_request(b, seconds=0.3)
+            timed_out = False
+        except socket.timeout:
+            timed_out = True
+        chk('a request that never finishes arriving is cut off at its deadline',
+            timed_out and time.monotonic() - t0 < 1.0, time.monotonic() - t0)
+
+
 def _selftest():
     import tempfile, shutil
     ok = tot = 0
@@ -2535,25 +2667,7 @@ def _selftest():
             chk('the control socket is private to its owner',
                 stat.S_IMODE(os.stat(sockp).st_mode) == 0o600,
                 oct(stat.S_IMODE(os.stat(sockp).st_mode)))
-            me, other = os.getuid(), os.getuid() + 1
-            pdir = tempfile.mkdtemp(prefix='tuxchange-perm-', dir='/tmp')
-            os.chmod(pdir, 0o755)
-            secret = os.path.join(pdir, 'secret')
-            open(secret, 'w').close()
-            os.chmod(secret, 0o600)
-            chk('a caller may import a file it can read', peer_can_read(secret, me))
-            chk('but not a file only someone else can read', not peer_can_read(secret, other))
-            os.chmod(secret, 0o644)
-            chk('a world-readable file is fine', peer_can_read(secret, other))
-            os.chmod(pdir, 0o700)
-            chk('unless a directory above it is closed', not peer_can_read(secret, other))
-            os.chmod(pdir, 0o755)
-            chk('a missing file is not readable', not peer_can_read(secret + 'x', other))
-            os.chmod(secret, 0o600)
-            refused = ctl.handle({'cmd': 'import', 'path': secret}, peer_uid=other)
-            chk('import refuses a path the caller cannot read',
-                not refused['ok'] and 'cannot read' in refused['error'], refused)
-            shutil.rmtree(pdir, ignore_errors=True)
+            _import_selftest(chk, ctl, tmp)
             chk('pause disables exchanges',
                 send_command(sockp, 'pause')['enabled'] is False and r.enabled is False)
             chk('resume re-enables them',
@@ -2985,8 +3099,10 @@ def main():
     imp.add_argument('--store', default='relay_store')
     imp.add_argument('--from-log', action='store_true', help='an sp_link run log instead')
     imp.add_argument('--replace', action='store_true',
-                     help='empty the outbox first, so this becomes the only data the relay '
-                          'serves. Use it when swapping in another console\'s data.')
+                     help='make this the only data the relay serves, in place of the current '
+                          'outbox. Use it when swapping in another console\'s data.')
+    imp.add_argument('--allow-empty', action='store_true',
+                     help='with --replace: empty the outbox even if the source holds no messages')
 
     exp = sub.add_parser('export', help="deliver Inbox messages into an emulator's (or a "
                                         "console-shaped) CEC folder, as if they arrived there")
@@ -3017,8 +3133,11 @@ def main():
     ct.add_argument('--store', default='relay_store')
     ct.add_argument('--path', help='for `ctl import`: what to ingest')
     ct.add_argument('--replace', action='store_true',
-                    help='for `ctl import`: clear the outbox; for `ctl seed`: replace the '
+                    help='for `ctl import`: replace the outbox; for `ctl seed`: replace the '
                          'existing Mii Plaza message')
+    ct.add_argument('--allow-empty', action='store_true',
+                    help='for `ctl import --replace`: empty the outbox even if the source holds '
+                         'no messages')
     ct.add_argument('--mac', help='the peer for forget / block / unblock / unfilter '
                                   '(forget and unfilter without --mac apply to every peer)')
     ct.add_argument('--note', default='', help='for `ctl block`: why')
@@ -3056,7 +3175,11 @@ def main():
         if a.from_log:
             import_from_log(s, a.path)
         else:
-            import_into(s, a.path, replace=a.replace)
+            try:
+                import_into(s, a.path, replace=a.replace, allow_empty=a.allow_empty)
+            except sp_import.Refused as e:
+                print('not imported: %s' % e)
+                return 1
         print(s.summary())
         return 0
     if a.cmd == 'export':
@@ -3080,7 +3203,8 @@ def main():
         if a.command == 'import':
             if not a.path:
                 print('ctl import needs --path'); return 2
-            kw = {'path': os.path.abspath(a.path), 'replace': a.replace}
+            kw = {'path': os.path.abspath(a.path), 'replace': a.replace,
+                  'allow_empty': a.allow_empty}
         elif a.command in ('forget', 'unfilter'):
             kw = {'mac': a.mac} if a.mac else {}
         elif a.command in ('block', 'unblock'):
