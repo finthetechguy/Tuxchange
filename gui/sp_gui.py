@@ -1051,7 +1051,10 @@ class RelayApp(Adw.Application):
             msgs = [(base64.b64decode(m['data']), m.get('when'))
                     for m in rep['messages']]
             if raw:
-                return 'Copied %d message(s) to %s.' % (len(ex.write_raw(msgs, dest)), dest)
+                skipped = []
+                n = len(ex.write_raw(msgs, dest, log=skipped.append))
+                return 'Copied %d message(s) to %s.%s' % (
+                    n, dest, ' Skipped %d malformed.' % len(skipped) if skipped else '')
             running = ex.emulator_running()
             if running:
                 raise RuntimeError('%s is running. Close it and export again.' % running)
@@ -1059,11 +1062,11 @@ class RelayApp(Adw.Application):
             backup = folder.backup(ex.default_backup_dir())
             notes = []
             counts = ex.deliver_all(folder, msgs, log=notes.append)
-            text = 'Delivered %d message(s).' % counts.get(ex.ADDED, 0)
+            text = 'Delivered %d message(s).' % sum(counts.get(k, 0) for k in ex.DELIVERED)
             if counts.get(ex.DUPLICATE):
                 text += ' %d already exists.' % counts[ex.DUPLICATE]
             if notes:
-                text += '\n\nNot delivered:\n' + '\n'.join(n.strip() for n in notes[:12])
+                text += '\n\nDetails:\n' + '\n'.join(n.strip() for n in notes[:12])
                 if len(notes) > 12:
                     text += '\n…and %d more' % (len(notes) - 12)
             return text + '\n\nBackup of the previous CEC data: %s' % backup

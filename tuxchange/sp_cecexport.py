@@ -19,7 +19,7 @@ by its game, with its own HMAC key and limits, so one we invent would not be one
 import os, sys, time, glob, struct, shutil, tarfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import sp_cec, sp_store, sp_cecstore
+import sp_cec, sp_cecvalid, sp_store, sp_cecstore
 
 HDR_LEN = sp_cec.HDR_LEN
 BOXINFO_HDR = 0x20
@@ -32,6 +32,11 @@ EMULATOR_PROCESSES = ('azahar', 'azahar-qt', 'azahar-room', 'azaharplus', 'citra
 CEC_SUBPATH = os.path.join('sysdata', '00010026', '00000000', 'CEC')
 
 ADDED, DUPLICATE, NO_BOX, FULL, TOO_BIG = 'added', 'duplicate', 'no-box', 'full', 'too-big'
+# Delivered, but the destination holds no key for its title, so its HMAC went unchecked.
+UNVERIFIED = 'unverified'
+# Not delivered: malformed, or its HMAC does not match the destination title's key.
+INVALID = 'invalid'
+DELIVERED = (ADDED, UNVERIFIED)
 
 
 def timestamp(when=None):
@@ -167,13 +172,30 @@ class CecFolder:
             return []
         return parse_boxinfo(open(os.path.join(box, 'BoxInfo_____'), 'rb').read())[1]
 
+    def title_key(self, tid):
+        """The title's HMAC key from its MBoxInfo here, or None."""
+        d = self._title_dir(tid)
+        try:
+            k = sp_cecstore.parse_mboxinfo(open(os.path.join(d, 'MBoxInfo____'), 'rb').read())['hmac_key']
+        except (TypeError, OSError, ValueError):
+            return None
+        return k if len(k) == 0x20 and any(k) else None
+
     def deliver(self, container, when=None, dry_run=False):
-        """File one message in its title's inbox. -> one of ADDED, DUPLICATE, NO_BOX, FULL, TOO_BIG."""
+        """File one message in its title's inbox.
+
+        -> ADDED or UNVERIFIED (both delivered), or DUPLICATE, NO_BOX, FULL, TOO_BIG, INVALID.
+        """
+        if sp_cecvalid.problems(container):
+            return INVALID
         h = sp_cec.parse_header(container)
         tid, size = h['cec_title_id'], h['total_size']
         box = self._inbox(tid)
         if box is None:
             return NO_BOX
+        key = self.title_key(tid)
+        if key is not None and not sp_cecvalid.hmac_ok(container, key):
+            return INVALID
         bi = os.path.join(box, 'BoxInfo_____')
         fields, headers = parse_boxinfo(open(bi, 'rb').read())
         name = sp_store.message_filename(container)
@@ -185,13 +207,14 @@ class CecFolder:
         used = sum(struct.unpack_from('<I', x, 4)[0] for x in headers)
         if len(headers) >= fields['max_messages'] or used + size > fields['max_bytes']:
             return FULL
+        done = ADDED if key is not None else UNVERIFIED
         if dry_run:
-            return ADDED
+            return done
         msg = as_received(container, when)
         _write(os.path.join(box, name), msg)
         _write(bi, build_boxinfo(fields, [msg[:HDR_LEN]] + headers))
         self._mark_received(tid, msg[0x54:0x60])
-        return ADDED
+        return done
 
     def _mark_received(self, tid, ts):
         p = os.path.join(self._title_dir(tid), 'MBoxInfo____')
@@ -239,12 +262,16 @@ def deliver_all(folder, messages, dry_run=False, log=print):
     """Deliver [(container, when)], oldest first so the newest ends up on top. -> {status: n}."""
     counts = {}
     for c, when in sorted(messages, key=lambda m: m[1] or 0):
-        h = sp_cec.parse_header(c)
         st = folder.deliver(c, when, dry_run=dry_run)
         counts[st] = counts.get(st, 0) + 1
         if st != DUPLICATE and (st != ADDED or dry_run):
-            log('  %08X %s: %s' % (h['cec_title_id'], c[0x20:0x28].hex(),
+            tid = struct.unpack_from('<I', c, 0x10)[0] if len(c) >= 0x14 else 0
+            log('  %08X %s: %s' % (tid, bytes(c[0x20:0x28]).hex(),
                                    {ADDED: 'would be delivered', DUPLICATE: 'already there',
+                                    UNVERIFIED: '%sdelivered, but there is no key there to check '
+                                                'its HMAC' % ('would be ' if dry_run else ''),
+                                    INVALID: 'malformed, or its HMAC does not match that '
+                                             "title's key; not delivered",
                                     NO_BOX: 'no inbox for this title there (start its game '
                                             'once with StreetPass on)',
                                     FULL: 'that inbox is full',
@@ -252,10 +279,15 @@ def deliver_all(folder, messages, dry_run=False, log=print):
     return counts
 
 
-def write_raw(messages, dest):
-    """Write each message unchanged as <dest>/<TITLE>/_<id>. -> the paths written."""
+def write_raw(messages, dest, log=None):
+    """Write each well-formed message unchanged as <dest>/<TITLE>/_<id>. -> the paths written."""
     out = []
     for c, _when in messages:
+        bad = sp_cecvalid.problems(c)
+        if bad:
+            if log:
+                log('  skipped a malformed message: %s' % '; '.join(bad))
+            continue
         tid = sp_cec.parse_header(c)['cec_title_id']
         d = os.path.join(dest, '%08X' % tid)
         os.makedirs(d, exist_ok=True)
@@ -274,21 +306,26 @@ def _selftest():
         tot += 1; ok += bool(c)
         print('  [%s] %s%s' % ('PASS' if c else 'FAIL', n, ('  %s' % (g,)) if g else ''))
 
-    def msg(tid, mid, size=0x200):
+    import hashlib, hmac
+    KEY = b'K' * 32
+
+    def msg(tid, mid, size=0x200, key=KEY):
         c = bytearray(size)
         struct.pack_into('<HHIII', c, 0, 0x6060, 0, size, HDR_LEN, size - HDR_LEN - 0x20)
         struct.pack_into('<I', c, 0x10, tid)
         c[0x20:0x28] = mid
         c[0x34:0x36] = b'\x03\x03'
         c[0x60:0x6C] = timestamp(1.6e9)
+        c[-0x20:] = hmac.new(key, c[HDR_LEN:-0x20], hashlib.sha256).digest()
         return bytes(c)
 
-    def console_title(cec, tid, max_messages=3, max_bytes=0x1000, max_size=0x800):
+    def console_title(cec, tid, max_messages=3, max_bytes=0x1000, max_size=0x800, key=KEY):
         d = os.path.join(cec, '%08x' % tid)
         os.makedirs(os.path.join(d, INBOX))
         info = bytearray(0x60)
         info[:2] = b'cc'
         struct.pack_into('<I', info, 4, tid)
+        info[0x10:0x30] = key
         open(os.path.join(d, 'MBoxInfo____'), 'wb').write(bytes(info))
         f = dict(max_bytes=max_bytes, max_messages=max_messages, max_batch=max_messages,
                  max_message_size=max_size)
@@ -340,22 +377,35 @@ def _selftest():
             f.deliver(msg(0x00020800, b'D' * 8, 0x900)) == TOO_BIG)
         chk('a dry run changes nothing', f.deliver(msg(0x00020800, b'E' * 8), dry_run=True)
             == ADDED and len(f.inbox(0x00020800)) == 2)
+        chk('a message failing the title key there is refused',
+            f.deliver(msg(0x00020800, b'X' * 8, key=b'z' * 32)) == INVALID)
+        bad = bytearray(msg(0x00020800, b'Y' * 8))
+        struct.pack_into('<I', bad, 8, 0xFFFFFFF0)
+        chk('so is a malformed message', f.deliver(bytes(bad)) == INVALID)
+        chk('and neither was filed', len(f.inbox(0x00020800)) == 2)
+        chk('raw export skips the malformed one',
+            [os.path.basename(p) for p in write_raw([(bytes(bad), 0), (a, 0)],
+                                                    os.path.join(tmp, 'raw'))]
+            == [sp_store.message_filename(a)])
         f.deliver(msg(0x00020800, b'E' * 8))
         chk('a full inbox is refused', f.deliver(msg(0x00020800, b'F' * 8)) == FULL)
 
         f2 = CecFolder(cec)
-        console_title(cec, 0x001a0400)
+        console_title(cec, 0x001a0400, key=bytes(32))
         ml[8:12] = struct.pack('<I', 2)
         ml[28:36] = b'001a0400'
         open(os.path.join(cec, 'MBoxList____'), 'wb').write(bytes(ml))
         logged = []
         n = deliver_all(f2, [(msg(0x001a0400, b'G' * 8), 2.0e9), (msg(0x001a0400, b'H' * 8), 1.0e9),
                              (a, 1.0), (msg(0x00030600, b'I' * 8), 1.0)], log=logged.append)
-        chk('deliver_all counts each outcome', n == {ADDED: 2, DUPLICATE: 1, NO_BOX: 1}, n)
+        chk('deliver_all counts each outcome', n == {UNVERIFIED: 2, DUPLICATE: 1, NO_BOX: 1}, n)
         chk('and delivers oldest first, so the newest is listed first',
             [x[0x20:0x28] for x in f2.inbox(0x001a0400)] == [b'G' * 8, b'H' * 8])
         chk('it says why a message was not delivered, but not for each duplicate',
-            len(logged) == 1 and 'no inbox' in logged[0], logged)
+            sum('no inbox' in x for x in logged) == 1 and not any('already' in x for x in logged),
+            logged)
+        chk('and says which went in without an HMAC check',
+            sum('no key there' in x for x in logged) == 2, logged)
 
         arc = f.backup(os.path.join(tmp, 'bk'))
         with tarfile.open(arc) as tf:

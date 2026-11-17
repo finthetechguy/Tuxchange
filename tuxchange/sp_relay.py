@@ -719,7 +719,7 @@ def export_main(a):
     if a.raw:
         if not a.dest:
             print('export --raw needs a destination folder'); return 2
-        for p in ex.write_raw(msgs, a.dest):
+        for p in ex.write_raw(msgs, a.dest, log=print):
             print('  wrote %s' % p)
         return 0
     user = os.environ.get('SUDO_USER') if os.geteuid() == 0 else None
@@ -753,7 +753,8 @@ def export_main(a):
               % (folder.path, folder.backup(a.backup_dir or ex.default_backup_dir(home))))
     counts = ex.deliver_all(folder, msgs, dry_run=a.dry_run)
     print('%s %d message(s) to %s; %s' % (
-        'would deliver' if a.dry_run else 'delivered', counts.get(ex.ADDED, 0), folder.path,
+        'would deliver' if a.dry_run else 'delivered',
+        sum(counts.get(k, 0) for k in ex.DELIVERED), folder.path,
         ', '.join('%d %s' % (n, k) for k, n in sorted(counts.items()) if k != ex.ADDED)
         or 'nothing skipped'))
     return 0
