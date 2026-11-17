@@ -1023,6 +1023,7 @@ class Control:
                 except Exception as e:
                     reply = {'ok': False, 'error': '%s: %s' % (type(e).__name__, e)}
                 try:
+                    conn.settimeout(REQUEST_TIMEOUT)
                     conn.sendall((json.dumps(reply) + '\n').encode())
                 except OSError:
                     pass
@@ -1045,12 +1046,16 @@ MAX_REQUEST = 1 << 20          # a plugin's body is up to 0x18000 B, ~131 kB as 
 REQUEST_TIMEOUT = 5.0
 
 
-def read_request(conn, limit=MAX_REQUEST):
-    """One newline-terminated request. A slow or silent client times out rather than
-    holding the (single-threaded) control socket."""
-    conn.settimeout(REQUEST_TIMEOUT)
+def read_request(conn, limit=MAX_REQUEST, seconds=REQUEST_TIMEOUT):
+    """One newline-terminated request. A slow or silent client gets `seconds` in all, rather
+    than holding the (single-threaded) control socket."""
+    deadline = time.monotonic() + seconds
     buf = b''
     while not buf.endswith(b'\n'):
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise socket.timeout('the request took over %g s to arrive' % seconds)
+        conn.settimeout(left)
         chunk = conn.recv(65536)
         if not chunk:
             break
@@ -1134,18 +1139,17 @@ def recovery_argv(a):
 
 def send_command(sock_path, cmd, **kw):
     """-> the daemon's reply dict."""
-    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    s.settimeout(5.0)
-    with socket_address(sock_path) as addr:
-        s.connect(addr)
-    s.sendall((json.dumps(dict(cmd=cmd, **kw)) + '\n').encode())
-    buf = b''
-    while not buf.endswith(b'\n'):
-        chunk = s.recv(65536)
-        if not chunk:
-            break
-        buf += chunk
-    s.close()
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+        s.settimeout(5.0)
+        with socket_address(sock_path) as addr:
+            s.connect(addr)
+        s.sendall((json.dumps(dict(cmd=cmd, **kw)) + '\n').encode())
+        buf = b''
+        while not buf.endswith(b'\n'):
+            chunk = s.recv(65536)
+            if not chunk:
+                break
+            buf += chunk
     return json.loads(buf.decode('utf-8', 'replace') or '{}')
 
 
