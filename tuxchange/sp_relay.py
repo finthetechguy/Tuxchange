@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Tuxchange: a daemon that exchanges with any 3DS that passes."""
-import contextlib, os, sys, json, time, socket, stat, struct, threading, random, argparse, re, pwd
+import contextlib, functools, os, sys, json, time, socket, stat, struct, threading, random, argparse, re, pwd
 import base64, subprocess, queue, signal, tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -89,10 +89,7 @@ def write_env_key(path, key, value):
     body = ['# Written by the Tuxchange daemon. Change these from the GUI or `sp_relay.py ctl`.']
     body += ['%s=%s' % (k, d[k]) for k in sorted(d)]
     try:
-        tmp = path + '.tmp'
-        with open(tmp, 'w') as f:
-            f.write('\n'.join(body) + '\n')
-        os.replace(tmp, path)
+        sp_store.write_atomic(path, ('\n'.join(body) + '\n').encode(), 0o644)
         return None
     except OSError as e:
         return str(e)
@@ -160,10 +157,7 @@ def write_store_pointer(home, store):
             if os.path.exists(p):
                 os.remove(p)
             return None
-        with open(p + '.tmp', 'w') as f:
-            f.write(os.path.abspath(store) + '\n')
-        os.chmod(p + '.tmp', 0o644)
-        os.replace(p + '.tmp', p)
+        sp_store.write_atomic(p, (os.path.abspath(store) + '\n').encode(), 0o644)
         return None
     except OSError as e:
         return str(e)
@@ -379,6 +373,14 @@ class HookRunner:
             self._fail(event, 'exit status %d' % rc)
 
 
+def _book_locked(fn):
+    @functools.wraps(fn)
+    def run(self, *a, **kw):
+        with self.lock:
+            return fn(self, *a, **kw)
+    return run
+
+
 class PeerBook:
     """Per-peer history (what we have given each MAC), the MAC filter, and the denylist.
 
@@ -389,6 +391,9 @@ class PeerBook:
 
     def __init__(self, path, retry=60.0, filter_max=MAC_FILTER_MAX):
         self.path = path
+        # The control thread and the exchange loop share one book. A Store's lock may be
+        # held while this one is taken, never the other way round.
+        self.lock = threading.RLock()
         self.retry = retry
         self.filter_max = filter_max
         self.peers = {}
@@ -409,15 +414,22 @@ class PeerBook:
                 self.peers, self.blocked, self.filter = {}, {}, []
 
     def save(self):
-        tmp = self.path + '.tmp'
-        with open(tmp, 'w') as f:
-            json.dump({'peers': self.peers, 'blocked': self.blocked, 'filter': self.filter},
-                      f, indent=1, sort_keys=True)
-        os.replace(tmp, self.path)
+        with self.lock:
+            body = json.dumps({'peers': self.peers, 'blocked': self.blocked,
+                               'filter': self.filter}, indent=1, sort_keys=True)
+            sp_store.write_atomic(self.path, body.encode(), 0o644)
 
+    def snapshot(self):
+        """-> a private copy of {'peers', 'blocked', 'filter'}, safe to walk unlocked."""
+        with self.lock:
+            return json.loads(json.dumps({'peers': self.peers, 'blocked': self.blocked,
+                                          'filter': self.filter}))
+
+    @_book_locked
     def is_filtered(self, mac):
         return mac.lower() in self.filter
 
+    @_book_locked
     def unfilter(self, mac=None):
         """Take one MAC out of the filter, or empty it. -> how many were removed."""
         if mac is None:
@@ -428,26 +440,31 @@ class PeerBook:
         self.save()
         return n
 
+    @_book_locked
     def is_blocked(self, mac):
         return mac.lower() in self.blocked
 
+    @_book_locked
     def block(self, mac, note='', now=None):
         self.blocked[mac.lower()] = {'when': time.time() if now is None else now,
                                      'note': str(note)}
         self.save()
         return True
 
+    @_book_locked
     def unblock(self, mac):
         gone = self.blocked.pop(mac.lower(), None) is not None
         self.save()
         return gone
 
+    @_book_locked
     def due(self, mac, now=None):
         """-> True if this peer may be engaged now: not filtered, and not backing off."""
         if self.is_filtered(mac):
             return False
         return self.wait(mac, now) <= 0
 
+    @_book_locked
     def note_attempt(self, mac, now=None):
         """Record an engagement that did not complete, so we back off briefly, not for hours."""
         now = time.time() if now is None else now
@@ -457,6 +474,7 @@ class PeerBook:
         e['attempts'] = e.get('attempts', 0) + 1
         self.save()
 
+    @_book_locked
     def wait(self, mac, now=None):
         """-> seconds left of the retry backoff after a failed attempt (the filter has no clock)."""
         now = time.time() if now is None else now
@@ -466,6 +484,7 @@ class PeerBook:
         la = e.get('last_attempt') or 0
         return max(0.0, (self.retry - (now - la)) if la > 0 else 0.0)
 
+    @_book_locked
     def record(self, mac, sent_ids=(), got_ids=(), now=None):
         now = time.time() if now is None else now
         e = self.peers.setdefault(mac.lower(), {'first': now, 'exchanges': 0,
@@ -482,6 +501,7 @@ class PeerBook:
             del self.filter[:-self.filter_max]
         self.save()
 
+    @_book_locked
     def forget(self, mac=None):
         """Drop one peer's history, or all of it."""
         if mac is None:
@@ -493,10 +513,12 @@ class PeerBook:
         self.save()
         return n
 
+    @_book_locked
     def already_sent(self, mac, msgid):
         h = msgid.hex() if isinstance(msgid, (bytes, bytearray)) else msgid
         return h in set(self.peers.get(mac.lower(), {}).get('sent', []))
 
+    @_book_locked
     def came_from(self, mac, msgid):
         h = msgid.hex() if isinstance(msgid, (bytes, bytearray)) else msgid
         return h in set(self.peers.get(mac.lower(), {}).get('received', []))
@@ -646,7 +668,7 @@ def backfill_air_provenance(store, book, log=print):
         known.setdefault(c[0x20:0x28].hex(), []).append((t, b))
     have = store.origins()
     n = 0
-    for mac, e in (book.peers or {}).items():
+    for mac, e in book.snapshot()['peers'].items():
         for mid in e.get('received', []):
             for (t, b) in known.get(mid, ()):
                 if store._okey(bytes.fromhex(mid), b) in have:
@@ -674,9 +696,27 @@ def import_from_log(store, log_path, log=print):
     return n
 
 
+def import_via_daemon(a):
+    """`import` while the daemon holds the store: it reads the file as us and files it."""
+    print('the daemon holds the store at %s; handing it the import' % a.store)
+    try:
+        rep = send_command(control_socket_path(a.store), 'import', path=os.path.abspath(a.path),
+                           replace=a.replace, allow_empty=a.allow_empty)
+    except OSError as e:
+        print('the daemon is not answering (%s)' % e)
+        return 1
+    if not rep.get('ok'):
+        print('not imported: %s' % rep.get('error'))
+        return 1
+    print('imported %d message(s)' % rep.get('imported', 0))
+    return 0
+
+
 def messages_for_export(store_path, titles=None):
-    """Received messages, read from the store directly or, without the rights, from the daemon."""
-    if os.access(os.path.join(store_path, 'CEC'), os.R_OK | os.X_OK):
+    """Received messages, read from the store directly or, while the daemon holds it or
+    without the rights, from the daemon."""
+    if (os.access(os.path.join(store_path, 'CEC'), os.R_OK | os.X_OK)
+            and not sp_store.store_claimed(store_path)):
         return received_messages(sp_store.Store(store_path), titles)
     sock = control_socket_path(store_path)
     if os.path.exists(sock):
@@ -781,19 +821,22 @@ class Control:
             return {'ok': True, 'cleared': n}
         if cmd == 'denylist':
             now = time.time()
+            with r.book.lock:
+                snap = r.book.snapshot()
+                waits = {m: round(r.book.wait(m, now), 1) for m in snap['peers']}
+            peers = snap['peers']
             return {'ok': True,
-                    'blocked': [{'mac': m, **v} for m, v in sorted(r.book.blocked.items())],
+                    'blocked': [{'mac': m, **v} for m, v in sorted(snap['blocked'].items())],
                     # Newest first, the way the GUI lists it.
                     'filter': [{'mac': m,
-                                'exchanges': r.book.peers.get(m, {}).get('exchanges', 0),
-                                'last': r.book.peers.get(m, {}).get('last', 0)}
-                               for m in reversed(r.book.filter)],
+                                'exchanges': peers.get(m, {}).get('exchanges', 0),
+                                'last': peers.get(m, {}).get('last', 0)}
+                               for m in reversed(snap['filter'])],
                     'filter_max': r.book.filter_max,
                     'clear_filter_on_rotate': r.clear_filter_on_rotate(),
-                    'backing_off': [{'mac': m, 'attempts': e.get('attempts', 0),
+                    'backing_off': [{'mac': m, 'attempts': peers[m].get('attempts', 0),
                                      'remaining_s': w}
-                                    for m, e in sorted(r.book.peers.items())
-                                    for w in [round(r.book.wait(m, now), 1)] if w > 0]}
+                                    for m, w in sorted(waits.items()) if w > 0]}
         if cmd == 'log':
             return {'ok': True, 'log': r.recent_log(int(req.get('limit', 300)))}
 
@@ -937,7 +980,8 @@ class Control:
                 with r.lock:
                     msgs = r.store.messages(tid, 'outbox')
                     og = r.store.origins()
-                return {'ok': True, 'title': '%08x' % tid, 'name': r.store.title_name(tid),
+                    name = r.store.title_name(tid)
+                return {'ok': True, 'title': '%08x' % tid, 'name': name,
                         'messages': [{'id': c[0x20:0x28].hex(),
                                       'data': base64.b64encode(c).decode(),
                                       'origin': (og.get(r.store._okey(c[0x20:0x28], 'outbox'))
@@ -971,10 +1015,29 @@ class Control:
                 return {'ok': False, 'code': 'failed', 'error': '%s: %s' % (type(e).__name__, e)}
         return {'ok': False, 'error': 'unknown command %r' % cmd}
 
+    def _clear_stale(self):
+        """Remove a socket left by a dead daemon. A live one, or anything not a socket, stays."""
+        try:
+            st = os.lstat(self.path)
+        except FileNotFoundError:
+            return
+        if not stat.S_ISSOCK(st.st_mode):
+            raise FileExistsError('%s exists and is not a socket' % self.path)
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
+            probe.settimeout(1.0)
+            try:
+                with socket_address(self.path) as addr:
+                    probe.connect(addr)
+            except (ConnectionRefusedError, FileNotFoundError):
+                os.remove(self.path)
+                return
+            except OSError:
+                pass
+        raise FileExistsError('another daemon is answering on %s' % self.path)
+
     def serve_forever(self):
         try:
-            if os.path.exists(self.path):
-                os.remove(self.path)
+            self._clear_stale()
             self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             with socket_address(self.path) as addr:
                 self.sock.bind(addr)
@@ -1161,7 +1224,8 @@ class Relay:
         # The fix is rebuilding the interface, so exit and let systemd restart us.
         self.iface_failures = 0
         # The control thread can change the store while a pass reads it.
-        self.lock = threading.RLock()
+        self.lock = self.store.lock
+        self._enc_lock = threading.Lock()
         self.last_success = 0.0
         self.passes = 0
         self.last_tick = time.time()
@@ -1232,10 +1296,8 @@ class Relay:
     def save_rotation(self):
         """Persist the identity in use so a restart resumes the schedule. Never fatal."""
         try:
-            tmp = self.rotation_path() + '.tmp'
-            with open(tmp, 'w') as f:
-                json.dump({'mac': self.identity, 'since': self.identity_since}, f)
-            os.replace(tmp, self.rotation_path())
+            sp_store.write_atomic(self.rotation_path(), json.dumps(
+                {'mac': self.identity, 'since': self.identity_since}).encode())
         except OSError as e:
             self.log('  could not save the rotation state (%s); the schedule will restart if this '
                      'service does' % e)
@@ -1407,15 +1469,21 @@ class Relay:
             'iface_failures': self.iface_failures,
             'passes': self.passes,
             'store': self.a.store,
-            'titles': ['%08X' % t for t in self.store.titles()],
-            'messages': len(self.store.messages()),
-            # Counted by set difference, because older stored messages have no provenance tag.
-            'servable': len(self.servable()),
-            'held_but_never_served': len({c[0x20:0x28] for _t, _b, c in self.store.messages()}
-                                         - {c[0x20:0x28] for c in self.servable()}),
-            'filtered': len(self.book.filter),
+            **self._store_counts(),
+            'filtered': len(self.book.snapshot()['filter']),
             'filter_max': self.book.filter_max,
         }
+
+    def _store_counts(self):
+        with self.lock:
+            held = self.store.messages()
+            serv = self.servable()
+            return {'titles': ['%08X' % t for t in self.store.titles()],
+                    'messages': len(held),
+                    'servable': len(serv),
+                    # By set difference, because older stored messages have no provenance tag.
+                    'held_but_never_served': len({c[0x20:0x28] for _t, _b, c in held}
+                                                 - {c[0x20:0x28] for c in serv})}
 
     def describe_store(self):
         """Everything the GUI needs to draw the Outbox and Inbox tabs, in one round trip."""
@@ -1485,13 +1553,13 @@ class Relay:
         rec = dict(rec)
         rec.setdefault('when', time.time())
         try:
-            with open(self.encounters_path(), 'a') as f:
-                f.write(json.dumps(rec, sort_keys=True) + '\n')
-            lines = open(self.encounters_path()).read().splitlines()
-            if len(lines) > keep * 2:
-                with open(self.encounters_path() + '.tmp', 'w') as f:
-                    f.write('\n'.join(lines[-keep:]) + '\n')
-                os.replace(self.encounters_path() + '.tmp', self.encounters_path())
+            with self._enc_lock:
+                with open(self.encounters_path(), 'a') as f:
+                    f.write(json.dumps(rec, sort_keys=True) + '\n')
+                lines = open(self.encounters_path()).read().splitlines()
+                if len(lines) > keep * 2:
+                    sp_store.write_atomic(self.encounters_path(),
+                                          ('\n'.join(lines[-keep:]) + '\n').encode())
         except OSError as e:
             self.log('  could not record the encounter: %s' % e)
 
@@ -1517,6 +1585,10 @@ class Relay:
 
     def clear_encounters(self):
         """Forget the encounter history; returns how many records went."""
+        with self._enc_lock:
+            return self._clear_encounters()
+
+    def _clear_encounters(self):
         n = self.encounter_count()
         try:
             os.remove(self.encounters_path())
@@ -1718,6 +1790,8 @@ class Relay:
                 pass
 
     def run(self):
+        # Held for the daemon's whole life: offline tools refuse or come through the socket.
+        self.store.claim()
         sock = control_socket_path(self.a.store)
         if self.settings_file():
             err = write_store_pointer(os.path.dirname(os.path.abspath(self.settings_file())),
@@ -1741,7 +1815,8 @@ class Relay:
         self.log('  %d title(s), %d message(s) in the store'
                  % (len(self.store.titles()), len(self.store.messages())))
         self.align_iface_identity()
-        backfill_air_provenance(self.store, self.book, self.log)
+        with self.lock:
+            backfill_air_provenance(self.store, self.book, self.log)
         n_serve = len(self.servable())
         self.log('  %d of those can be served; the rest came from consoles and stay put'
                  % n_serve)
@@ -2175,6 +2250,60 @@ def _selftest():
         chk('a completed exchange clears the backoff and filters the MAC instead',
             b12.wait('CA:FE:00:00:00:03', now=T0 + 70) == 0
             and b12.is_filtered('CA:FE:00:00:00:03'))
+
+        # Hold the first save at its rename while a second thread saves, as the control
+        # thread and the exchange loop can.
+        bc = PeerBook(os.path.join(tmp, 'pc.json'))
+        real_replace, at_rename, errs = os.replace, threading.Event(), []
+
+        def slow_replace(a, b):
+            if b == bc.path and not at_rename.is_set():
+                at_rename.set()
+                time.sleep(0.3)
+            real_replace(a, b)
+
+        def save_in_thread(fn):
+            try:
+                fn()
+            except Exception as e:
+                errs.append(e)
+
+        os.replace = slow_replace
+        try:
+            t1 = threading.Thread(target=save_in_thread,
+                                  args=(lambda: bc.record('AA:00:00:00:00:01', [b'1' * 8]),))
+            t1.start(); at_rename.wait(2.0)
+            t2 = threading.Thread(target=save_in_thread,
+                                  args=(lambda: bc.block('AA:00:00:00:00:02', 'x'),))
+            t2.start(); t1.join(); t2.join()
+        finally:
+            os.replace = real_replace
+        bc2 = PeerBook(bc.path)
+        chk('two threads saving the peer book at once both succeed', not errs, errs)
+        chk('and the saved book has both changes',
+            bc2.is_filtered('AA:00:00:00:00:01') and bc2.is_blocked('AA:00:00:00:00:02'))
+        chk('and no temporary file is left behind',
+            not [f for f in os.listdir(tmp) if f.startswith('.pc.json.')])
+
+        def churn(k):
+            try:
+                for i in range(200):
+                    mac = 'bb:%02x:00:00:00:%02x' % (k, i % 50)
+                    bc.record(mac, [bytes([k, i % 256]) * 4]) if i % 2 else bc.note_attempt(mac)
+                    bc.snapshot()
+            except Exception as e:
+                errs.append(e)
+
+        ts = [threading.Thread(target=churn, args=(k,)) for k in range(4)]
+        for t in ts:
+            t.start()
+        for _ in range(200):
+            Control(None, argparse.Namespace(book=bc, clear_filter_on_rotate=lambda: False)
+                    ).handle({'cmd': 'denylist'})
+        for t in ts:
+            t.join()
+        chk('the peer book survives the exchange loop and the control socket using it at once',
+            not errs and PeerBook(bc.path).peers.keys() == bc.peers.keys(), errs[:1])
 
         if src is not None:
             stb = sp_store.Store(os.path.join(tmp, 'backfill'))
@@ -2833,6 +2962,48 @@ def _selftest():
             c8.failed is not None, c8.failed)
         c8.shutdown()
 
+        live = os.path.join(tmp, 'live.sock')
+        c9 = Control(live, r7)
+        c9.start(); time.sleep(0.3)
+        c10 = Control(live, r7)
+        c10.start(); time.sleep(0.3)
+        chk('a second control server does not take over a socket another daemon answers on',
+            c10.failed is not None and send_command(live, 'status')['ok'], c10.failed)
+        c10.shutdown(); c9.shutdown()
+        stale = os.path.join(tmp, 'stale.sock')
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as dead:
+            dead.bind(stale)
+        c11 = Control(stale, r7)
+        c11.start(); time.sleep(0.3)
+        chk('a socket left by a dead daemon is replaced',
+            c11.failed is None and send_command(stale, 'status')['ok'], c11.failed)
+        c11.shutdown()
+        notsock = os.path.join(tmp, 'plain.sock')
+        open(notsock, 'w').write('keep me')
+        c12 = Control(notsock, r7)
+        c12.start(); time.sleep(0.3)
+        chk('and a file that is not a socket is left alone',
+            c12.failed is not None and open(notsock).read() == 'keep me', c12.failed)
+        c12.shutdown()
+
+        rown = Relay(argparse.Namespace(**{**vars(args), 'store': os.path.join(tmp, 'owned')}))
+        rown.store.claim()
+        try:
+            try:
+                sp_store.Store(rown.a.store, exclusive=True)
+                busy = False
+            except sp_store.StoreBusy:
+                busy = True
+            chk('while the daemon holds its store, a second one may not open it for writing',
+                busy)
+            chk('and an export goes through the daemon instead of reading underneath it',
+                sp_store.store_claimed(rown.a.store))
+        finally:
+            rown.store.release()
+        chk('once it lets go, the store can be opened again',
+            not sp_store.store_claimed(rown.a.store)
+            and sp_store.Store(rown.a.store, exclusive=True).claimed)
+
         if src is not None:
             r3 = Relay(argparse.Namespace(**{**vars(args), 'store': os.path.join(tmp, 'store')}))
 
@@ -3168,10 +3339,15 @@ def main():
         return _selftest()
     if a.cmd == 'import':
         try:
-            s = sp_store.Store(a.store)
+            s = sp_store.Store(a.store, exclusive=True)
         except PermissionError:
             print('only root can write the store at %s; re-run with sudo' % a.store)
             return 1
+        except sp_store.StoreBusy as e:
+            if a.from_log:
+                print('%s; stop it before importing a run log' % e)
+                return 1
+            return import_via_daemon(a)
         if a.from_log:
             import_from_log(s, a.path)
         else:
@@ -3257,7 +3433,11 @@ def main():
     os.makedirs(a.store, exist_ok=True)
     os.umask(0o077)
     lock_down_store(a.store)
-    return Relay(a).run()
+    try:
+        return Relay(a).run()
+    except sp_store.StoreBusy as e:
+        print('not starting: %s' % e, file=sys.stderr)
+        return 1
 
 
 if __name__ == '__main__':

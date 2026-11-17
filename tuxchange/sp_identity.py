@@ -269,7 +269,11 @@ def main():
         print('wrote %s (%d B)' % (a.out, len(m)))
         return 0
 
-    st = sp_store.Store(a.store)
+    try:
+        st = sp_store.Store(a.store, exclusive=True)
+    except sp_store.StoreBusy as e:
+        print('%s; use `sp_relay.py ctl seed` to seed it through the daemon' % e)
+        return 1
     seed(st, a.store, replace=a.replace, **kw)
     print()
     print(st.summary())
