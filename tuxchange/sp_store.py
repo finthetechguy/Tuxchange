@@ -48,6 +48,10 @@ def write_atomic(path, data, mode=0o600, durable=False):
             os.close(dfd)
 
 
+class KeyConflict(ValueError):
+    """A title was offered an HMAC key different from the one it already has."""
+
+
 class StoreBusy(RuntimeError):
     """Another process (normally the daemon) holds the store."""
 
@@ -336,33 +340,46 @@ class Store:
         return out
 
     @_locked
-    def add_title(self, tid, name=None, hmac_key=None):
-        """Register a title. Idempotent; a later call may fill in a name or key."""
-        # Checked first, so a refused title leaves no directories behind.
-        if tid not in self.titles() and len(self.titles()) >= MBOXLIST_MAX:
+    def add_title(self, tid, name=None, hmac_key=None, replace_key=False):
+        """Register a title, or fill in its name or key. Idempotent.
+
+        A key different from the one the title already has is refused with KeyConflict
+        unless `replace_key`; everything is checked before anything is written.
+        """
+        if hmac_key is not None:
+            hmac_key = bytes(hmac_key)
+            if len(hmac_key) != 0x20:
+                raise ValueError('an HMAC key is 32 bytes, got %d' % len(hmac_key))
+        if name is not None and not isinstance(name, str):
+            raise ValueError('a title name is text, got %r' % type(name).__name__)
+        titles = self.titles()
+        if tid not in titles and len(titles) >= MBOXLIST_MAX:
             raise ValueError('a store holds at most %d titles' % MBOXLIST_MAX)
+        held = self.title_key(tid)
+        if hmac_key is not None and held is not None and held != hmac_key and not replace_key:
+            raise KeyConflict('title %08X already has a different HMAC key' % tid)
         self._make_title_dirs(tid)
-        if tid not in self.titles():
-            ts = self.titles() + [tid]
-            self._write_mboxlist(ts)
-        info = bytearray(0x60)
+        if tid not in titles:
+            self._write_mboxlist(titles + [tid])
         p = os.path.join(self._title_dir(tid), 'MBoxInfo____')
-        if os.path.exists(p):
-            info = bytearray(open(p, 'rb').read().ljust(0x60, b'\x00'))
+        old = open(p, 'rb').read() if os.path.exists(p) else b''
+        info = bytearray(old.ljust(0x60, b'\x00'))
         struct.pack_into('<HHI', info, 0, MBOXINFO_MAGIC, 0, 0)
         struct.pack_into('<I', info, 4, tid)
         if hmac_key is not None:
-            if len(hmac_key) != 0x20:
-                raise ValueError('an HMAC key is 32 bytes, got %d' % len(hmac_key))
             info[0x10:0x30] = hmac_key
+        if bytes(info) != old:
+            _write_private(p, bytes(info))
+        if hmac_key is not None:
             m = self._load_meta()
             if '%08x' % tid not in m['keyed_titles']:
                 m['keyed_titles'].append('%08x' % tid)
                 self._save_meta(m)
-        _write_private(p, bytes(info))
         if name is not None:
-            _write_private(os.path.join(self._title_dir(tid), 'MBoxData.010'),
-                           name.encode('utf-16-le') + b'\x00\x00')
+            np = os.path.join(self._title_dir(tid), 'MBoxData.010')
+            data = name.encode('utf-16-le') + b'\x00\x00'
+            if not os.path.exists(np) or open(np, 'rb').read() != data:
+                _write_private(np, data)
         for box in BOXES:
             self._write_boxinfo(tid, box)
         return tid
@@ -409,7 +426,7 @@ class Store:
         if container[:2] != b'\x60\x60':
             raise ValueError('add_message takes a bare 0x6060 container; unwrap the envelope first')
         container, tid = self._checked(container, key)
-        if tid not in self.titles():
+        if tid not in self.titles() or name is not None or key is not None:
             self.add_title(tid, name=name, hmac_key=key)
         else:
             self._make_title_dirs(tid)
@@ -435,8 +452,6 @@ class Store:
             raise ValueError('replace_outbox takes a bare 0x6060 container')
         container, tid = self._checked(container, key)
         old = self.messages(tid, 'outbox')
-        if tid in self.titles() and (key is not None or name is not None):
-            self.add_title(tid, name=name, hmac_key=key)
         self.add_message(container, 'outbox', name=name, key=key, origin=origin)
         keep = container[0x20:0x28]
         n = 0
@@ -700,6 +715,24 @@ def _selftest():
             and 0x00141000 in rp.titles())
         chk('an enveloped message is refused by replace_outbox',
             _raises(lambda: rp.replace_outbox(b'\x61\x61' + b'\x00' * 200)))
+
+        tk = Store(os.path.join(tmp, 'title-keys'))
+        tk.add_message(_synthetic(0x00020800, 1, key=b'p' * 32), 'inbox')
+        tk.add_message(_synthetic(0x00020800, 2, key=b'p' * 32), 'outbox', name='Mii Plaza',
+                       key=b'p' * 32)
+        chk('a key given with a message for a title already received is recorded',
+            tk.title_key(0x00020800) == b'p' * 32 and tk.title_name(0x00020800) == 'Mii Plaza')
+        other = _synthetic(0x00020800, 3, key=b'q' * 32)
+        chk('a different key for a keyed title is refused',
+            _raises(lambda: tk.add_message(other, 'outbox', key=b'q' * 32), KeyConflict)
+            and _raises(lambda: tk.add_title(0x00020800, hmac_key=b'q' * 32), KeyConflict))
+        chk('and neither the key nor the outbox changed',
+            tk.title_key(0x00020800) == b'p' * 32 and len(tk.messages(0x00020800, 'outbox')) == 1)
+        tk.add_title(0x00020800, hmac_key=b'q' * 32, replace_key=True)
+        chk('a key can still be replaced on purpose', tk.title_key(0x00020800) == b'q' * 32)
+        chk('a malformed key is refused before the title is created',
+            _raises(lambda: tk.add_title(0x00030600, name='x', hmac_key=b'short'))
+            and 0x00030600 not in tk.titles() and not os.path.exists(tk._title_dir(0x00030600)))
 
         fw = Store(os.path.join(tmp, 'failed-write'), log=lambda m: None)
         first = _synthetic(0x00030600, 9, key=b'f' * 32)
