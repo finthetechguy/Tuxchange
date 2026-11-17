@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """A CEC message store on disk, shaped like a console's."""
-import os, json, stat, time, struct, base64
+import os, json, stat, time, struct, base64, fcntl, functools, tempfile, threading
 
 import sp_cec, sp_cecvalid
 
 MBOXLIST_MAGIC, MBOXINFO_MAGIC, BOXINFO_MAGIC = 0x6868, 0x6363, 0x6262
 # Kept outside CEC/ so the tree stays byte-comparable with a console's.
 META_FILE = 'store_meta.json'
+LOCK_FILE = 'store.lock'
 MBOXLIST_HDR, MBOXLIST_ENTRY, MBOXLIST_MAX = 12, 16, 24
 BOXES = {'inbox': 'InBox___', 'outbox': 'OutBox__'}
 DEFAULT_MAX_BYTES, DEFAULT_MAX_MESSAGES = 0x100000, 24
@@ -20,6 +21,53 @@ def _write_private(path, data):
         f.write(data)
 
 
+def write_atomic(path, data, mode=0o600):
+    """Publish `data` at `path` through a uniquely named temporary file beside it, so a
+    concurrent writer never renames our file away and a reader never sees half of it."""
+    d, base = os.path.split(os.path.abspath(path))
+    fd, tmp = tempfile.mkstemp(dir=d, prefix='.%s.' % base, suffix='.tmp')
+    try:
+        with os.fdopen(fd, 'wb') as f:
+            os.fchmod(f.fileno(), mode)
+            f.write(data)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+class StoreBusy(RuntimeError):
+    """Another process (normally the daemon) holds the store."""
+
+
+def store_claimed(root):
+    """-> True if some process holds `root` exclusively right now."""
+    try:
+        fd = os.open(os.path.join(root, LOCK_FILE), os.O_RDONLY | os.O_CLOEXEC)
+    except OSError:
+        return False
+    try:
+        fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        return False
+    except BlockingIOError:
+        return True
+    except OSError:
+        return False
+    finally:
+        os.close(fd)
+
+
+def _locked(fn):
+    @functools.wraps(fn)
+    def run(self, *a, **kw):
+        with self.lock:
+            return fn(self, *a, **kw)
+    return run
+
+
 def message_filename(container):
     """`_` + base64 of the 8-byte message id, '/' -> '-', unpadded."""
     mid = container[0x20:0x28]
@@ -27,18 +75,54 @@ def message_filename(container):
 
 
 class Store:
-    """A directory holding CEC messages, in the console's own shape."""
+    """A directory holding CEC messages, in the console's own shape.
 
-    def __init__(self, root):
+    Every public method holds `self.lock`, so threads sharing one Store see whole operations;
+    hold it yourself around a read-then-write. `exclusive=True` also takes the store's
+    lifetime lock, refusing with StoreBusy while another process has it, and every writer
+    (the daemon, offline imports) opens it that way.
+    """
+
+    def __init__(self, root, exclusive=False):
         self.root = os.path.abspath(root)
+        self.lock = threading.RLock()
         self.last_evicted = 0
+        self._lock_fd = None
         self.cec = os.path.join(self.root, 'CEC')
         os.makedirs(self.cec, mode=0o700, exist_ok=True)
+        if exclusive:
+            self.claim()
         self._lock_down()
         if not os.path.exists(self._mboxlist_path()):
             self._write_mboxlist([])
         if not os.path.exists(self._meta_path()):
             self._save_meta({'keyed_titles': ['%08x' % t for t in self.titles()], 'origins': {}})
+
+    def claim(self):
+        """Hold the store against every other process until release() or exit."""
+        if self._lock_fd is not None:
+            return
+        fd = os.open(os.path.join(self.root, LOCK_FILE),
+                     os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            os.close(fd)
+            raise StoreBusy('the store at %s is in use by another process '
+                            '(is the daemon running?)' % self.root)
+        except BaseException:
+            os.close(fd)
+            raise
+        self._lock_fd = fd
+
+    def release(self):
+        if self._lock_fd is not None:
+            os.close(self._lock_fd)
+            self._lock_fd = None
+
+    @property
+    def claimed(self):
+        return self._lock_fd is not None
 
     def _lock_down(self):
         """Close up a store written before its files were private."""
@@ -73,23 +157,24 @@ class Store:
         return m
 
     def _save_meta(self, m):
-        tmp = self._meta_path() + '.tmp'
-        _write_private(tmp, json.dumps(m, indent=1, sort_keys=True).encode())
-        os.replace(tmp, self._meta_path())
+        write_atomic(self._meta_path(), json.dumps(m, indent=1, sort_keys=True).encode())
 
     @staticmethod
     def _okey(mid, box):
         return '%s/%s' % (box, mid.hex() if isinstance(mid, (bytes, bytearray)) else mid)
 
+    @_locked
     def origin(self, container_or_id, box='outbox'):
         """-> {'source', 'when', 'box'} for one message IN ONE BOX, or None if never recorded."""
         mid = (container_or_id[0x20:0x28] if len(container_or_id) > 0x28 else container_or_id)
         m = self._load_meta()['origins']
         return m.get(self._okey(mid, box))
 
+    @_locked
     def origins(self):
         return self._load_meta()['origins']
 
+    @_locked
     def is_from_air(self, container_or_id, box='outbox'):
         o = self.origin(container_or_id, box)
         return bool(o) and str(o.get('source', '')).startswith('air:')
@@ -117,8 +202,9 @@ class Store:
         for i, t in enumerate(titles):
             b[MBOXLIST_HDR + i * MBOXLIST_ENTRY:
               MBOXLIST_HDR + i * MBOXLIST_ENTRY + 8] = ('%08x' % t).encode()
-        _write_private(self._mboxlist_path(), bytes(b))
+        write_atomic(self._mboxlist_path(), bytes(b))
 
+    @_locked
     def titles(self):
         d = open(self._mboxlist_path(), 'rb').read()
         n = struct.unpack_from('<I', d, 8)[0]
@@ -131,6 +217,7 @@ class Store:
                 pass
         return out
 
+    @_locked
     def add_title(self, tid, name=None, hmac_key=None):
         """Register a title. Idempotent; a later call may fill in a name or key."""
         # Checked first, so a refused title leaves no directories behind.
@@ -162,6 +249,7 @@ class Store:
             self._write_boxinfo(tid, box)
         return tid
 
+    @_locked
     def title_key(self, tid):
         """The title's 32-byte HMAC key, or None if we have no MBoxInfo for it."""
         p = os.path.join(self._title_dir(tid), 'MBoxInfo____')
@@ -172,6 +260,7 @@ class Store:
         k = open(p, 'rb').read()[0x10:0x30]
         return k if len(k) == 0x20 else None
 
+    @_locked
     def title_name(self, tid):
         p = os.path.join(self._title_dir(tid), 'MBoxData.010')
         if not os.path.exists(p):
@@ -196,6 +285,7 @@ class Store:
                                       % (tid, container[0x20:0x28].hex()))
         return container, tid
 
+    @_locked
     def add_message(self, container, box='inbox', name=None, key=None, origin=None):
         """File one bare 0x6060 container."""
         if container[:2] != b'\x60\x60':
@@ -216,6 +306,7 @@ class Store:
             self._save_meta(m)
         return p
 
+    @_locked
     def replace_outbox(self, container, name=None, key=None, origin=None):
         """Make `container` its title's only outbox message. -> how many it replaced.
 
@@ -257,6 +348,7 @@ class Store:
             count, used, dropped = count - 1, used - size, dropped + 1
         return dropped
 
+    @_locked
     def messages(self, tid=None, box=None):
         """-> [(title, box, container)] for every stored message matching the filters."""
         out = []
@@ -271,6 +363,7 @@ class Store:
                     out.append((t, b, open(os.path.join(d, fn), 'rb').read()))
         return out
 
+    @_locked
     def remove_message(self, tid, box, container_or_id):
         mid = (container_or_id[0x20:0x28] if len(container_or_id) > 0x28 else container_or_id)
         fn = '_' + base64.b64encode(mid).decode().rstrip('=').replace('/', '-')
@@ -284,6 +377,7 @@ class Store:
             return True
         return False
 
+    @_locked
     def remove_title(self, tid):
         """Forget a title entirely: its messages, its name, its key, its MBoxList entry."""
         import shutil
@@ -302,6 +396,7 @@ class Store:
             self._save_meta(m)
         return n
 
+    @_locked
     def clear_box(self, box):
         """Empty one box across every title."""
         n = 0
@@ -310,6 +405,7 @@ class Store:
                 n += 1
         return n
 
+    @_locked
     def verify(self, tid, container):
         """-> True/False if we hold the title's key, None if we do not."""
         k = self.title_key(tid)
@@ -317,6 +413,7 @@ class Store:
             return None
         return sp_cecvalid.hmac_status(container, k) == sp_cecvalid.VALID
 
+    @_locked
     def summary(self):
         og = self.origins()
         lines = []
@@ -395,6 +492,46 @@ def _selftest():
         chk('an inbox stops at its byte limit', used <= DEFAULT_MAX_BYTES, used)
         chk('and still holds the newest message',
             12 in {int.from_bytes(c[0x20:0x28], 'little') for _t, _b, c in big.messages(box='inbox')})
+        held = Store(os.path.join(tmp, 'held'), exclusive=True)
+        try:
+            Store(held.root, exclusive=True)
+            second = 'opened'
+        except StoreBusy:
+            second = 'refused'
+        chk('a second writer cannot open a store another process holds', second == 'refused')
+        chk('and the store reports itself held', store_claimed(held.root))
+        held.release()
+        chk('it can be opened again once released',
+            not store_claimed(held.root) and Store(held.root, exclusive=True).claimed)
+
+        # Two registrations racing on MBoxList used to lose one title, orphaning its directory.
+        reg = Store(os.path.join(tmp, 'race'))
+        real_write, errs = reg._write_mboxlist, []
+
+        def slow_write(ts):
+            time.sleep(0.01)
+            real_write(ts)
+
+        reg._write_mboxlist = slow_write
+
+        def register(base):
+            try:
+                for i in range(8):
+                    reg.add_title(base + i)
+            except Exception as e:
+                errs.append(e)
+
+        import threading
+        ts = [threading.Thread(target=register, args=(b,)) for b in (0x00040000, 0x00050000)]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join()
+        on_disk = {int(n, 16) for n in os.listdir(reg.cec) if n != 'MBoxList____'}
+        chk('titles registered from two threads at once are all listed',
+            not errs and set(reg.titles()) == on_disk and len(on_disk) == 16,
+            '%d listed, %d on disk %s' % (len(reg.titles()), len(on_disk), errs[:1]))
+
         mal = bytearray(_synthetic(0x00030600, 77))
         struct.pack_into('<I', mal, 8, 0xFFFFFFF0)
         chk('a container with an impossible header_size is refused',
