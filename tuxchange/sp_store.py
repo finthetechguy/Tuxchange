@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """A CEC message store on disk, shaped like a console's."""
-import os, sys, json, stat, time, struct, base64, fcntl, functools, tempfile, threading
+import os, sys, json, stat, time, struct, base64, fcntl, functools, hashlib, tempfile, threading
 
 import sp_cec, sp_cecvalid
 
@@ -8,6 +8,10 @@ MBOXLIST_MAGIC, MBOXINFO_MAGIC, BOXINFO_MAGIC = 0x6868, 0x6363, 0x6262
 # Kept outside CEC/ so the tree stays byte-comparable with a console's.
 META_FILE = 'store_meta.json'
 LOCK_FILE = 'store.lock'
+IDENTITY_FILE = 'identity.json'
+# Stores from before IDENTITY_FILE hashed this with their path. Do not change it, or every
+# such store gets a new identity.
+LEGACY_IDENTITY_PREFIX = 'sp-relay:'
 QUARANTINE_DIR = 'quarantine'
 TMP_SUFFIX = '.tmp'
 MBOXLIST_HDR, MBOXLIST_ENTRY, MBOXLIST_MAX = 12, 16, 24
@@ -33,11 +37,12 @@ def _write_private(path, data):
     write_atomic(path, data, 0o600, durable=True)
 
 
-def write_atomic(path, data, mode=0o600, durable=False):
+def write_atomic(path, data, mode=0o600, durable=False, clobber=True):
     """Publish `data` at `path` through a uniquely named temporary file beside it, so a
     concurrent writer never renames our file away and a reader never sees half of it.
     `durable` also syncs the file and its directory, so a crash leaves the old or the new
-    contents, never an empty file."""
+    contents, never an empty file. Without `clobber`, an existing `path` is kept and
+    FileExistsError raised."""
     d, base = os.path.split(os.path.abspath(path))
     fd, tmp = tempfile.mkstemp(dir=d, prefix='.%s.' % base, suffix=TMP_SUFFIX)
     try:
@@ -47,7 +52,13 @@ def write_atomic(path, data, mode=0o600, durable=False):
             if durable:
                 f.flush()
                 os.fsync(f.fileno())
-        os.replace(tmp, path)
+        if clobber:
+            os.replace(tmp, path)
+        else:
+            try:
+                os.link(tmp, path)
+            finally:
+                os.unlink(tmp)
     except BaseException:
         try:
             os.unlink(tmp)
@@ -60,6 +71,34 @@ def write_atomic(path, data, mode=0o600, durable=False):
             os.fsync(dfd)
         finally:
             os.close(dfd)
+
+
+def legacy_identity_seed(root):
+    """-> the seed a store at `root` had before stores kept their own."""
+    return hashlib.sha256((LEGACY_IDENTITY_PREFIX + os.path.abspath(root)).encode()).digest()
+
+
+def read_identity(root):
+    """-> {'seed': 32 bytes, 'source': 'random' | 'legacy' | 'copied'}, or None if the
+    store has no identity file."""
+    path = os.path.join(root, IDENTITY_FILE)
+    try:
+        with open(path, 'rb') as f:
+            d = json.loads(f.read().decode())
+        seed = bytes.fromhex(d['seed'])
+    except FileNotFoundError:
+        return None
+    except (ValueError, KeyError, TypeError, AttributeError) as e:
+        raise ValueError('%s is damaged (%s)' % (path, e)) from None
+    if len(seed) != 32:
+        raise ValueError('%s holds a %d-byte seed, not 32' % (path, len(seed)))
+    return {'seed': seed, 'source': d.get('source') or 'random'}
+
+
+def write_identity(root, seed, source, replace=False):
+    """Make `seed` the store's identity. Without `replace`, raise FileExistsError if it has one."""
+    data = json.dumps({'version': 1, 'seed': seed.hex(), 'source': source}).encode() + b'\n'
+    write_atomic(os.path.join(root, IDENTITY_FILE), data, 0o600, durable=True, clobber=replace)
 
 
 class KeyConflict(ValueError):
@@ -118,10 +157,12 @@ class Store:
         self.log = log or (lambda s: print(s, file=sys.stderr))
         self._lock_fd = None
         self.cec = os.path.join(self.root, 'CEC')
+        fresh = not os.path.isdir(self.cec)
         os.makedirs(self.cec, mode=0o700, exist_ok=True)
         if exclusive:
             self.claim()
         self._lock_down()
+        self._ensure_identity(fresh)
         if not exclusive and self._may_repair():
             self.recover()
         if not os.path.exists(self._mboxlist_path()):
@@ -251,6 +292,18 @@ class Store:
                     self.add_title(t)
             self.messages(t)
         return len(self.quarantined) - before
+
+    def _ensure_identity(self, fresh):
+        """A new store gets a random identity. One from before identity files keeps the one
+        its path always gave it, so consoles that know it still do; see sp_identity."""
+        if os.path.exists(os.path.join(self.root, IDENTITY_FILE)):
+            return
+        seed, source = ((os.urandom(32), 'random') if fresh
+                        else (legacy_identity_seed(self.root), 'legacy'))
+        try:
+            write_identity(self.root, seed, source)
+        except (FileExistsError, PermissionError):
+            pass
 
     def _lock_down(self):
         """Close up a store written before its files were private."""
@@ -638,7 +691,38 @@ def _selftest():
             mode(p0.cec) == 0o700 and mode(tdir) == 0o700 and mode(p0._meta_path()) == 0o600
             and mode(os.path.join(tdir, 'MBoxInfo____')) == 0o600)
 
-        lim = Store(os.path.join(tmp, 'limit'))
+        idp = os.path.join(p0.root, IDENTITY_FILE)
+        first = read_identity(p0.root)
+        chk('a new store gets a random identity, kept private',
+            first['source'] == 'random' and first['seed'] != legacy_identity_seed(p0.root)
+            and mode(idp) == 0o600, first['source'])
+        Store(p0.root)
+        chk('and keeps it when opened again', read_identity(p0.root) == first)
+        again = os.path.join(tmp, 'again')
+        Store(again)
+        seed_a = read_identity(again)['seed']
+        shutil.rmtree(again)
+        Store(again)
+        chk('a store made afresh at the same path gets a different identity',
+            read_identity(again)['seed'] != seed_a)
+        old = os.path.join(tmp, 'pre-identity')
+        os.makedirs(os.path.join(old, 'CEC'))
+        Store(old)
+        chk('a store from before identity files keeps the identity its path gave it',
+            read_identity(old) == {'seed': legacy_identity_seed(old), 'source': 'legacy'})
+        try:
+            write_identity(old, b'\0' * 32, 'random')
+            kept = False
+        except FileExistsError:
+            kept = read_identity(old)['source'] == 'legacy'
+        chk('an identity is only replaced when asked',
+            kept and not [n for n in os.listdir(old) if n.endswith(TMP_SUFFIX)])
+        with open(os.path.join(old, IDENTITY_FILE), 'w') as f:
+            f.write('{"seed": "zz"}')
+        chk('a damaged identity file is an error, not a silent new identity',
+            _raises(lambda: read_identity(old)))
+
+        lim =Store(os.path.join(tmp, 'limit'))
         for i in range(1, DEFAULT_MAX_MESSAGES + 7):
             lim.add_message(_synthetic(0x00030600, i), 'inbox', origin='air:test')
             time.sleep(0.005)
