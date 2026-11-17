@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Tuxchange: a daemon that exchanges with any 3DS that passes."""
 import contextlib, functools, os, sys, json, time, socket, stat, struct, threading, random, argparse, re, pwd
-import base64, subprocess, queue, signal, tempfile
+import base64, subprocess, queue, signal, select
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import sp_store, sp_cec, sp_cecvalid, sp_harvest_air, sp_build, sp_import
@@ -194,7 +194,8 @@ class HookRunner:
     As the daemon is root, a hook is NEVER run as root: it is ran by the control user, and a
     script that user could not have written themselves (wrong owner, or writable by anyone else)
     is refused. Event details go in TUXCHANGE_* environment variables, not on the command line.
-    A failing/hanging hook is killed after `timeout` seconds.
+    A failing/hanging hook is killed after `timeout` seconds, and anything it started is
+    killed when it exits.
     """
 
     def __init__(self, directory, user, timeout=10.0, log=print):
@@ -344,27 +345,66 @@ class HookRunner:
             env['TUXCHANGE_' + k.upper()] = self._clean(v)
         return env
 
+    def _collect(self, pid, fd):
+        """Read a hook's output until it exits or its time runs out, keeping only the first
+        HOOK_OUTPUT_MAX + 1 bytes. Leaves the process unreaped. -> (output, timed_out)."""
+        deadline = time.monotonic() + self.timeout
+        kept, reading = bytearray(), True
+        while not os.waitid(os.P_PID, pid, os.WEXITED | os.WNOHANG | os.WNOWAIT):
+            left = deadline - time.monotonic()
+            if left <= 0:
+                return kept, True
+            if not reading:
+                time.sleep(min(left, 0.05))
+            elif select.select([fd], [], [], min(left, 0.05))[0]:
+                chunk = os.read(fd, 65536)
+                reading = bool(chunk)
+                kept += chunk[:HOOK_OUTPUT_MAX + 1 - len(kept)]
+        return kept, False
+
+    @staticmethod
+    def _drain(fd, room, reads=64):
+        """What is left in the pipe once the hook's group is gone, without waiting on anything
+        that escaped it."""
+        os.set_blocking(fd, False)
+        kept = b''
+        for _ in range(reads):
+            try:
+                chunk = os.read(fd, 65536)
+            except BlockingIOError:
+                break
+            if not chunk:
+                break
+            kept += chunk[:max(0, room - len(kept))]
+        return kept
+
     def _run(self, event, path, fields):
         pw = self.pw
         drop = {}
         if pw.pw_uid != os.geteuid():
             drop = {'user': pw.pw_uid, 'group': pw.pw_gid,
                     'extra_groups': os.getgrouplist(pw.pw_name, pw.pw_gid)}
-        # Output goes to a file, not a pipe: a hook that leaves a background child holding a
-        # pipe open would otherwise block after the hook itself has exited.
-        with tempfile.TemporaryFile() as out:
-            p = subprocess.Popen([path], cwd='/', env=self._env(event, fields),
-                                 stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT,
-                                 start_new_session=True, **drop)
+        r, w = os.pipe()
+        try:
             try:
-                rc = p.wait(self.timeout)
-            except subprocess.TimeoutExpired:
+                p = subprocess.Popen([path], cwd='/', env=self._env(event, fields),
+                                     stdin=subprocess.DEVNULL, stdout=w, stderr=subprocess.STDOUT,
+                                     start_new_session=True, **drop)
+            finally:
+                os.close(w)
+            try:
+                out, timed_out = self._collect(p.pid, r)
+            finally:
+                # Signalled before reaping, so the group id cannot have been reused yet.
                 with contextlib.suppress(OSError):
                     os.killpg(p.pid, signal.SIGKILL)
-                p.wait()
-                rc = None
-            out.seek(0)
-            text = out.read(HOOK_OUTPUT_MAX + 1).decode('utf-8', 'replace').strip()
+                rc = p.wait()
+            out += self._drain(r, HOOK_OUTPUT_MAX + 1 - len(out))
+        finally:
+            os.close(r)
+        if timed_out:
+            rc = None
+        text = bytes(out).decode('utf-8', 'replace').strip()
         for line in text[:HOOK_OUTPUT_MAX].splitlines():
             self.log('    hook %s: %s' % (event, line))
         if rc is None:
@@ -2633,6 +2673,33 @@ def _selftest():
         chk('and it is killed at the timeout',
             time.time() - t0 < 10 and hr.last_failure and 'killed' in hr.last_failure['why'],
             hr.last_failure)
+        logged = []
+        hook('exchange', 'yes xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n')
+        hr = HookRunner(hd, me, 1.0, logged.append); hr.fire('exchange'); hr.close(15)
+        chk('a hook that writes without end has only the first %d bytes kept' % HOOK_OUTPUT_MAX,
+            0 < sum(len(m) for m in logged) < HOOK_OUTPUT_MAX * 2 and 'killed' in hr.last_failure['why'],
+            sum(len(m) for m in logged))
+        bgpid = os.path.join(tmp, 'bgpid')
+        hook('exchange', '(sleep 30; echo late) &\necho $! > %s\necho done\n' % bgpid)
+        logged = []
+        hr = HookRunner(hd, me, 10.0, logged.append)
+        t0 = time.time(); hr.fire('exchange'); hr.close(15)
+
+        def gone(pid):
+            try:
+                with open('/proc/%d/stat' % pid) as f:
+                    return f.read().rsplit(')', 1)[1].split()[0] in 'ZX'
+            except OSError:
+                return True
+        pid = int(open(bgpid).read())
+        for _ in range(40):
+            if gone(pid):
+                break
+            time.sleep(0.05)
+        chk('a hook that leaves a child holding its output finishes when it exits',
+            time.time() - t0 < 5 and not hr.last_failure and any('done' in m for m in logged),
+            (time.time() - t0, hr.last_failure, logged))
+        chk('and that child is killed with it', gone(pid))
         hook('exchange', 'true\n', 0o757)
         chk('a hook writable by others is refused', not runner().fire('exchange'))
         hook('exchange', 'true\n', 0o644)
