@@ -63,6 +63,10 @@ jobs:
           python tools/macfilter_decode.py --selftest || rc=1
           exit $rc
 
+      - name: Installer against a fake root
+        if: ${{ !cancelled() }}
+        run: bash install/install_selftest.sh
+
       - name: No key material has crept into the tree
         if: ${{ !cancelled() }}
         run: ./.github/scripts/keyscan.sh
@@ -104,7 +108,7 @@ jobs:
         run: |
           set -e
           for f in scripts/tuxchange scripts/tuxchange-link scripts/tuxchange-probe \
-                   scripts/sp_monitor.sh install/install.sh; do
+                   scripts/sp_monitor.sh install/install.sh install/install_selftest.sh; do
             bash -n "$f" && echo "ok  $f"
           done
 
