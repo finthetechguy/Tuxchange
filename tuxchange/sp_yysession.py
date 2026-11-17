@@ -44,6 +44,9 @@ RETRANSMIT_AFTER = 0.75
 VERDICT_HOLD = 0.06
 MAX_RESENDS = 8
 MAX_OBJECT = 1 << 20
+# A real exchange is a handful of small control objects and one envelope per title.
+MAX_RECEIVED_OBJECTS = 64
+MAX_RECEIVED_BYTES = 8 << 20
 
 
 def object_length(buf):
@@ -92,6 +95,8 @@ class YYSession:
         self.syn_at = None
         self.syn_resends = 0
         self.rx_expect = None
+        self.rx_refused = None
+        self.rx_total = 0
         # Cleared only by a completed object, because a hole stays until the peer retransmits.
         self.rx_gap = False
         self.repeat_slot = None
@@ -104,7 +109,7 @@ class YYSession:
         self.send_at = None             # deferred start_send(), driven by poll()
         self.stats = {'sent_objects': 0, 'recv_objects': 0, 'tx_frames': 0, 'rx_frames': 0,
                       'resends': 0, 'dup_tails': 0, 'syn_resends': 0, 'gaps': 0,
-                      'short_holds': 0, 'manifest_repeats': 0}
+                      'short_holds': 0, 'manifest_repeats': 0, 'refused': 0}
 
     def _emit(self, flags, seq, ack, payload=b''):
         self.stats['tx_frames'] += 1
@@ -184,6 +189,7 @@ class YYSession:
             self.rx_buf = bytearray()
             self.rx_expect = None
             self.rx_gap = False
+            self.rx_refused = None
             self.log('  <-- peer opened a connection (object %d incoming)'
                      % len(self.received))
             return self._emit(sp_yy.SYN | sp_yy.ACK, 0, 0)
@@ -206,11 +212,17 @@ class YYSession:
                 self._emit(sp_yy.ACK, 0, self.rx_done_len)
             return True
 
+        if y['payload_len'] > 0 and self.rx_refused:
+            return False
         if y['payload_len'] > 0:
             if y['seq'] == len(self.rx_buf):
+                if len(self.rx_buf) + len(y['payload']) > MAX_OBJECT:
+                    return self._refuse('it runs past the %d B object limit' % MAX_OBJECT)
                 self.rx_buf += y['payload']
-                if self.rx_expect is None:
+                if self.rx_expect is None and len(self.rx_buf) >= 0x10:
                     self.rx_expect = object_length(self.rx_buf)
+                    if self.rx_expect is None and bytes(self.rx_buf[:2]) in (b'cc', b'aa'):
+                        return self._refuse('its header declares an impossible length')
             elif y['seq'] < len(self.rx_buf):
                 pass
             else:
@@ -235,7 +247,12 @@ class YYSession:
                     if self.rx_expect is not None and len(self.rx_buf) > self.rx_expect:
                         self.log('  object %d overshot its declared length by %d B; trimmed'
                                  % (len(self.received), len(self.rx_buf) - self.rx_expect))
+                    if (len(self.received) >= MAX_RECEIVED_OBJECTS
+                            or self.rx_total + len(obj) > MAX_RECEIVED_BYTES):
+                        return self._refuse('the session already holds %d objects, %d B'
+                                            % (len(self.received), self.rx_total))
                     self.received.append(obj)
+                    self.rx_total += len(obj)
                     self.stats['recv_objects'] += 1
                     self.rx_done_len = len(obj)
                     self.log('  <== received object %d complete: %d B'
@@ -287,6 +304,16 @@ class YYSession:
                 self.idle_since = time.time()
                 return False
             return self._pump_send(self.tx_acked, y['window'])
+        return False
+
+    def _refuse(self, why):
+        """Drop the incoming object and ignore its data until the peer opens a new one."""
+        self.stats['refused'] += 1
+        self.log('  REFUSING peer object %d (%d B so far): %s'
+                 % (len(self.received), len(self.rx_buf), why))
+        self.rx_refused = why
+        self.rx_buf = bytearray()
+        self.rx_expect = None
         return False
 
     def poll(self, idle_timeout=0.4):
@@ -894,6 +921,50 @@ def _selftest():
     s23.on_frame(sp_yy.parse(build_yy_frame(sp_yy.SYN, 0, 0)))
     s23.on_frame(sp_yy.parse(build_yy_frame(sp_yy.ACK | sp_yy.PSH | sp_yy.URG, 0, 0, v)))
     chk('a hold of 0 restores the old behaviour', s23.send_at is None and s23.role == 'send')
+
+    def rx_session():
+        r = YYSession(lambda *_a: True, lambda m, l=1: None, [])
+        r.on_frame(sp_yy.parse(build_yy_frame(sp_yy.SYN, 0, 0)))
+        return r
+
+    def push(r, payload, flags=sp_yy.ACK):
+        r.on_frame(sp_yy.parse(build_yy_frame(flags, len(r.rx_buf), 0, payload)))
+
+    s24 = rx_session()
+    junk = b'unknown-object-header' + b'x' * (MAX_SEG - 21)
+    peak = 0
+    for _ in range(MAX_OBJECT // len(junk) + 4):
+        push(s24, junk)
+        peak = max(peak, len(s24.rx_buf))
+    chk('an object with no decodable length cannot grow past MAX_OBJECT',
+        peak <= MAX_OBJECT and s24.stats['refused'] == 1, peak)
+    chk('and the rest of it is ignored, not buffered', not s24.rx_buf and s24.rx_refused)
+    s24.on_frame(sp_yy.parse(build_yy_frame(sp_yy.SYN, 0, 0)))
+    push(s24, b'\xaa' * 40, sp_yy.ACK | sp_yy.PSH | sp_yy.URG)
+    chk('a new connection after a refusal is received normally',
+        s24.received == [b'\xaa' * 40] and s24.rx_refused is None)
+
+    for name, head in (('a cc object past MAX_OBJECT',
+                        b'cc\xff\xff' + struct.pack('<III', 0x40, 0, MAX_OBJECT)),
+                       ('an envelope shorter than its own header',
+                        b'aa\x00\x00' + struct.pack('<III', 4, 0, 0)),
+                       ('an envelope declaring 4 GiB',
+                        b'aa\x00\x00' + struct.pack('<III', 0xFFFFFFFF, 0, 0))):
+        s25 = rx_session()
+        push(s25, head)
+        chk('%s is refused at once' % name, s25.stats['refused'] == 1 and not s25.rx_buf)
+
+    s27 = rx_session()
+    for i in range(MAX_RECEIVED_OBJECTS + 3):
+        s27.on_frame(sp_yy.parse(build_yy_frame(sp_yy.SYN, 0, 0)))
+        push(s27, cc(0x40, bytes(4)), sp_yy.ACK | sp_yy.PSH | sp_yy.URG)
+    chk('a session keeps at most MAX_RECEIVED_OBJECTS objects',
+        len(s27.received) == MAX_RECEIVED_OBJECTS and s27.stats['refused'] == 3,
+        len(s27.received))
+    s28 = rx_session()
+    s28.rx_total = MAX_RECEIVED_BYTES - 8
+    push(s28, cc(0x40, bytes(4)), sp_yy.ACK | sp_yy.PSH | sp_yy.URG)
+    chk('and at most MAX_RECEIVED_BYTES in all', not s28.received and s28.stats['refused'] == 1)
 
     print('\n%d/%d checks passed' % (ok, tot))
     return 0 if ok == tot else 1

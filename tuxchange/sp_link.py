@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Stage 2: drive the handshake to an encrypted link and decrypt what the console sends."""
 import sys, os, time, socket, struct, select, random, argparse, inspect
+from collections import deque
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import sp_parse, sp_ccmp, sp_yy, sp_yysession
@@ -11,6 +12,9 @@ from streetpass_ccmp_key import derive_ccmp_key
 YY_SNAP = b'\xaa\xaa\x03\x00\x00\x00' + b'\x08\x00' + b'\x00\x00'
 WINDOW = 0x38B8                      # 14520, what both consoles advertise
 DATA_DURATION = 0x002C               # 44 us -- the value on all 108 captured bulk frames
+# Per-pass diagnostics, bounded so a peer flooding authenticated frames cannot exhaust memory.
+HISTORY_MAX = 4096
+LOG_LINES_MAX = 20000
 
 
 def build_yy(flags, seq=0, ack=0, window=WINDOW, payload=b''):
@@ -77,18 +81,18 @@ class Link:
         self.last_peer = None
         self.peer_token = None
         self.keys = []              # [(label, key)]
-        self.events = []
+        self.events = deque(maxlen=HISTORY_MAX)
         self.rx_total = self.echoes = 0
         self.sent = {}
-        self.sent_frames = []
-        self.decrypted = []
+        self.sent_frames = deque(maxlen=HISTORY_MAX)
+        self.decrypted = deque(maxlen=HISTORY_MAX)
         self.protected_seen = 0
         self.t_engaged = None
         self.pending_poll = None
         self.linkbss_giveup = None
         self.polls = 0
         self.t_first_poll = None
-        self.log_lines = []
+        self.log_lines = deque(maxlen=LOG_LINES_MAX)
         self.session = None
         if getattr(a, 'forward', None):
             import sp_build
