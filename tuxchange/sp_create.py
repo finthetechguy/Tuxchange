@@ -323,7 +323,7 @@ def _selftest():
             [p.id for p in plugins] == ['miiplaza'] and not broken,
             [str(b) for b in broken])
         plaza = P.find('miiplaza', plugins)
-        store = os.path.join(tmp, 'store')
+        store = sp_store.Store(os.path.join(tmp, 'store')).root
 
         def go(*argv):
             del lines[:]

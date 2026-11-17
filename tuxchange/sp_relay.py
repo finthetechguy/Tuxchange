@@ -24,7 +24,8 @@ SOCK_PATH_MAX = 100
 def lock_down_store(store):
     """Make the daemon's own files in `store` private, including ones from older versions."""
     for path, mode in [(os.path.join(store, n), 0o600)
-                       for n in (STATE_FILE, ROTATION_FILE, ENCOUNTERS_FILE, 'relay.env')] \
+                       for n in (STATE_FILE, ROTATION_FILE, ENCOUNTERS_FILE, 'relay.env',
+                                 sp_store.IDENTITY_FILE)] \
             + [(os.path.join(store, 'runs'), 0o700)]:
         try:
             os.chmod(path, mode)
@@ -33,10 +34,9 @@ def lock_down_store(store):
 
 
 def store_identity(store):
-    """A stable MAC derived from the store path, so a restart keeps the same identity."""
-    import hashlib
-    h = hashlib.sha256((sp_identity_seed() + os.path.abspath(store)).encode()).digest()
-    return 'ba:ae:6e:%02x:%02x:%02x' % (h[0], h[1], h[2])
+    """The store's own MAC, from the seed it keeps, so a restart keeps the same identity."""
+    import sp_identity
+    return sp_identity.derive(store)['mac']
 
 
 def control_socket_path(store):
@@ -55,12 +55,6 @@ def socket_address(path):
         yield '/proc/self/fd/%d/%s' % (fd, os.path.basename(path))
     finally:
         os.close(fd)
-
-
-def sp_identity_seed():
-    """The one seed string, read from sp_identity so the two can never drift apart."""
-    import sp_identity
-    return sp_identity.SEED_PREFIX
 
 
 ADAPTER_RE = re.compile(r'[A-Za-z0-9_.-]{1,15}')
@@ -1259,6 +1253,12 @@ class Relay:
         self.exchanges = 0
         self.last_peer = None
         self.last_error = None
+        import sp_identity
+        self.own = sp_identity.derive(args.store)
+        if self.own['source'] == 'legacy':
+            self.log('  this store keeps the identity it had before stores drew their own, which '
+                     'every store at %s shares; `sp_identity.py regenerate` gives it one of its '
+                     'own' % self.own['store'])
         self.identity = args.mac or self.fixed_identity()
         self.identity_since = time.time()
         self.rotations = 0
@@ -1282,7 +1282,7 @@ class Relay:
         print('[%s] %s' % (time.strftime('%H:%M:%S'), msg), flush=True)
 
     def fixed_identity(self):
-        return store_identity(self.a.store)
+        return self.own['mac']
 
     def random_identity(self):
         """A fresh locally-administered MAC in the prefix real consoles use."""
@@ -1493,6 +1493,7 @@ class Relay:
             'exchanges': self.exchanges, 'last_peer': self.last_peer,
             'last_error': self.last_error,
             'identity': self.identity,
+            'own_identity': {k: v for k, v in self.own.items() if k != 'store'},
             'iface_mismatch': self.iface_mismatch,
             'can_save_settings': bool(self.settings_file()),
             'adapter': (read_env_file(self.settings_file()).get('SP_IFACE', '')
@@ -3096,9 +3097,18 @@ def _selftest():
             all(stat.S_IMODE(os.stat(os.path.join(priv, n)).st_mode) == 0o600
                 for n in (STATE_FILE, ROTATION_FILE, ENCOUNTERS_FILE, 'relay.env'))
             and stat.S_IMODE(os.stat(os.path.join(priv, 'runs')).st_mode) == 0o700)
-        chk('the identity comes from the path alone, without creating a store',
-            bool(MAC_RE.match(store_identity(os.path.join(tmp, 'never-made'))))
-            and not os.path.exists(os.path.join(tmp, 'never-made')))
+        import sp_identity
+        try:
+            store_identity(os.path.join(tmp, 'never-made'))
+            refused = False
+        except sp_identity.NoIdentity:
+            refused = True
+        chk('reading the identity does not create a store',
+            refused and not os.path.exists(os.path.join(tmp, 'never-made')))
+        made = sp_store.Store(os.path.join(tmp, 'made')).root
+        chk('and a store\'s identity is the one its seed gives',
+            MAC_RE.match(store_identity(made))
+            and store_identity(made) == sp_identity.derive(made)['mac'])
 
         shallow = control_socket_path(os.path.join(tmp, 'store'))
         chk('a normal store keeps its socket inside it',
@@ -3518,7 +3528,15 @@ def main():
     a = ap.parse_args()
 
     if a.cmd == 'identity':
-        print(store_identity(a.store))
+        import sp_identity
+        try:
+            print(store_identity(a.store))
+        except PermissionError:
+            print('only root can read the store at %s; re-run with sudo' % a.store)
+            return 1
+        except (sp_identity.NoIdentity, ValueError) as e:
+            print(e)
+            return 1
         return 0
 
     if a.cmd in (None, 'selftest'):

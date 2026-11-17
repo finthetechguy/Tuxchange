@@ -124,11 +124,18 @@ def fields():
 FIELDS = fields()
 
 
-def default_values(store_path=None):
-    """Fresh values. The Mii's identity is derived from the store path, as the relay's own
-    identity always has been, so the same store keeps the same Mii."""
+def default_values(store_path=None, identity=None):
+    """Fresh values. The Mii is the store's own (or `identity`, from sp_identity), so the
+    same store keeps the same Mii. Without a store this process can read, it is a one-off."""
     import sp_identity
-    ident = sp_identity.derive(store_path or 'relay_store')
+    ident = identity
+    if ident is None and store_path:
+        try:
+            ident = sp_identity.derive(store_path)
+        except (sp_identity.NoIdentity, PermissionError):
+            pass
+    if ident is None:
+        ident = sp_identity.from_seed(os.urandom(32))
     v = {f.key: f.make_default() for f in FIELDS}
     v['mii'].update(mii_name='Relay', author_name='Tuxchange', mii_id=ident['mii_id'],
                     creator_mac=bytes.fromhex(ident['creator_mac'].replace(':', '')))
@@ -361,10 +368,9 @@ def _selftest():
             return True
         return False
 
-    sp = '/tmp/does-not-matter/relay_store'
-    v = default_values(sp)
+    ident = sp_identity.from_seed(hashlib.sha256(b'plaza selftest').digest())
+    v = default_values(identity=ident)
     chk('the defaults are valid values', validate(v) is not None)
-    ident = sp_identity.derive(sp)
     old_mii = sp_build.build_cfl(mii_name='Relay', author_name='Tuxchange',
                                  mii_id=ident['mii_id'], creator_mac=ident['creator_mac'],
                                  face_shape=ident['face_shape'], gender=ident['gender'])
@@ -442,11 +448,11 @@ def _selftest():
     for path, val in (('greeting', 'x' * 17), ('mii.mii_name', 'a%b'), ('mii.mii_id', 0x20),
                       ('profile.hat', 168), ('profile.hat', 204), ('bubble', 6),
                       ('featured.title_id', 0)):
-        t = default_values(sp)
+        t = default_values(identity=ident)
         keys = path.split('.')
         P.set_path(t, keys, val)
         chk('%s = %r is refused' % (path, val), raises(lambda: validate(t), P.ValidationError))
-    long_country = default_values(sp)
+    long_country = default_values(identity=ident)
     long_country['sender']['country'][0] = '\U0001F600' * 31   # 62 UTF-16 units
     chk('text that fits in characters but not in bytes is refused at build',
         raises(lambda: build_body(long_country)))
@@ -454,7 +460,7 @@ def _selftest():
     other = sp_build.build_cfl(mii_name='Other', author_name='Someone', mii_id=0x11223390,
                                creator_mac='b8:ae:6e:aa:bb:cc', birthday_month=4,
                                birthday_day=1, favourite_colour=5)
-    av = apply_mii(default_values(sp), other)
+    av = apply_mii(default_values(identity=ident), other)
     chk('apply_mii takes the name, creator and identity from the Mii',
         (av['mii']['mii_name'], av['mii']['author_name'], av['mii']['mii_id'])
         == ('Other', 'Someone', 0x11223390))
@@ -466,8 +472,8 @@ def _selftest():
         summ)
     bad_mii = bytearray(other); bad_mii[0x0C] |= 0x20
     chk('a Mii the Plaza would refuse is not imported',
-        raises(lambda: apply_mii(default_values(sp), sp_mii.reseal_cfl(bytes(bad_mii)))))
-    nom = default_values(sp); nom['mii']['mii_data'] = bytes(0x60)
+        raises(lambda: apply_mii(default_values(identity=ident), sp_mii.reseal_cfl(bytes(bad_mii)))))
+    nom = default_values(identity=ident); nom['mii']['mii_data'] = bytes(0x60)
     chk('building with no Mii data says to import one', raises(lambda: build_body(nom)))
     print('\n%d/%d checks passed' % (ok, tot))
     return 0 if ok == tot else 1

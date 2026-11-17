@@ -30,7 +30,8 @@ class MiiPlaza(P.Plugin):
     ]
 
     def defaults(self):
-        return sp_plaza.default_values(self.context.get('store'))
+        return sp_plaza.default_values(self.context.get('store'),
+                                       identity=self.context.get('identity'))
 
     def build(self, values):
         try:

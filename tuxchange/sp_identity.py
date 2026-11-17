@@ -1,25 +1,41 @@
 #!/usr/bin/env python3
-"""The relay's own identity: a Mii, a greeting and a profile card that belong to this box."""
+"""The relay's own identity: a Mii, a greeting and a profile card that belong to this box.
+
+Everything here comes from a 32-byte seed the store keeps in identity.json (see sp_store).
+A new store draws it at random, so two installs never share a MAC or a Mii even at the same
+path. A store from before identity.json is given the seed its path always hashed to, so the
+consoles that have met it, or filtered it, still see the same relay; `regenerate` gives such a
+store a random identity instead. Nothing copies an identity between stores except `copy`.
+"""
 import os, sys, json, struct, hashlib, argparse
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import sp_build, sp_cec, sp_store, sp_mii
 
-# Do not rename: hashed with the store path, so a change gives every install a new identity.
-SEED_PREFIX = 'sp-relay:'
 MII_NAME_MAX = 10          # 20 bytes of UTF-16LE at CFL+0x1A
 GREETING_MAX = 16          # 0x20 bytes at body+OFF_GREETING
 
 
-def seed_digest(store_path):
-    return hashlib.sha256((SEED_PREFIX + os.path.abspath(store_path)).encode()).digest()
+class NoIdentity(LookupError):
+    """The path is not a store yet, so it has no identity to read."""
 
 
-def derive(store_path):
-    """-> the relay's stable identity, from its store path alone."""
-    h = seed_digest(store_path)
+def store_seed(store_path):
+    """-> {'seed', 'source'} for the store at `store_path`, without writing anything."""
+    root = os.path.abspath(store_path)
+    got = sp_store.read_identity(root)
+    if got is not None:
+        return got
+    if os.path.isdir(os.path.join(root, 'CEC')):
+        # Opening it as a Store records this; until then it is what the store always had.
+        return {'seed': sp_store.legacy_identity_seed(root), 'source': 'legacy'}
+    raise NoIdentity('%s is not a store yet; it gets its identity when it is first opened'
+                     % root)
+
+
+def from_seed(h):
+    """-> the identity a 32-byte seed stands for."""
     return {
-        'store': os.path.abspath(store_path),
         'mac': 'ba:ae:6e:%02x:%02x:%02x' % (h[0], h[1], h[2]),
         'creator_mac': 'b8:ae:6e:%02x:%02x:%02x' % (h[0], h[1], h[2]),
         # Bit 5 of the first byte must be clear, or the plaza drops the message after the green LED.
@@ -32,6 +48,37 @@ def derive(store_path):
         'hobby': h[10] % 27,
         'gender': h[11] & 1,
     }
+
+
+def derive(store_path):
+    """-> the relay's stable identity, from its store's seed."""
+    got = store_seed(store_path)
+    return dict(from_seed(got['seed']), store=os.path.abspath(store_path),
+                source=got['source'])
+
+
+def regenerate(store_path):
+    """Give a store a new random identity. The daemon must not be running on it."""
+    st = sp_store.Store(store_path, exclusive=True)
+    try:
+        sp_store.write_identity(st.root, os.urandom(32), 'random', replace=True)
+    finally:
+        st.release()
+    return derive(store_path)
+
+
+def copy(src_path, dst_path, replace=False):
+    """Make the store at `dst_path` present the same identity as `src_path`."""
+    seed = store_seed(src_path)['seed']
+    if os.path.isdir(os.path.join(os.path.abspath(dst_path), 'CEC')) and not replace:
+        raise FileExistsError('%s already has an identity of its own; pass --replace to '
+                              'overwrite it' % os.path.abspath(dst_path))
+    st = sp_store.Store(dst_path, exclusive=True)
+    try:
+        sp_store.write_identity(st.root, seed, 'copied', replace=True)
+    finally:
+        st.release()
+    return derive(dst_path)
 
 
 def build_message(store_path, mii_name='Relay', author_name='Tuxchange',
@@ -49,7 +96,7 @@ def build_message(store_path, mii_name='Relay', author_name='Tuxchange',
     if len(greeting) > GREETING_MAX:
         raise ValueError('a greeting is at most %d characters, got %d (%r)'
                          % (GREETING_MAX, len(greeting), greeting))
-    v = sp_plaza.default_values(store_path)
+    v = sp_plaza.default_values(identity=derive(store_path))
     v['mii'].update(mii_name=mii_name, author_name=author_name)
     v['greeting'] = greeting
     v['profile'].update(streetpass_hits=hits, plaza_population=population, pet=pet)
@@ -113,11 +160,50 @@ def _selftest():
     tmp = tempfile.mkdtemp()
     try:
         sp = os.path.join(tmp, 'relay_store')
+        chk('a path that is not a store yet has no identity to read',
+            _raises(lambda: derive(sp), NoIdentity))
+        sp_store.Store(sp)
 
         a, b = derive(sp), derive(sp)
-        chk('the identity is deterministic', a == b, a['mac'])
+        chk('the identity is stable', a == b and a['source'] == 'random', a['mac'])
+        sp_store.Store(os.path.join(tmp, 'other'))
         chk('and a different store is a different identity',
             derive(os.path.join(tmp, 'other'))['mac'] != a['mac'])
+        again = os.path.join(tmp, 'again')
+        sp_store.Store(again)
+        first = derive(again)
+        shutil.rmtree(again)
+        sp_store.Store(again)
+        chk('two fresh stores at the same path (as on two machines) differ',
+            derive(again)['mac'] != first['mac']
+            and derive(again)['mii_id'] != first['mii_id'], (first['mac'], derive(again)['mac']))
+        chk('the identity an install at the default path always had is still what its seed '
+            'gives', from_seed(sp_store.legacy_identity_seed('/var/lib/tuxchange'))['mac']
+            == 'ba:ae:6e:ee:ec:3b')
+        old = os.path.join(tmp, 'pre-identity')
+        os.makedirs(os.path.join(old, 'CEC'))
+        before = from_seed(sp_store.legacy_identity_seed(old))
+        unread = derive(old)
+        sp_store.Store(old)
+        chk('a store from before identity files keeps its identity, before and after it '
+            'is opened', all({k: v for k, v in d.items() if k not in ('store', 'source')}
+                             == before for d in (unread, derive(old)))
+            and derive(old)['source'] == 'legacy', derive(old)['mac'])
+        fresh = regenerate(old)
+        chk('regenerate gives it a random identity of its own',
+            fresh['source'] == 'random' and fresh['mac'] != before['mac'], fresh['mac'])
+        busy = sp_store.Store(old, exclusive=True)
+        chk('but not while something holds the store',
+            _raises(lambda: regenerate(old), sp_store.StoreBusy) and derive(old) == fresh)
+        busy.release()
+        dst = os.path.join(tmp, 'copy-dst')
+        cp = copy(old, dst)
+        chk('copy makes another store present the same identity, and says so',
+            cp['mac'] == fresh['mac'] and cp['mii_id'] == fresh['mii_id']
+            and cp['source'] == 'copied')
+        chk('and will not overwrite a store\'s own identity unless asked',
+            _raises(lambda: copy(sp, dst), FileExistsError) and derive(dst)['mac'] == cp['mac']
+            and copy(sp, dst, replace=True)['mac'] == a['mac'])
         import sp_relay
         ns = argparse.Namespace(store=sp, mac=None, rotate_identity=False,
                                 start_paused=True, iface='none', channel='1', window=1,
@@ -137,8 +223,8 @@ def _selftest():
             not ((a['mii_id'] & 0xFF) >> 5) & 1, '%08x' % a['mii_id'])
         chk('and it has the high nibble every real id we have seen carries',
             (a['mii_id'] & 0xF0) == 0x90, '%08x' % a['mii_id'])
-        ids = {derive(os.path.join(tmp, 's%d' % i))['mii_id'] for i in range(64)}
-        chk('64 different stores give 64 different Miis, all valid',
+        ids = {from_seed(os.urandom(32))['mii_id'] for _ in range(64)}
+        chk('64 different seeds give 64 different Miis, all valid',
             len(ids) == 64 and all(not ((i & 0xFF) >> 5) & 1 for i in ids))
 
         m = build_message(sp, mii_name='Relay', greeting='Hello from Linux')
@@ -237,10 +323,10 @@ def _selftest():
     return 0 if ok == tot else 1
 
 
-def _raises(fn):
+def _raises(fn, exc=ValueError):
     try:
         fn(); return False
-    except ValueError:
+    except exc:
         return True
 
 
@@ -262,22 +348,53 @@ def main():
         if name == 'seed':
             p.add_argument('--replace', action='store_true',
                            help='remove any Mii Plaza message already in the outbox first')
+    rg = sub.add_parser('regenerate', help='give the store a new random identity; consoles '
+                                          'will see it as a relay they have never met')
+    rg.add_argument('--store', default=sp_store.default_store())
+    cp = sub.add_parser('copy', help='make --store present the same identity as --from')
+    cp.add_argument('--from', dest='src', required=True, metavar='STORE')
+    cp.add_argument('--store', default=sp_store.default_store())
+    cp.add_argument('--replace', action='store_true',
+                    help='overwrite the identity --store already has')
     sub.add_parser('selftest')
     a = ap.parse_args()
 
     if a.cmd in (None, 'selftest'):
         return _selftest()
 
-    if a.cmd == 'show':
-        d = derive(a.store)
+    try:
+        if a.cmd == 'show':
+            d = derive(a.store)
+        elif a.cmd == 'regenerate':
+            d = regenerate(a.store)
+        elif a.cmd == 'copy':
+            d = copy(a.src, a.store, replace=a.replace)
+        else:
+            d = None
+    except PermissionError:
+        print('only root can read or change the store at %s; re-run with sudo' % a.store)
+        return 1
+    except sp_store.StoreBusy as e:
+        print('%s; stop the daemon first, as its identity is fixed while it runs' % e)
+        return 1
+    except (NoIdentity, FileExistsError, ValueError) as e:
+        print(e)
+        return 1
+    if d is not None:
         d['mii_id'] = '%08x' % d['mii_id']
         print(json.dumps(d, indent=2))
+        if a.cmd != 'show':
+            print('re-run `seed --replace` so the Mii Plaza message carries this identity too')
         return 0
 
     kw = dict(mii_name=a.mii_name, author_name=a.author_name, greeting=a.greeting,
               hits=a.hits, population=a.population, pet=a.pet)
     if a.cmd == 'build':
-        m = build_message(a.store, **kw)
+        try:
+            m = build_message(a.store, **kw)
+        except (NoIdentity, PermissionError) as e:
+            print(e)
+            return 1
         open(a.out, 'wb').write(m)
         print('wrote %s (%d B)' % (a.out, len(m)))
         return 0
