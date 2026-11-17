@@ -1205,7 +1205,7 @@ def send_command(sock_path, cmd, **kw):
 class Relay:
     def __init__(self, args):
         self.a = args
-        self.store = sp_store.Store(args.store)
+        self.store = sp_store.Store(args.store, log=self.log)
         self.book = PeerBook(os.path.join(args.store, STATE_FILE),
                              retry=getattr(args, 'retry', 60.0))
         self.enabled = not args.start_paused

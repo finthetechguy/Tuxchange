@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """A CEC message store on disk, shaped like a console's."""
-import os, json, stat, time, struct, base64, fcntl, functools, tempfile, threading
+import os, sys, json, stat, time, struct, base64, fcntl, functools, tempfile, threading
 
 import sp_cec, sp_cecvalid
 
@@ -8,28 +8,31 @@ MBOXLIST_MAGIC, MBOXINFO_MAGIC, BOXINFO_MAGIC = 0x6868, 0x6363, 0x6262
 # Kept outside CEC/ so the tree stays byte-comparable with a console's.
 META_FILE = 'store_meta.json'
 LOCK_FILE = 'store.lock'
+QUARANTINE_DIR = 'quarantine'
+TMP_SUFFIX = '.tmp'
 MBOXLIST_HDR, MBOXLIST_ENTRY, MBOXLIST_MAX = 12, 16, 24
 BOXES = {'inbox': 'InBox___', 'outbox': 'OutBox__'}
 DEFAULT_MAX_BYTES, DEFAULT_MAX_MESSAGES = 0x100000, 24
 
 
 def _write_private(path, data):
-    """Write `data` to `path`, readable only by its owner even if the file already existed."""
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, 'wb') as f:
-        os.fchmod(f.fileno(), 0o600)
-        f.write(data)
+    write_atomic(path, data, 0o600, durable=True)
 
 
-def write_atomic(path, data, mode=0o600):
+def write_atomic(path, data, mode=0o600, durable=False):
     """Publish `data` at `path` through a uniquely named temporary file beside it, so a
-    concurrent writer never renames our file away and a reader never sees half of it."""
+    concurrent writer never renames our file away and a reader never sees half of it.
+    `durable` also syncs the file and its directory, so a crash leaves the old or the new
+    contents, never an empty file."""
     d, base = os.path.split(os.path.abspath(path))
-    fd, tmp = tempfile.mkstemp(dir=d, prefix='.%s.' % base, suffix='.tmp')
+    fd, tmp = tempfile.mkstemp(dir=d, prefix='.%s.' % base, suffix=TMP_SUFFIX)
     try:
         with os.fdopen(fd, 'wb') as f:
             os.fchmod(f.fileno(), mode)
             f.write(data)
+            if durable:
+                f.flush()
+                os.fsync(f.fileno())
         os.replace(tmp, path)
     except BaseException:
         try:
@@ -37,6 +40,12 @@ def write_atomic(path, data, mode=0o600):
         except OSError:
             pass
         raise
+    if durable:
+        dfd = os.open(d, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
 
 
 class StoreBusy(RuntimeError):
@@ -83,16 +92,20 @@ class Store:
     (the daemon, offline imports) opens it that way.
     """
 
-    def __init__(self, root, exclusive=False):
+    def __init__(self, root, exclusive=False, log=None):
         self.root = os.path.abspath(root)
         self.lock = threading.RLock()
         self.last_evicted = 0
+        self.quarantined = []
+        self.log = log or (lambda s: print(s, file=sys.stderr))
         self._lock_fd = None
         self.cec = os.path.join(self.root, 'CEC')
         os.makedirs(self.cec, mode=0o700, exist_ok=True)
         if exclusive:
             self.claim()
         self._lock_down()
+        if not exclusive and self._may_repair():
+            self.recover()
         if not os.path.exists(self._mboxlist_path()):
             self._write_mboxlist([])
         if not os.path.exists(self._meta_path()):
@@ -114,6 +127,7 @@ class Store:
             os.close(fd)
             raise
         self._lock_fd = fd
+        self.recover()
 
     def release(self):
         if self._lock_fd is not None:
@@ -123,6 +137,102 @@ class Store:
     @property
     def claimed(self):
         return self._lock_fd is not None
+
+    def _may_repair(self):
+        """Only the process holding the store, or any process while nobody does, moves files."""
+        return self.claimed or not store_claimed(self.root)
+
+    def _quarantine(self, path, why):
+        """Move a damaged store file aside, out of the CEC tree, and say so."""
+        rel = os.path.relpath(path, self.root)
+        if not self._may_repair():
+            self.log('  store: ignoring damaged %s (%s)' % (rel, why))
+            return None
+        qd = os.path.join(self.root, QUARANTINE_DIR)
+        os.makedirs(qd, mode=0o700, exist_ok=True)
+        dest = os.path.join(qd, '%s-%s' % (time.strftime('%Y%m%d-%H%M%S'),
+                                           rel.replace(os.sep, '_')))
+        base, n = dest, 1
+        while os.path.exists(dest):
+            dest, n = '%s.%d' % (base, n), n + 1
+        os.replace(path, dest)
+        self.quarantined.append((rel, why, dest))
+        self.log('  store: moved damaged %s to %s (%s)' % (rel, dest, why))
+        return dest
+
+    def _message_problem(self, tid, fn, c):
+        """-> why a stored message file cannot be used, or None if it is sound."""
+        bad = sp_cecvalid.problems(c)
+        if bad:
+            return '; '.join(bad)
+        if sp_cecvalid.parts(c)[2] != tid:
+            return 'it belongs to title %08X' % sp_cecvalid.parts(c)[2]
+        if message_filename(c) != fn:
+            return 'its message id does not match its file name'
+        return None
+
+    @_locked
+    def recover(self):
+        """Bring the store back to a usable state after a crash or a damaged file.
+
+        Leftover temporary files go; a damaged MBoxList is rebuilt from the title
+        directories; a damaged sidecar, MBoxInfo or message is moved to quarantine/.
+        -> how many files were quarantined.
+        """
+        before = len(self.quarantined)
+        for d, _dirs, files in os.walk(self.cec):
+            for f in files:
+                if f.startswith('.') and f.endswith(TMP_SUFFIX):
+                    try:
+                        os.unlink(os.path.join(d, f))
+                    except OSError:
+                        pass
+        for f in os.listdir(self.root):
+            if f.startswith('.%s.' % META_FILE) and f.endswith(TMP_SUFFIX):
+                try:
+                    os.unlink(os.path.join(self.root, f))
+                except OSError:
+                    pass
+        if os.path.exists(self._mboxlist_path()):
+            try:
+                self._read_mboxlist()
+            except ValueError as e:
+                self._quarantine(self._mboxlist_path(), e)
+                found = sorted(int(n, 16) for n in os.listdir(self.cec)
+                               if len(n) == 8 and os.path.isdir(os.path.join(self.cec, n))
+                               and all(ch in '0123456789abcdef' for ch in n))
+                self._write_mboxlist(found[:MBOXLIST_MAX])
+        titles = self.titles() if os.path.exists(self._mboxlist_path()) else []
+        if os.path.exists(self._meta_path()):
+            try:
+                m = json.load(open(self._meta_path()))
+                if not isinstance(m, dict):
+                    raise ValueError('not a JSON object')
+            except ValueError as e:
+                self._quarantine(self._meta_path(), e)
+                # An all-zero key cannot be told from no key at all, so it is not trusted here.
+                keyed = []
+                for t in titles:
+                    try:
+                        k = open(os.path.join(self._title_dir(t), 'MBoxInfo____'), 'rb').read()
+                    except OSError:
+                        continue
+                    if k[0x10:0x30].strip(b'\x00'):
+                        keyed.append('%08x' % t)
+                self._save_meta({'keyed_titles': keyed, 'origins': {}})
+        for t in titles:
+            p = os.path.join(self._title_dir(t), 'MBoxInfo____')
+            if os.path.exists(p):
+                info = open(p, 'rb').read()
+                if len(info) < 0x30 or struct.unpack_from('<H', info)[0] != MBOXINFO_MAGIC:
+                    self._quarantine(p, 'MBoxInfo is %d B or has no magic' % len(info))
+                    m = self._load_meta()
+                    if '%08x' % t in m['keyed_titles']:
+                        m['keyed_titles'].remove('%08x' % t)
+                        self._save_meta(m)
+                    self.add_title(t)
+            self.messages(t)
+        return len(self.quarantined) - before
 
     def _lock_down(self):
         """Close up a store written before its files were private."""
@@ -157,7 +267,7 @@ class Store:
         return m
 
     def _save_meta(self, m):
-        write_atomic(self._meta_path(), json.dumps(m, indent=1, sort_keys=True).encode())
+        _write_private(self._meta_path(), json.dumps(m, indent=1, sort_keys=True).encode())
 
     @staticmethod
     def _okey(mid, box):
@@ -202,11 +312,19 @@ class Store:
         for i, t in enumerate(titles):
             b[MBOXLIST_HDR + i * MBOXLIST_ENTRY:
               MBOXLIST_HDR + i * MBOXLIST_ENTRY + 8] = ('%08x' % t).encode()
-        write_atomic(self._mboxlist_path(), bytes(b))
+        _write_private(self._mboxlist_path(), bytes(b))
+
+    def _read_mboxlist(self):
+        d = open(self._mboxlist_path(), 'rb').read()
+        if len(d) < MBOXLIST_HDR + MBOXLIST_MAX * MBOXLIST_ENTRY:
+            raise ValueError('MBoxList is %d B, too short' % len(d))
+        if struct.unpack_from('<H', d)[0] != MBOXLIST_MAGIC:
+            raise ValueError('MBoxList has no magic')
+        return d
 
     @_locked
     def titles(self):
-        d = open(self._mboxlist_path(), 'rb').read()
+        d = self._read_mboxlist()
         n = struct.unpack_from('<I', d, 8)[0]
         out = []
         for i in range(min(n, MBOXLIST_MAX)):
@@ -360,7 +478,17 @@ class Store:
                 for fn in sorted(os.listdir(d)):
                     if not fn.startswith('_'):
                         continue
-                    out.append((t, b, open(os.path.join(d, fn), 'rb').read()))
+                    p = os.path.join(d, fn)
+                    try:
+                        c = open(p, 'rb').read()
+                    except FileNotFoundError:
+                        continue
+                    why = self._message_problem(t, fn, c)
+                    if why:
+                        if self._quarantine(p, why):
+                            self._write_boxinfo(t, b)
+                        continue
+                    out.append((t, b, c))
         return out
 
     @_locked
@@ -573,6 +701,63 @@ def _selftest():
         chk('an enveloped message is refused by replace_outbox',
             _raises(lambda: rp.replace_outbox(b'\x61\x61' + b'\x00' * 200)))
 
+        fw = Store(os.path.join(tmp, 'failed-write'), log=lambda m: None)
+        first = _synthetic(0x00030600, 9, key=b'f' * 32)
+        fw.replace_outbox(first, key=b'f' * 32)
+        mpath = os.path.join(fw._box_dir(0x00030600, 'outbox'), message_filename(first))
+        real_fsync = os.fsync
+
+        def failing_fsync(fd):
+            raise OSError(28, 'No space left on device')
+
+        os.fsync = failing_fsync
+        try:
+            failed = _raises(lambda: fw.replace_outbox(first, key=b'f' * 32), OSError)
+        finally:
+            os.fsync = real_fsync
+        chk('a write that fails part-way leaves the message it was replacing whole',
+            failed and open(mpath, 'rb').read() == first)
+        chk('and leaves no temporary file behind',
+            not [f for f in os.listdir(os.path.dirname(mpath)) if f.endswith(TMP_SUFFIX)])
+
+        fw.add_message(_synthetic(0x00030600, 10, key=b'f' * 32), 'outbox')
+        open(mpath, 'wb').close()
+        stray = os.path.join(os.path.dirname(mpath), '.%s.abc%s' % (message_filename(first),
+                                                                    TMP_SUFFIX))
+        open(stray, 'wb').close()
+        reopened = Store(fw.root, exclusive=True, log=lambda m: None)
+        chk('an empty message file is quarantined when the store is opened, not served',
+            [int.from_bytes(c[0x20:0x28], 'little') for _t, _b, c in reopened.messages()] == [10]
+            and len(reopened.quarantined) == 1
+            and os.path.exists(reopened.quarantined[0][2]), reopened.quarantined)
+        chk('and BoxInfo counts what is left',
+            _boxinfo_count(reopened, 0x00030600, 'outbox') == 1)
+        chk('a temporary file left by a crash is cleaned up', not os.path.exists(stray))
+        reopened.release()
+
+        rt = Store(os.path.join(tmp, 'runtime-damage'), log=lambda m: None)
+        rt.add_message(_synthetic(0x00030600, 1), 'inbox')
+        rt.add_message(_synthetic(0x00030600, 2), 'inbox')
+        p2 = os.path.join(rt._box_dir(0x00030600, 'inbox'), message_filename(_synthetic(0x00030600, 2)))
+        open(p2, 'r+b').truncate(0x40)
+        chk('a message damaged while the store is open is set aside, not raised on',
+            [int.from_bytes(c[0x20:0x28], 'little') for _t, _b, c in rt.messages()] == [1]
+            and not os.path.exists(p2))
+
+        dm = Store(os.path.join(tmp, 'damaged-meta'), log=lambda m: None)
+        dm.add_message(_synthetic(0x00030600, 1, key=b'd' * 32), 'inbox', key=b'd' * 32)
+        dm.add_message(_synthetic(0x00020800, 1), 'inbox')
+        open(dm._mboxlist_path(), 'wb').close()
+        open(dm._meta_path(), 'w').write('{"keyed_ti')
+        dm2 = Store(dm.root, log=lambda m: None)
+        chk('an empty MBoxList is rebuilt from the title directories',
+            sorted(dm2.titles()) == [0x00020800, 0x00030600], dm2.titles())
+        chk('a damaged sidecar is rebuilt, keeping the keys MBoxInfo holds',
+            dm2.title_key(0x00030600) == b'd' * 32 and dm2.title_key(0x00020800) is None)
+        chk('and both damaged files were kept in quarantine/',
+            len(dm2.quarantined) == 2
+            and all(os.path.exists(q[2]) for q in dm2.quarantined))
+
         import lp_corpus as corpus
         src = corpus.path('console_nand') or ''
         if not os.path.exists(src):
@@ -758,11 +943,16 @@ def _synthetic(tid, n, size=0x200, key=None):
     return bytes(b)
 
 
-def _raises(fn):
+def _raises(fn, exc=ValueError):
     try:
         fn(); return False
-    except ValueError:
+    except exc:
         return True
+
+
+def _boxinfo_count(store, tid, box):
+    b = open(os.path.join(store._box_dir(tid, box), 'BoxInfo_____'), 'rb').read()
+    return struct.unpack_from('<I', b, 0x14)[0]
 
 
 if __name__ == '__main__':
