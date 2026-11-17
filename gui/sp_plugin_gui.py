@@ -291,12 +291,15 @@ class Context:
                     path = d.open_finish(res).get_path()
                 except GLib.Error:
                     return
-                try:
-                    px = f.from_text(path, '.'.join(map(str, keys)))
-                except P.ValidationError as e:
-                    return self.error('Cannot use that picture', e.msg)
-                self.changed(keys, px)
-                pic.set_paintable(texture_from_rgb565(px, scale))
+
+                def loaded(px):
+                    if isinstance(px, P.ValidationError):
+                        return self.error('Cannot use that picture', px.msg)
+                    if isinstance(px, Exception):
+                        return self.error('Cannot use that picture', str(px))
+                    self.changed(keys, px)
+                    pic.set_paintable(texture_from_rgb565(px, scale))
+                run_async(lambda: f.from_text(path, '.'.join(map(str, keys))), loaded)
             dlg.open(self.window, None, done)
 
         b = Gtk.Button(label='Choose…', valign=Gtk.Align.CENTER)

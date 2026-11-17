@@ -23,6 +23,7 @@ import os, sys, json, zlib, struct, importlib.util, types, traceback
 API_VERSION = 1
 HERE = os.path.dirname(os.path.abspath(__file__))
 BUILTIN_DIR = os.path.join(HERE, 'plugins')
+IMAGE_FILE_MAX = 16 << 20
 
 # The 16 SMDH / CEC language slots, in order.
 LANGUAGES = ('Japanese', 'English', 'French', 'German', 'Italian', 'Spanish',
@@ -827,11 +828,21 @@ def read_png(data):
         raise ValueError('not a PNG file')
     p, idat, plte, trns = 8, [], None, None
     w = h = depth = ctype = interlace = None
-    while p + 8 <= len(data):
+    while True:
+        if p + 12 > len(data):
+            raise ValueError('PNG ends without an IEND chunk')
         ln, typ = struct.unpack_from('>I4s', data, p)
+        if p + 12 + ln > len(data):
+            raise ValueError('PNG %r chunk is truncated' % typ)
         chunk = data[p + 8:p + 8 + ln]
+        if struct.unpack_from('>I', data, p + 8 + ln)[0] != zlib.crc32(typ + chunk):
+            raise ValueError('PNG %r chunk has a bad CRC' % typ)
         p += 12 + ln
+        if (w is None) != (typ == b'IHDR'):
+            raise ValueError('PNG must start with exactly one IHDR chunk')
         if typ == b'IHDR':
+            if ln != 13:
+                raise ValueError('PNG IHDR is %d bytes, not 13' % ln)
             w, h, depth, ctype, _c, _f, interlace = struct.unpack('>IIBBBBB', chunk)
         elif typ == b'PLTE':
             plte = [tuple(chunk[i:i + 3]) for i in range(0, len(chunk) - 2, 3)]
@@ -841,18 +852,29 @@ def read_png(data):
             idat.append(chunk)
         elif typ == b'IEND':
             break
-    if w is None:
-        raise ValueError('PNG has no IHDR')
     if depth != 8 or interlace or ctype not in (0, 2, 3, 4, 6):
         raise ValueError('only 8-bit, non-interlaced PNGs are supported '
                          '(depth %s, colour type %s, interlace %s)' % (depth, ctype, interlace))
-    if w * h > 4096 * 4096:
-        raise ValueError('PNG is too large')
+    if not w or not h or w * h > 4096 * 4096:
+        raise ValueError('PNG is %dx%d; it must be between 1x1 and 4096x4096 pixels' % (w, h))
     bpp = {0: 1, 2: 3, 3: 1, 4: 2, 6: 4}[ctype]
-    raw = zlib.decompress(b''.join(idat))
     stride = w * bpp
-    if len(raw) < h * (stride + 1):
+    expected = h * (stride + 1)
+    z = zlib.decompressobj()
+    try:
+        raw = z.decompress(b''.join(idat), expected)
+        while not z.eof:
+            tail = z.unconsumed_tail
+            if z.decompress(tail, 1):
+                raise ValueError('PNG image data is longer than %dx%d needs' % (w, h))
+            if z.unconsumed_tail == tail:
+                break
+    except zlib.error as e:
+        raise ValueError('PNG image data is corrupt: %s' % e)
+    if len(raw) < expected or not z.eof:
         raise ValueError('PNG image data is truncated')
+    if z.unused_data:
+        raise ValueError('PNG image data has trailing bytes')
     rows, prev = [], bytearray(stride)
     for y in range(h):
         f = raw[y * (stride + 1)]
@@ -906,7 +928,9 @@ def load_image(path_or_data, width, height):
     data = path_or_data
     if isinstance(path_or_data, str):
         with open(path_or_data, 'rb') as fh:
-            data = fh.read()
+            data = fh.read(IMAGE_FILE_MAX + 1)
+        if len(data) > IMAGE_FILE_MAX:
+            raise ValueError('%s is over %d bytes' % (path_or_data, IMAGE_FILE_MAX))
     if data[:8] == b'\x89PNG\r\n\x1a\n':
         w, h, rows = read_png(data)
         return [[rgb565(*rows[y * h // height][x * w // width]) for x in range(width)]
@@ -1185,6 +1209,17 @@ PLUGIN = Dummy()
                + chunk(b'IDAT', zlib.compress(b'\x00\x00\x01')) + chunk(b'IEND', b''))
         chk('palette PNGs decode, with transparency over white',
             read_png(pal)[2] == [[(255, 0, 0), (255, 255, 255)]])
+
+        def grey1(z):
+            return (b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', struct.pack('>IIBBBBB', 1, 1, 8, 0, 0, 0, 0))
+                    + chunk(b'IDAT', z) + chunk(b'IEND', b''))
+        chk('a one-pixel PNG that inflates to 4 MiB is refused without inflating it',
+            raises(lambda: read_png(grey1(zlib.compress(b'\0' * (4 << 20)))), ValueError))
+        chk('so are data short of the image, and bytes after the stream',
+            raises(lambda: read_png(grey1(zlib.compress(b'\0'))), ValueError)
+            and raises(lambda: read_png(grey1(zlib.compress(b'\0\0') + b'x')), ValueError))
+        chk('and a chunk with a bad CRC', raises(
+            lambda: read_png(pal[:20] + bytes([pal[20] ^ 1]) + pal[21:]), ValueError))
         chk('the built-in plugins directory sits beside this module', BUILTIN_DIR.startswith(HERE))
         ex = load_path(os.path.join(BUILTIN_DIR, '_example.py'), 'builtin')
         chk('the example plugin loads and keeps to the contract', isinstance(ex, Plugin),
