@@ -37,7 +37,7 @@ Working end to end:
 
 #### Extra
 
-- Build a StreetPass Mii Plaza message.
+- Build game CEC data using plugins. StreetPass Mii Plaza built-in.
 - Import Outbox CEC messages, from Azahar, console, etc, to send data from different games.
 - Export Inbox CEC messages, to import into Azahar, etc, to use recieved data from other consoles.
 
