@@ -1686,6 +1686,8 @@ class Relay:
         if self.run_logs():
             argv += ['--log', os.path.join(runs, 'relay_%d.log' % stamp)]
         argv += recovery_argv(self.a)
+        if getattr(self.a, 'private_debug', False):
+            argv.append('--private-debug')
         if self.a.pcap:
             argv += ['--pcap', os.path.join(runs, 'relay_%d.pcap' % stamp)]
         a = sp_link.build_parser().parse_args(argv)
@@ -1884,6 +1886,8 @@ class Relay:
             self.log('           sp_relay.py import <save image|dump dir|Azahar NAND> --replace')
         if not self.enabled:
             self.log('  exchanges are PAUSED (resume with: sp_relay.py ctl resume)')
+        if getattr(self.a, 'private_debug', False):
+            self.log('  PRIVATE DEBUG is ON: session keys and decrypted frames go to the logs')
         if sd_notify('READY=1'):
             self.log('  systemd is watching this process; a stall restarts THE SERVICE, '
                      'never the machine')
@@ -3369,6 +3373,10 @@ def main():
                           'reproduce the unrecovered baseline.')
     run.add_argument('--pcap', action='store_true')
     run.add_argument('--verbose', '-v', type=int, default=1)
+    run.add_argument('--private-debug', action='store_true',
+                     help='PRIVATE: also log session keys and decrypted frame contents, to the '
+                          'journal and per-pass logs. Off by default; do not share logs made '
+                          'with it.')
     run.add_argument('--settings-file', metavar='PATH',
                      help='where the GUI\'s adapter and rotation choices are saved. The unit '
                           'reads this file when it starts.')

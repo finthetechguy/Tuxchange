@@ -214,6 +214,7 @@ class Link:
         self.tick_hook = None
         # stop_check(link) -> True ends the pass early; it is asked once per loop turn.
         self.stop_check = None
+        self.private = bool(getattr(a, 'private_debug', False))
         self.sightings = {}          # mac -> {'n','first','last','token','rssi'}
         # A console refusing our MAC sends no probe, so this separates refused from absent.
         self.on_air = {}
@@ -311,9 +312,10 @@ class Link:
                           derive_ccmp_key(theirs, mine, them, me, **kw)))
         self.keys.append(('host=us',
                           derive_ccmp_key(mine, theirs, me, them, **kw)))
-        self.log('  derived %d candidate keys:' % len(self.keys))
-        for lbl, k in self.keys:
-            self.log('      %-24s %s' % (lbl, k.hex()))
+        self.log('  derived %d candidate keys' % len(self.keys))
+        if self.private:
+            for lbl, k in self.keys:
+                self.log('      PRIVATE %-16s %s' % (lbl, k.hex()))
 
     def try_decrypt(self, mpdu):
         for lbl, k in self.keys:
@@ -565,9 +567,12 @@ class Link:
         self.log('  ############################################################')
         self.log('  ###  DECRYPTED A FRAME FROM THE CONSOLE                  ###')
         self.log('  ############################################################')
-        self.log('      key      : %s  [%s]' % (key.hex(), lbl))
+        self.log('      key      : [%s]' % lbl)
         self.log('      PN       : %d' % pn)
-        self.log('      plaintext: %s' % pt.hex())
+        self.log('      length   : %d B' % len(pt))
+        if self.private:
+            self.log('      PRIVATE key      : %s' % key.hex())
+            self.log('      PRIVATE plaintext: %s' % pt.hex())
         y = sp_yy.parse(pt)
         if y:
             self.log('      YY       : %s' % sp_yy.describe(y))
@@ -946,7 +951,9 @@ class Link:
                      % len(self.decrypted))
             for pt, lbl in self.decrypted:
                 y = sp_yy.parse(pt)
-                self.log('      [%s] %s' % (lbl, sp_yy.describe(y) if y else pt.hex()))
+                self.log('      [%s] %s' % (lbl, sp_yy.describe(y) if y
+                                            else pt.hex() if self.private
+                                            else 'not YY, %d B' % len(pt)))
             rc = 0
         else:
             self.log('  No consoles were engaged:')
@@ -1431,6 +1438,10 @@ def simulate(verbose=1, peer_hook=None, out=None, link_at=0.60):
     chk('derived the MIC-verified key first',
         L.keys and L.keys[0][1] == expect_key, L.keys[0][1].hex() if L.keys else '-')
     chk('decrypted the console frame', len(L.decrypted) == 1)
+    logged = '\n'.join(L.log_lines)
+    chk('ordinary logs carry no session key or plaintext',
+        L.keys and not any(k.hex() in logged for _l, k in L.keys)
+        and not any(pt.hex() in logged for pt, _l in L.decrypted))
     if L.decrypted:
         y = sp_yy.parse(L.decrypted[0][0])
         chk('plaintext is a YY SYN|ACK', y and y['flags'] == (sp_yy.SYN | sp_yy.ACK),
@@ -2043,6 +2054,9 @@ def build_parser():
     ap.add_argument('--pcap-all', action='store_true', help='record ambient traffic too')
     ap.add_argument('--log', default=None)
     ap.add_argument('--verbose', '-v', type=int, default=1)
+    ap.add_argument('--private-debug', action='store_true',
+                    help='PRIVATE: also log session keys and decrypted frame contents. '
+                         'Logs made with this must not be shared.')
     ap.add_argument('--selftest', action='store_true')
     ap.add_argument('--replay', nargs='+', metavar='PCAP')
     ap.add_argument('--simulate', action='store_true',

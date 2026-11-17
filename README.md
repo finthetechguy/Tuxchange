@@ -110,6 +110,10 @@ started from until that restart, and a failed install leaves the previous copy i
 To watch it in a terminal instead, `sudo ./scripts/tuxchange` runs the daemon in the
 foreground.
 
+Logs hold metadata only: peers, sizes and outcomes. `--private-debug` (for the service, put it in
+`SP_EXTRA` in `/etc/default/tuxchange`) also logs session keys and decrypted frames. Anyone who can
+read the journal can read those, so turn it off again afterwards and do not share those logs.
+
 ## FAQ
 
 ### "It took 3 tries for an exchange"
