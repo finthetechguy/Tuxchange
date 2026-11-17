@@ -90,7 +90,7 @@ running_root() {
 preflight() {
   local c d store
   need_root
-  for c in systemctl systemd-analyze install sed stat readlink find mktemp getent date cp mv cut; do
+  for c in systemctl systemd-analyze install sed stat readlink find mktemp getent cp mv cut; do
     command -v "$c" >/dev/null || die "missing $c, which the installer needs."
   done
   [ -f "$HERE/tuxchange.service.in" ] || die "missing tuxchange.service.in"
@@ -119,35 +119,52 @@ preflight() {
   fi
 }
 
-RELEASE=
+STAGE=
 BACKUP=
 PENDING=
 PUBLISHED=()
+SWAPPED=()
+CODE_DIRS="tuxchange gui scripts"
 
 # Copies regular files only, so a symlink in the checkout cannot lead root back to user files.
-# Each install gets a new directory, so a running service keeps the tree it started from.
 stage_code() {
   local list f mode
   local -a files
   install -d -o root -g root -m 0755 "$LIB"
-  RELEASE=$(mktemp -d "$LIB/release-$(date +%Y%m%d%H%M%S)-XXXXXX")
-  list=$RELEASE/.files
-  (cd "$ROOT" && find tuxchange gui scripts -type f ! -path '*/__pycache__/*' -print0) > "$list" \
+  STAGE=$(mktemp -d "$LIB/.stage-XXXXXX")
+  list=$STAGE/.files
+  (cd "$ROOT" && find $CODE_DIRS -type f ! -path '*/__pycache__/*' -print0) > "$list" \
     || die "could not list the files in $ROOT"
   mapfile -d '' files < "$list"
   rm -f "$list"
   for f in "${files[@]}"; do
     mode=0644
     [ -x "$ROOT/$f" ] && mode=0755
-    install -D -o root -g root -m "$mode" "$ROOT/$f" "$RELEASE/$f"
+    install -D -o root -g root -m "$mode" "$ROOT/$f" "$STAGE/$f"
   done
-  chmod 0755 "$RELEASE"
+}
+
+backup_dir() {
+  [ -n "$BACKUP" ] || BACKUP=$(mktemp -d "$LIB/.backup-XXXXXX")
+}
+
+# Moves the staged code into $LIB, keeping what it replaces until the install succeeds.
+swap_code() {
+  local d
+  backup_dir
+  for d in $CODE_DIRS; do
+    if [ -e "$LIB/$d" ]; then
+      mv -- "$LIB/$d" "$BACKUP/code-$d"
+    fi
+    SWAPPED+=("$d")
+    mv -- "$STAGE/$d" "$LIB/$d"
+  done
 }
 
 # Moves a finished file into place, keeping what it replaces until the install succeeds.
 publish() {
   local src=$1 dest=$2 tmp
-  [ -n "$BACKUP" ] || BACKUP=$(mktemp -d "$LIB/.backup-XXXXXX")
+  backup_dir
   if [ -e "$dest" ]; then
     cp -p -- "$dest" "$BACKUP/${#PUBLISHED[@]}"
   fi
@@ -160,7 +177,7 @@ publish() {
 }
 
 rollback() {
-  local i dest
+  local i dest d
   for i in "${!PUBLISHED[@]}"; do
     dest=${PUBLISHED[$i]}
     if [ -e "$BACKUP/$i" ]; then
@@ -169,8 +186,14 @@ rollback() {
       rm -f -- "$dest"
     fi
   done
+  for d in "${SWAPPED[@]}"; do
+    rm -rf -- "${LIB:?}/$d"
+    if [ -e "$BACKUP/code-$d" ]; then
+      mv -- "$BACKUP/code-$d" "$LIB/$d" || echo "could not restore $LIB/$d" >&2
+    fi
+  done
   [ ${#PUBLISHED[@]} -eq 0 ] || systemctl daemon-reload || true
-  [ -z "$RELEASE" ] || rm -rf -- "$RELEASE"
+  [ -z "$STAGE" ] || rm -rf -- "$STAGE"
   [ -z "$BACKUP" ] || rm -rf -- "$BACKUP"
   [ -z "$PENDING" ] || rm -f -- "$PENDING"
 }
@@ -184,20 +207,17 @@ on_install_exit() {
   exit "$rc"
 }
 
-# Removes other releases, the old flat layout and backups, but never the tree the running service
-# was started from.
+# Removes the staging area, backups and any release-* directories from older installers, but
+# never the one a running service was started from.
 prune() {
   local live d
   live=$(running_root)
   live=${live% (deleted)}
   for d in "$LIB"/release-*; do
     [ -d "$d" ] || continue
-    [ "$d" = "$RELEASE" ] || [ "$d" = "$live" ] || rm -rf -- "$d"
+    [ "$d" = "$live" ] || rm -rf -- "$d"
   done
-  if [ "$live" != "$LIB" ]; then
-    rm -rf -- "${LIB:?}/tuxchange" "${LIB:?}/gui" "${LIB:?}/scripts"
-  fi
-  rm -rf -- "$BACKUP"
+  rm -rf -- "$STAGE" "$BACKUP"
 }
 
 write_defaults() {
@@ -222,17 +242,21 @@ EOF
 }
 
 do_install() {
-  local f k user_cfg out
+  local f k user_cfg out root
   preflight
   trap on_install_exit EXIT
 
   stage_code
-  sed -e "s|__ROOT__|$RELEASE|g" -e "s|__PY__|$PY|g" -e "s|__GUI_USER__|$GUI_USER|g" \
-      "$HERE/tuxchange.service.in" > "$RELEASE/tuxchange.service"
-  if ! out=$(systemd-analyze verify "$RELEASE/tuxchange.service" 2>&1); then
-    printf '%s\n' "$out" >&2
-    die "systemd rejected the generated unit."
-  fi
+  # Verified against the staged code, which only moves into $LIB once everything else has worked.
+  for root in "$STAGE" "$LIB"; do
+    sed -e "s|__ROOT__|$root|g" -e "s|__PY__|$PY|g" -e "s|__GUI_USER__|$GUI_USER|g" \
+        "$HERE/tuxchange.service.in" > "$STAGE/tuxchange.service"
+    [ "$root" = "$LIB" ] && break
+    if ! out=$(systemd-analyze verify "$STAGE/tuxchange.service" 2>&1); then
+      printf '%s\n' "$out" >&2
+      die "systemd rejected the generated unit."
+    fi
+  done
   [ -z "$out" ] || printf '%s\n(verify emitted the above)\n' "$out"
 
   install -d -o root -g root -m 0755 "$STATE"
@@ -245,8 +269,8 @@ do_install() {
   done
 
   if [ ! -e "$DEFAULTS" ]; then
-    write_defaults > "$RELEASE/defaults"
-    publish "$RELEASE/defaults" "$DEFAULTS"
+    write_defaults > "$STAGE/defaults"
+    publish "$STAGE/defaults" "$DEFAULTS"
     echo "wrote $DEFAULTS"
   else
     echo "kept the existing $DEFAULTS"
@@ -254,17 +278,17 @@ do_install() {
 
   # Lets the GUI start, stop and restart this one unit without a stored password.
   if [ -n "$GUI_USER" ] && [ -d "$(dirname "$POLKIT")" ] && [ -f "$HERE/50-tuxchange.rules.in" ]; then
-    sed -e "s|__GUI_USER__|$GUI_USER|g" "$HERE/50-tuxchange.rules.in" > "$RELEASE/polkit.rules"
-    publish "$RELEASE/polkit.rules" "$POLKIT"
+    sed -e "s|__GUI_USER__|$GUI_USER|g" "$HERE/50-tuxchange.rules.in" > "$STAGE/polkit.rules"
+    publish "$STAGE/polkit.rules" "$POLKIT"
     echo "wrote $POLKIT  (lets $GUI_USER manage only tuxchange.service)"
   else
     echo "NOTE: no polkit rule written; the GUI will need a polkit agent to start/stop the service"
   fi
 
   if [ -f "$HERE/tuxchange-gui.desktop.in" ] && [ -d "$(dirname "$DESKTOP")" ]; then
-    sed -e "s|__ROOT__|$RELEASE|g" -e "s|__PY__|$PY|g" -e "s|__STORE__|$STORE_PATH|g" \
-        "$HERE/tuxchange-gui.desktop.in" > "$RELEASE/tuxchange-gui.desktop"
-    publish "$RELEASE/tuxchange-gui.desktop" "$DESKTOP"
+    sed -e "s|__ROOT__|$LIB|g" -e "s|__PY__|$PY|g" -e "s|__STORE__|$STORE_PATH|g" \
+        "$HERE/tuxchange-gui.desktop.in" > "$STAGE/tuxchange-gui.desktop"
+    publish "$STAGE/tuxchange-gui.desktop" "$DESKTOP"
     echo "wrote $DESKTOP  (menu entry for the GUI)"
   fi
 
@@ -285,7 +309,8 @@ do_install() {
     echo "      See the wiki page \"Getting your keys\"."
   fi
 
-  publish "$RELEASE/tuxchange.service" "$UNIT"
+  swap_code
+  publish "$STAGE/tuxchange.service" "$UNIT"
   systemctl daemon-reload
   systemctl enable tuxchange.service
   trap - EXIT
@@ -295,9 +320,9 @@ do_install() {
     update-desktop-database -q 2>/dev/null || true
   fi
   echo
-  echo "INSTALLED to $RELEASE."
+  echo "INSTALLED to $LIB."
   if [ -n "$(running_root)" ]; then
-    echo "The running service still uses the previous copy until: sudo systemctl restart tuxchange"
+    echo "The running service keeps the code it loaded until: sudo systemctl restart tuxchange"
   fi
   echo "To start tuxchange from CLI:"
   echo "  sudo systemctl start tuxchange      # or: sudo $0 start"

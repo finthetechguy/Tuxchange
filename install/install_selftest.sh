@@ -23,6 +23,7 @@ check() {
 
 fresh() {
   R=$base/root
+  L=$R/opt/tuxchange
   rm -rf "$R"
   mkdir -p "$R"/{bin,etc/systemd/system,etc/default,etc/polkit-1/rules.d,usr/share/applications} \
            "$R"/{opt,var/lib,usr/bin,src/tuxchange,src/gui,src/scripts,home/user/.config/tuxchange}
@@ -47,6 +48,8 @@ EOF
 #!/bin/sh
 echo "systemd-analyze \$*" >> "$R/calls"
 grep -qx "systemd-analyze" "$R/fail" && { echo "bad unit"; exit 1; }
+pre=\$(sed -n 's/^ExecStartPre=\\([^ ]*\\).*/\\1/p' "\$2")
+[ -x "\$pre" ] || { echo "\$pre is not executable"; exit 1; }
 exit 0
 EOF
   cat > "$R/bin/install" <<EOF
@@ -92,48 +95,51 @@ run() {
 
 snapshot() { (cd "$R" && find etc opt usr/share -print0 | sort -z | xargs -0 ls -ld --time-style=+ 2>/dev/null; cat etc/systemd/system/tuxchange.service 2>/dev/null || true) | md5sum; }
 
-releases() { ls -d "$R"/opt/tuxchange/release-* 2>/dev/null | wc -l; }
+leftovers() { find "$R/opt/tuxchange" -mindepth 1 -maxdepth 1 ! -name tuxchange ! -name gui ! -name scripts | wc -l; }
 
 echo "== a clean install"
 fresh
 TEST_GUI_USER=user run install
 check "succeeds" '[ $RC -eq 0 ]'
 check "says so" '[[ $OUT == *INSTALLED* ]]'
-rel=$(ls -d "$R"/opt/tuxchange/release-* 2>/dev/null | head -n 1)
-check "copies the code into one release" '[ "$(releases)" -eq 1 ] && [ -f "$rel/tuxchange/sp_relay.py" ] && [ -x "$rel/scripts/sp_monitor.sh" ]'
-check "the unit runs that release" 'grep -q "WorkingDirectory=$rel\$" "$R/etc/systemd/system/tuxchange.service"'
+check "copies the code into $L" '[ -f "$L/tuxchange/sp_relay.py" ] && [ -x "$L/scripts/sp_monitor.sh" ] && [ -f "$L/gui/sp_gui.py" ]'
+check "the unit runs from there" 'grep -q "WorkingDirectory=$L\$" "$R/etc/systemd/system/tuxchange.service"'
 check "the unit runs the checked python" 'grep -q "exec $R/usr/bin/python3 " "$R/etc/systemd/system/tuxchange.service"'
 check "the unit was verified, reloaded and enabled" 'grep -q "^systemd-analyze verify" "$R/calls" && grep -qx "systemctl daemon-reload" "$R/calls" && grep -qx "systemctl enable tuxchange.service" "$R/calls"'
-check "writes the defaults, polkit rule and desktop file" '[ -f "$R/etc/default/tuxchange" ] && [ -f "$R/etc/polkit-1/rules.d/50-tuxchange.rules" ] && grep -q "$rel/gui" "$R/usr/share/applications/tuxchange-gui.desktop"'
+check "writes the defaults, polkit rule and desktop file" '[ -f "$R/etc/default/tuxchange" ] && [ -f "$R/etc/polkit-1/rules.d/50-tuxchange.rules" ] && grep -q "$L/gui" "$R/usr/share/applications/tuxchange-gui.desktop"'
 check "copies the keys" '[ "$(cat "$R/etc/tuxchange/aes_keys.txt")" = aeskey ]'
-check "leaves no backups or temporary files" '[ -z "$(find "$R/opt/tuxchange" -maxdepth 1 -name ".*" ! -name .)" ] && [ -z "$(find "$R/etc" "$R/usr/share" -name "*.??????")" ]'
+check "leaves no backups or temporary files" '[ "$(leftovers)" -eq 0 ] && [ -z "$(find "$R/etc" "$R/usr/share" -name "*.??????")" ]'
 
 echo "== a reinstall"
-before_rel=$rel
+echo 'print(3)' > "$R/src/tuxchange/sp_relay.py"
+touch "$L/tuxchange/stale.py"
 run install
 check "succeeds" '[ $RC -eq 0 ]'
-check "replaces the stopped service's release" '[ "$(releases)" -eq 1 ] && [ ! -e "$before_rel" ]'
-echo "$(ls -d "$R"/opt/tuxchange/release-*)" > "$R/running"
-live=$(cat "$R/running")
+check "replaces the code in place" '[ "$(cat "$L/tuxchange/sp_relay.py")" = "print(3)" ] && [ ! -e "$L/tuxchange/stale.py" ] && [ "$(leftovers)" -eq 0 ]'
+echo "$L" > "$R/running"
 run install
-check "keeps the release a running service started from" '[ $RC -eq 0 ] && [ "$(releases)" -eq 2 ] && [ -f "$live/tuxchange/sp_relay.py" ]'
-check "and says a restart is needed" '[[ $OUT == *"still uses the previous copy"* ]]'
+check "says a running service needs a restart" '[ $RC -eq 0 ] && [[ $OUT == *"restart tuxchange"* ]]'
 rm -f "$R/running"
-mkdir -p "$R/opt/tuxchange/tuxchange"
+mkdir -p "$L/release-20260101000000-abcdef/tuxchange"
 run install
-check "removes the old flat layout when nothing runs from it" '[ $RC -eq 0 ] && [ ! -e "$R/opt/tuxchange/tuxchange" ]'
+check "removes release directories from older installers" '[ $RC -eq 0 ] && [ "$(leftovers)" -eq 0 ]'
+mkdir -p "$L/release-20260101000000-abcdef/tuxchange"
+echo "$L/release-20260101000000-abcdef" > "$R/running"
+run install
+check "but not one a running service started from" '[ $RC -eq 0 ] && [ -d "$L/release-20260101000000-abcdef" ]'
+rm -rf "$R/running" "$L/release-20260101000000-abcdef"
 
 echo "== failures leave the previous install in place"
+echo 'print(4)' > "$R/src/tuxchange/sp_relay.py"
 for step in "systemctl enable" "systemctl daemon-reload" "systemd-analyze"; do
   echo "$step" > "$R/fail"
   old_unit=$(cat "$R/etc/systemd/system/tuxchange.service")
-  old_rel=$(ls -d "$R"/opt/tuxchange/release-*)
   run install
   check "$step failing exits non-zero" '[ $RC -ne 0 ]'
   check "$step failing never claims success" '[[ $OUT != *INSTALLED* ]] && [[ $OUT == *"INSTALL FAILED"* ]]'
   check "$step failing restores the unit" '[ "$(cat "$R/etc/systemd/system/tuxchange.service")" = "$old_unit" ]'
-  check "$step failing keeps only the previous release" '[ "$(ls -d "$R"/opt/tuxchange/release-*)" = "$old_rel" ] && [ -f "$old_rel/tuxchange/sp_relay.py" ]'
-  check "$step failing leaves no backups" '[ -z "$(find "$R/opt/tuxchange" -maxdepth 1 -name ".backup-*")" ]'
+  check "$step failing restores the code" '[ "$(cat "$L/tuxchange/sp_relay.py")" = "print(3)" ] && [ -x "$L/scripts/sp_monitor.sh" ]'
+  check "$step failing leaves no backups" '[ "$(leftovers)" -eq 0 ]'
   : > "$R/fail"
 done
 
@@ -144,7 +150,7 @@ if [ -r "$R/src/gui/sp_gui.py" ]; then
 else
   run install
   check "an unreadable source file fails the install" '[ $RC -ne 0 ] && [[ $OUT != *INSTALLED* ]]'
-  check "and leaves the unit and release alone" '[ "$(cat "$R/etc/systemd/system/tuxchange.service")" = "$old_unit" ] && [ "$(releases)" -eq 1 ]'
+  check "and leaves the unit and code alone" '[ "$(cat "$R/etc/systemd/system/tuxchange.service")" = "$old_unit" ] && [ "$(cat "$L/tuxchange/sp_relay.py")" = "print(3)" ] && [ "$(leftovers)" -eq 0 ]'
 fi
 chmod 0644 "$R/src/gui/sp_gui.py"
 
