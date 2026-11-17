@@ -131,7 +131,7 @@ def scan_save_image(path_or_data):
         if not f['name'].startswith('_'):          # message files are named _<12 chars>
             continue
         try:
-            raw = fs.read(f)
+            raw = fs.read(f, sp_cec.MAX_TOTAL)
         except ValueError:
             continue
         c = container_at(raw)
