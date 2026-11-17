@@ -28,35 +28,71 @@ jobs:
 
       # These run with no keys and no corpus, as on a fresh clone.
       - name: Daemon self-test
+        if: ${{ !cancelled() }}
         run: python tuxchange/sp_relay.py selftest
 
       - name: Link self-test
+        if: ${{ !cancelled() }}
         run: python tuxchange/sp_link.py --selftest
 
       - name: Full handshake simulation
+        if: ${{ !cancelled() }}
         run: python tuxchange/sp_link.py --simulate
 
       - name: Remaining module self-tests
+        if: ${{ !cancelled() }}
         run: |
-          set -e
-          python tuxchange/sp_build.py --selftest
-          python tuxchange/sp_mii.py --selftest
-          python tuxchange/sp_cecstore.py --selftest
-          python tuxchange/sp_store.py --selftest
-          python tuxchange/sp_smdh.py --selftest
-          python tuxchange/sp_yysession.py --selftest
-          python tuxchange/sp_savefs.py --selftest
-          python tuxchange/sp_cecexport.py --selftest
-          python tuxchange/sp_probe_tx.py --selftest
-          python tuxchange/sp_aes.py --selftest
-          python tuxchange/sp_identity.py selftest
-          python tuxchange/sp_plugin.py --selftest
-          python tuxchange/sp_plaza.py
-          python tuxchange/sp_create.py --selftest
-          python tools/macfilter_decode.py --selftest
+          # Run them all and fail at the end, so one failure does not hide the rest.
+          rc=0
+          python tuxchange/sp_build.py --selftest || rc=1
+          python tuxchange/sp_mii.py --selftest || rc=1
+          python tuxchange/sp_cecstore.py --selftest || rc=1
+          python tuxchange/sp_store.py --selftest || rc=1
+          python tuxchange/sp_smdh.py --selftest || rc=1
+          python tuxchange/sp_yysession.py --selftest || rc=1
+          python tuxchange/sp_savefs.py --selftest || rc=1
+          python tuxchange/sp_cecexport.py --selftest || rc=1
+          python tuxchange/sp_probe_tx.py --selftest || rc=1
+          python tuxchange/sp_aes.py --selftest || rc=1
+          python tuxchange/sp_identity.py selftest || rc=1
+          python tuxchange/sp_plugin.py --selftest || rc=1
+          python tuxchange/sp_plaza.py || rc=1
+          python tuxchange/sp_create.py --selftest || rc=1
+          python tools/macfilter_decode.py --selftest || rc=1
+          exit $rc
 
       - name: No key material has crept into the tree
+        if: ${{ !cancelled() }}
         run: ./.github/scripts/keyscan.sh
+
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build the wheel and sdist
+        run: |
+          pip install build
+          python -m build --outdir dist .
+
+      - name: Wheel installs and its entry points run
+        run: |
+          python -m venv /tmp/smoke
+          /tmp/smoke/bin/pip install dist/*.whl
+          /tmp/smoke/bin/tuxchange --help
+          /tmp/smoke/bin/tuxchange selftest
+          # The GUI needs GTK, which is absent here; it must say so rather than crash.
+          rc=0; /tmp/smoke/bin/tuxchange-gui || rc=$?
+          test "$rc" -eq 1
+
+      - name: Sdist builds and carries the sources
+        run: |
+          tar tzf dist/*.tar.gz | grep -q 'tuxchange/sp_relay.py'
+          tar tzf dist/*.tar.gz | grep -q 'LICENSE'
 
   shellcheck:
     runs-on: ubuntu-latest
