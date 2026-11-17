@@ -18,9 +18,9 @@ def build(plugin, ctx):
 def mii_group(plugin, ctx):
     g = Adw.PreferencesGroup(
         title='Mii',
-        description='Import a Mii to change it\'s appearence..')
+        description='Import a Mii to show in StreetPass Mii Plaza')
     box = Gtk.Box(spacing=6, valign=Gtk.Align.CENTER)
-    for imp, label in zip(plugin.importers, ('Mii data…', 'QR code…', 'From a message…')):
+    for imp, label in zip(plugin.importers, ('Mii data', 'QR code', 'From a message')):
         b = Gtk.Button(label=label, tooltip_text=imp.help or imp.label)
         b.connect('clicked', lambda _b, i=imp: ctx.run_importer(i))
         box.append(b)

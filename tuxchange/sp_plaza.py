@@ -73,7 +73,7 @@ def fields():
     return [
         P.Str('greeting', 'Greeting', max_len=GREETING_MAX, default='Hello, world!',
               help='shown on your Mii card'),
-        P.Group('mii', 'Mii', [
+        P.Group('mii', 'Mii Info', [
             P.Str('mii_name', 'Mii name', max_len=MII_NAME_MAX, forbid=NAME_FORBID),
             P.Str('author_name', 'Creator', max_len=MII_NAME_MAX, forbid=NAME_FORBID,
                   help='the "Creator" line on the card'),
@@ -116,8 +116,7 @@ def fields():
             P.Int('mii_cache_count', 'Plaza Mii-cache count', 0, CACHE_MAX, advanced=True),
             _met('met32', 32, False),
         ], advanced=True),
-        P.Int('bubble', 'Speech-bubble style', 0, sp_build.BUBBLE_MAX, advanced=True,
-              help='inferred from the game, not proven'),
+        P.Int('bubble', 'Speech-bubble style', 0, sp_build.BUBBLE_MAX, advanced=True),
         P.Blob('original', 'Original body', max_len=BODY_LEN),
     ]
 
