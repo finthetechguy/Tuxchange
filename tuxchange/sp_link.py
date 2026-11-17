@@ -211,6 +211,7 @@ class Link:
         self.channels = [int(c) for c in str(a.channel).split(',') if c.strip()]
         self.chan_idx = 0
         self.chan_locked = False
+        self.retune_proven = False
         self.next_hop = 0.0
 
     def log(self, msg, level=1):
@@ -526,12 +527,24 @@ class Link:
         self.session = None
         self.abandon_attempt()
 
-    def detect_channel(self, secs=2.0, enough=None):
-        """The channel the radio is really on, from the radiotap of received frames."""
+    def drain(self):
+        """Discard frames already queued on the socket (received before a retune)."""
+        while True:
+            try:
+                self.sock.recv(4096)
+            except (BlockingIOError, OSError):
+                return
+
+    def detect_channel(self, secs=2.0, enough=None, want=None):
+        """The channel the radio is acutally on from the radiotap of received frames."""
         from collections import Counter
+        self.drain()
+        want_f = T.CH_FREQ.get(want)
         c, end = Counter(), time.time() + secs
         while time.time() < end:
-            if enough and c and c.most_common(1)[0][1] >= enough:
+            if enough and want_f and c[want_f] >= enough:
+                return want
+            if enough and not want_f and c and c.most_common(1)[0][1] >= enough:
                 break
             if not select.select([self.sock], [], [], 0.2)[0]:
                 continue
@@ -656,11 +669,13 @@ class Link:
                 if not ok:
                     # iw reports no channel for a monitor vif and in mixed mode it refuses the change with
                     # (EBUSY) while the radio stays on channel 1
-                    actual = self.detect_channel(1.0, enough=5)
+                    actual = self.detect_channel(1.0, enough=5, want=ch)
                     if ok is None:
                         ok = actual in (None, ch)
                     heard = actual is not None
-                if ok:
+                if ok and heard:
+                    self.retune_proven = True
+                elif ok:
                     self.log('  hunting on channel %d%s'
                              % (ch, '' if heard else ' (unconfirmed: nothing heard)'), 2)
                 else:
