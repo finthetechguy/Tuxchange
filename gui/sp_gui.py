@@ -414,6 +414,7 @@ class HomePage(Page):
                       why if active else 'Start the service above.'))
             return
         s = st['status']
+        self.app.plugins.set_identity(s.get('own_identity'))
 
         g = self.group('Exchanges', 'Stops exchanges from happening while the daemon is running.')
         sw = Gtk.Switch(active=s['enabled'], valign=Gtk.Align.CENTER)
@@ -450,7 +451,7 @@ class HomePage(Page):
             return 'a new MAC every pass'
         every = int(s.get('rotate_every_s') or 0)
         if not every:
-            return 'fixed, derived from the store path'
+            return 'fixed, the store\'s own'
         age = s.get('identity_age_s')
         if age is None:              # a change is already due at the next pass boundary
             return 'on a timer: change due at the end of this listening pass (%d change(s) so far)' \

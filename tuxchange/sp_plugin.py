@@ -557,7 +557,8 @@ class Plugin:
 
     def __init__(self):
         # Set by the GUI or CLI before defaults() is called. 'store' is the daemon's store
-        # path, which some plugins derive a stable default identity from.
+        # path, whose own identity some plugins use as a default; 'identity', when set, is
+        # that identity as the running daemon reports it.
         self.context = {}
 
     def defaults(self):

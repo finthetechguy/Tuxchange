@@ -551,12 +551,20 @@ class Plugins:
     def __init__(self, app):
         self.app = app
         self.plugins, self.broken = [], []
+        self.identity = None
         self.reload()
 
     def reload(self):
         self.plugins, self.broken = P.discover()
         for p in self.plugins:
             p.context['store'] = self.app.daemon.store
+            p.context['identity'] = self.identity
+
+    def set_identity(self, identity):
+        """The running daemon's own identity, for stores this user cannot read."""
+        self.identity = identity
+        for p in self.plugins:
+            p.context['identity'] = identity
 
     def for_title(self, tid):
         return P.for_title(tid, self.plugins)
