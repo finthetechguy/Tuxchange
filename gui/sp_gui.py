@@ -201,6 +201,19 @@ class Page(Adw.Bin):
         self._groups = []
         self._expanders = {}
         self._signature = None
+        self._generation = 0
+
+    def fetch(self, fn, draw):
+        """run_async for a refresh: only the newest request's reply is drawn, so a slow
+        reply cannot land after a newer one and put old state back on screen."""
+        self._generation += 1
+        mine = self._generation
+
+        def done(res):
+            if mine == self._generation:
+                draw(res)
+            return False
+        run_async(fn, done)
 
     # A rebuild collapses expanded rows, so skip it when nothing displayed has changed.
 
@@ -295,7 +308,7 @@ class HomePage(Page):
         self.busy = False
 
     def refresh(self):
-        run_async(lambda: (Daemon.unit_state(), self.app.daemon.try_call('status')), self._draw)
+        self.fetch(lambda: (Daemon.unit_state(), self.app.daemon.try_call('status')), self._draw)
 
     def _service_group(self, unit, st):
         active = unit.get('ActiveState') == 'active'
@@ -523,7 +536,7 @@ class EncountersPage(Page):
         super().__init__(app, 'Encounters', 'network-wireless-symbolic')
 
     def refresh(self):
-        run_async(lambda: self.app.daemon.try_call('encounters', limit=200), self._draw)
+        self.fetch(lambda: self.app.daemon.try_call('encounters', limit=200), self._draw)
 
     def _draw(self, res):
         rep, why = res
@@ -583,7 +596,7 @@ class StorePage(Page):
     BOX = 'outbox'
 
     def refresh(self):
-        run_async(lambda: self.app.daemon.try_call('store'), self._draw)
+        self.fetch(lambda: self.app.daemon.try_call('store'), self._draw)
 
     def _messages(self, t):
         return [m for m in t['messages'] if m['box'] == self.BOX]
@@ -701,7 +714,7 @@ class DenylistPage(Page):
         super().__init__(app, 'Denylist', 'action-unavailable-symbolic')
 
     def refresh(self):
-        run_async(lambda: self.app.daemon.try_call('denylist'), self._draw)
+        self.fetch(lambda: self.app.daemon.try_call('denylist'), self._draw)
 
     def signature(self, data):
         rep, why = data
@@ -806,7 +819,7 @@ class LogPage(Page):
         return False
 
     def refresh(self):
-        run_async(lambda: self.app.daemon.try_call('log', limit=400), self._draw)
+        self.fetch(lambda: self.app.daemon.try_call('log', limit=400), self._draw)
 
     def _draw(self, res):
         rep, why = res
