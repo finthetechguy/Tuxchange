@@ -4,7 +4,7 @@ import contextlib, os, sys, json, time, socket, stat, struct, threading, random,
 import base64, subprocess, queue, signal, tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import sp_store, sp_cecstore, sp_cec, sp_harvest_air, sp_build
+import sp_store, sp_cecstore, sp_cec, sp_cecvalid, sp_harvest_air, sp_build
 
 # Like a 3DS's own MacFilter: a MAC that has completed an exchange is refused until it changes.
 # The console keeps the last 255 and never expires one; a 3DS presents a new MAC from time to time.
@@ -217,15 +217,6 @@ def sd_notify(state):
     except OSError:
         return False
 
-
-def declared_length(msg):
-    """The total length a CEC message states in its own header at +0x04, or -1 if unreadable."""
-    return struct.unpack_from('<I', msg, 4)[0] if len(msg) >= 8 else -1
-
-
-def message_is_whole(msg):
-    """Does a CEC message contain exactly as many bytes as its header claims?"""
-    return declared_length(msg) == len(msg)
 
 # Events a hook can be written for. TODO: add more?
 HOOK_EVENTS = ('exchange', 'rotate', 'error', 'start', 'stop')
@@ -556,6 +547,11 @@ def select_for_peer(store, peer_titles, book=None, mac=None, max_titles=None, lo
         if mid in seen_ids:
             continue
         seen_ids.add(mid)
+        if sp_cecvalid.hmac_status(c, store.title_key(tid)) == sp_cecvalid.INVALID:
+            if log:
+                log('  NOT serving %08X/%s: it is malformed or fails its title HMAC'
+                    % (tid, mid.hex()))
+            continue
         if store.is_from_air(mid, box):
             if log:
                 log('  NOT serving %08X/%s: it came from a console over the air, and this relay '
@@ -611,20 +607,26 @@ def import_into(store, path, log=print, replace=False):
     meta = title_metadata_any(path)
     if replace:
         log('  cleared %d message(s) from the outbox first' % store.clear_box('outbox'))
-    n = 0
+    n = skipped = 0
     for m in found:
         c = m.get('raw')
         if not c:
             continue
         t = m['cec_title_id']
         md = meta.get(t) or {}
+        try:
+            store.add_message(c, m['box'] if m['box'] in ('inbox', 'outbox') else 'outbox',
+                              name=md.get('name'), key=md.get('hmac_key'),
+                              origin=os.path.abspath(path))
+        except sp_cecvalid.Invalid as e:
+            log('  skipped %s (%08X): %s' % (m.get('path', '?'), t, e))
+            skipped += 1
+            continue
         if md.get('name') or md.get('hmac_key'):
             store.add_title(t, name=md.get('name'), hmac_key=md.get('hmac_key'))
-        store.add_message(c, m['box'] if m['box'] in ('inbox', 'outbox') else 'outbox',
-                          name=md.get('name'), key=md.get('hmac_key'),
-                          origin=os.path.abspath(path))
         n += 1
-    log('  imported %d message(s) from %s' % (n, path))
+    log('  imported %d message(s) from %s%s'
+        % (n, path, '; skipped %d malformed or unauthentic' % skipped if skipped else ''))
     return n
 
 
@@ -1650,28 +1652,28 @@ class Relay:
                               if i < delivered for mid in ids]
         got_detail = []
         for obj in (getattr(sess, 'received', None) or []):
-            if len(obj) > 0x14 + 0x70 and obj[:2] == b'\x61\x61':
+            if obj[:2] != b'\x61\x61':
+                continue
+            try:
+                containers = sp_build.unwrap(obj)
+            except ValueError as e:
+                self.log('  DISCARDING a malformed message from %s (%d B): %s. Not stored.'
+                         % (peer or '?', len(obj), e))
+                continue
+            for c in containers:
+                tid = sp_cec.parse_header(c)['cec_title_id']
                 try:
-                    for c in sp_build.unwrap(obj):
-                        # Second check: a short message must never reach the store.
-                        if not message_is_whole(c):
-                            self.log('  DISCARDING a truncated message from %s: %d B on the wire, '
-                                     'its own header declares %d. Not stored.'
-                                     % (peer or '?', len(c), declared_length(c)))
-                            continue
-                        # Filed in the inbox with its origin, which keeps it from being offered to a console.
-                        with self.lock:
-                            self.store.add_message(c, 'inbox', origin='air:%s' % (peer or '?'))
-                            if self.store.last_evicted:
-                                self.log('  inbox full: dropped the %d oldest message(s) for %08X'
-                                         % (self.store.last_evicted,
-                                            sp_cec.parse_header(c)['cec_title_id']))
-                        got.append(c[0x20:0x28])
-                        got_detail.append({'title': '%08X' % sp_cec.parse_header(c)['cec_title_id'],
-                                           'bytes': len(c)})
+                    # Filed in the inbox with its origin, which keeps it from being offered to a console.
+                    with self.lock:
+                        self.store.add_message(c, 'inbox', origin='air:%s' % (peer or '?'))
+                        if self.store.last_evicted:
+                            self.log('  inbox full: dropped the %d oldest message(s) for %08X'
+                                     % (self.store.last_evicted, tid))
                 except ValueError as e:
                     self.log('  could not file a message from %s: %s' % (peer or '?', e))
                     continue
+                got.append(c[0x20:0x28])
+                got_detail.append({'title': '%08X' % tid, 'bytes': len(c)})
         if not peer:
             return False
         self.last_peer = peer
@@ -1803,6 +1805,13 @@ def _inspect_args(fn):
     return list(inspect.signature(fn).parameters)
 
 
+def _raises(fn):
+    try:
+        fn(); return False
+    except ValueError:
+        return True
+
+
 def _timesout(fn):
     try:
         fn(); return False
@@ -1839,7 +1848,6 @@ def _selftest():
         st = sp_store.Store(os.path.join(tmp, 'store'))
         src = corpus.path('console_nand')
         if src is None:
-            import sp_build
             for tid, origin in ((0x00020800, None), (0x00030600, 'air:96:58:cb:00:11:22')):
                 m = sp_build.build(mii_name='Tux', greeting='self-test', cec_title_id=tid,
                                    key=b'\x11' * 32)
@@ -2862,17 +2870,15 @@ def _selftest():
         bad = _scan_code_for_machine_kill(os.path.abspath(__file__))
         chk('nothing in this daemon can reboot the machine', not bad, bad)
 
-        whole = bytearray(32712)
-        struct.pack_into('<I', whole, 4, 32712)
-        chk('a message whose header matches its length is whole', message_is_whole(bytes(whole)))
-        chk('and its declared length reads back', declared_length(bytes(whole)) == 32712,
-            declared_length(bytes(whole)))
-        chk('THE REAL CASUALTY: 24,664 B declaring 32,712 is rejected',
-            not message_is_whole(bytes(whole)[:24664]))
+        whole = sp_build.build_envelope(b'data', 0x00030600, key=b'w' * 32, ex_headers=[])
+        chk('a message whose header matches its length is whole',
+            len(sp_build.unwrap(whole)) == 1)
+        chk('a message cut short of its declared length is rejected',
+            _raises(lambda: sp_build.unwrap(whole[:-4])))
         chk('a message longer than it declares is rejected too',
-            not message_is_whole(bytes(whole) + b'\x00' * 4))
+            _raises(lambda: sp_build.unwrap(whole + b'\x00' * 4)))
         chk('a runt too short to hold a header is rejected, not crashed',
-            not message_is_whole(b'\x00' * 4) and declared_length(b'') == -1)
+            _raises(lambda: sp_build.unwrap(b'\x61\x61\x00\x00')))
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     print('\n%d/%d checks passed' % (ok, tot))

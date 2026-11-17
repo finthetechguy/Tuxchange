@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """A CEC message store on disk, shaped like a console's."""
-import os, json, stat, time, struct, base64, hashlib, hmac as _hmac
+import os, json, stat, time, struct, base64
 
-import sp_cec
+import sp_cec, sp_cecvalid
 
 MBOXLIST_MAGIC, MBOXINFO_MAGIC, BOXINFO_MAGIC = 0x6868, 0x6363, 0x6262
 # Kept outside CEC/ so the tree stays byte-comparable with a console's.
@@ -186,16 +186,21 @@ class Store:
         struct.pack_into('<IIII', b, 8, DEFAULT_MAX_BYTES, used, DEFAULT_MAX_MESSAGES, len(msgs))
         _write_private(os.path.join(self._box_dir(tid, box), 'BoxInfo_____'), bytes(b))
 
+    def _checked(self, container, key):
+        """-> (container, title) if well-formed and, under any key we have, authentic."""
+        container = sp_cecvalid.check_container(container)
+        tid = sp_cecvalid.parts(container)[2]
+        k = key if key is not None else self.title_key(tid)
+        if k is not None and not sp_cecvalid.hmac_ok(container, k):
+            raise sp_cecvalid.Invalid('%08X message %s fails its title HMAC'
+                                      % (tid, container[0x20:0x28].hex()))
+        return container, tid
+
     def add_message(self, container, box='inbox', name=None, key=None, origin=None):
         """File one bare 0x6060 container."""
         if container[:2] != b'\x60\x60':
             raise ValueError('add_message takes a bare 0x6060 container; unwrap the envelope first')
-        h = sp_cec.parse_header(container)
-        tid = h['cec_title_id']
-        container = container[:h['total_size']]
-        if box == 'inbox' and len(container) > sp_cec.MAX_TOTAL:
-            raise ValueError('a CEC message is at most %d B, got %d'
-                             % (sp_cec.MAX_TOTAL, len(container)))
+        container, tid = self._checked(container, key)
         if tid not in self.titles():
             self.add_title(tid, name=name, hmac_key=key)
         else:
@@ -219,7 +224,7 @@ class Store:
         """
         if container[:2] != b'\x60\x60':
             raise ValueError('replace_outbox takes a bare 0x6060 container')
-        tid = sp_cec.parse_header(container)['cec_title_id']
+        container, tid = self._checked(container, key)
         old = self.messages(tid, 'outbox')
         if tid in self.titles() and (key is not None or name is not None):
             self.add_title(tid, name=name, hmac_key=key)
@@ -310,10 +315,7 @@ class Store:
         k = self.title_key(tid)
         if k is None:
             return None
-        h = sp_cec.parse_header(container)
-        body = container[h['header_size']:h['header_size'] + h['body_size']]
-        tag = container[h['header_size'] + h['body_size']:h['total_size']]
-        return len(tag) == 0x20 and _hmac.new(k, body, hashlib.sha256).digest() == tag
+        return sp_cecvalid.hmac_status(container, k) == sp_cecvalid.VALID
 
     def summary(self):
         og = self.origins()
@@ -349,7 +351,7 @@ def _selftest():
 
         p0 = Store(os.path.join(tmp, 'private'))
         p0.add_title(0x00020800, name='Mii Plaza', hmac_key=b'k' * 32)
-        p0.add_message(_synthetic(0x00020800, 1), 'inbox', origin='air:test')
+        p0.add_message(_synthetic(0x00020800, 1, key=b'k' * 32), 'inbox', origin='air:test')
         tdir = p0._title_dir(0x00020800)
         chk('the CEC tree is closed to other users', mode(p0.cec) == 0o700)
         chk('a title directory is private', mode(tdir) == 0o700)
@@ -393,6 +395,13 @@ def _selftest():
         chk('an inbox stops at its byte limit', used <= DEFAULT_MAX_BYTES, used)
         chk('and still holds the newest message',
             12 in {int.from_bytes(c[0x20:0x28], 'little') for _t, _b, c in big.messages(box='inbox')})
+        mal = bytearray(_synthetic(0x00030600, 77))
+        struct.pack_into('<I', mal, 8, 0xFFFFFFF0)
+        chk('a container with an impossible header_size is refused',
+            _raises(lambda: big.add_message(bytes(mal), 'inbox'))
+            and 77 not in {int.from_bytes(c[0x20:0x28], 'little') for _t, _b, c in big.messages()})
+        chk('a container with trailing bytes is refused',
+            _raises(lambda: big.add_message(_synthetic(0x00030600, 78) + bytes(4), 'inbox')))
         chk('an oversized message is refused for the inbox',
             _raises(lambda: big.add_message(_synthetic(0x00030600, 99, sp_cec.MAX_TOTAL + 4), 'inbox')))
         cap = Store(os.path.join(tmp, 'limit-titles'))
@@ -408,16 +417,19 @@ def _selftest():
         rp.add_message(_synthetic(0x00030600, 2), 'outbox')
         rp.add_message(_synthetic(0x00020800, 3), 'outbox')
         rp.add_message(_synthetic(0x00030600, 4), 'inbox')
-        n = rp.replace_outbox(_synthetic(0x00030600, 5), key=b'r' * 32, origin='authored:test')
+        n = rp.replace_outbox(_synthetic(0x00030600, 5, key=b'r' * 32), key=b'r' * 32,
+                             origin='authored:test')
         out = [int.from_bytes(c[0x20:0x28], 'little') for _t, _b, c in rp.messages(0x00030600, 'outbox')]
         chk('replace_outbox leaves exactly the new message', out == [5], out)
         chk('and reports the two it replaced', n == 2, n)
         chk('other titles and the inbox are untouched',
             len(rp.messages(0x00020800, 'outbox')) == 1 and len(rp.messages(0x00030600, 'inbox')) == 1)
+        chk('a message failing its title key is refused',
+            _raises(lambda: rp.add_message(_synthetic(0x00030600, 6, key=b'x' * 32), 'outbox')))
         chk('the key it was given is recorded on an existing title', rp.title_key(0x00030600) == b'r' * 32)
-        chk('and the origin', rp.origin(_synthetic(0x00030600, 5))['source'] == 'authored:test')
+        chk('and the origin', rp.origin(_synthetic(0x00030600, 5, key=b'r' * 32))['source'] == 'authored:test')
         chk('replacing a message with itself keeps it',
-            rp.replace_outbox(_synthetic(0x00030600, 5)) == 0
+            rp.replace_outbox(_synthetic(0x00030600, 5, key=b'r' * 32)) == 0
             and len(rp.messages(0x00030600, 'outbox')) == 1)
         chk('replace_outbox on a new title adds it', rp.replace_outbox(_synthetic(0x00141000, 1)) == 0
             and 0x00141000 in rp.titles())
@@ -593,13 +605,19 @@ def _selftest():
     return 0 if ok == tot else 1
 
 
-def _synthetic(tid, n, size=0x200):
-    """A bare container with just the header fields the store reads."""
+def _synthetic(tid, n, size=0x200, key=None):
+    """A well-formed bare container of `size` bytes; any excess over a full body is an ex-header."""
+    body = min(size - 0x90, sp_cec.MAX_BODY)
     b = bytearray(size)
     struct.pack_into('<HH', b, 0, 0x6060, 0)
-    struct.pack_into('<III', b, 4, size, 0x70, size - 0x90)
+    struct.pack_into('<III', b, 4, size, size - body - 0x20, body)
+    if size - body - 0x20 > 0x70:
+        struct.pack_into('<II', b, 0x70, 1, size - body - 0x20 - 0x78)
     struct.pack_into('<I', b, 0x10, tid)
     b[0x20:0x28] = n.to_bytes(8, 'little')
+    if key is not None:
+        import hashlib, hmac
+        b[size - 0x20:] = hmac.new(key, b[size - body - 0x20:size - 0x20], hashlib.sha256).digest()
     return bytes(b)
 
 

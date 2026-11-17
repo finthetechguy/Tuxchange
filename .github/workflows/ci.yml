@@ -52,6 +52,7 @@ jobs:
           python tuxchange/sp_yysession.py --selftest || rc=1
           python tuxchange/sp_savefs.py --selftest || rc=1
           python tuxchange/sp_cecexport.py --selftest || rc=1
+          python tuxchange/sp_cecvalid.py || rc=1
           python tuxchange/sp_probe_tx.py --selftest || rc=1
           python tuxchange/sp_aes.py --selftest || rc=1
           python tuxchange/sp_identity.py selftest || rc=1

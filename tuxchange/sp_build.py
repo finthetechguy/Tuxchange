@@ -2,7 +2,7 @@
 """Build a complete StreetPass Mii Plaza CEC message from scratch, with no captured input."""
 import struct, os, hmac, hashlib
 
-import sp_cec
+import sp_cec, sp_cecvalid
 import lp_keys as _keys, sp_mii, sp_smdh
 
 ENVELOPE_LEN = 0x14
@@ -392,20 +392,8 @@ def message_title(message):
 
 
 def unwrap(message):
-    """-> the list of bare 0x6060 containers inside `message`."""
-    if message[:2] == b'\x60\x60':
-        return [message[:struct.unpack_from('<I', message, 4)[0]]]
-    if message[:2] != b'\x61\x61':
-        raise ValueError('not a CEC message (no 6060 or 6161 magic)')
-    n = max(1, struct.unpack_from('<I', message, 0x10)[0])
-    out, off = [], ENVELOPE_LEN
-    for _ in range(n):
-        if off + 0x70 > len(message):
-            raise ValueError('envelope declares %d containers, ran out at %d' % (n, len(out)))
-        tot = struct.unpack_from('<I', message, off + 4)[0]
-        out.append(message[off:off + tot])
-        off += tot
-    return out
+    """-> the list of bare 0x6060 containers inside `message`, each strictly checked."""
+    return sp_cecvalid.containers(message)
 
 
 def envelope(containers):
@@ -878,6 +866,27 @@ def _selftest():
     chk('send mode 4 is refused', _raises(lambda: build_envelope(gb, 0x00030600, key=kx, send_mode=4)))
     chk('a truncated message is refused by split_message',
         _raises(lambda: sp_cec.split_message(gen[:-0x40])))
+    spin = bytearray(ENVELOPE_LEN + HDR_LEN + 4)
+    spin[:2], spin[ENVELOPE_LEN:ENVELOPE_LEN + 2] = b'aa', b'``'
+    struct.pack_into('<I', spin, 4, len(spin))
+    struct.pack_into('<I', spin, 0x10, 0xFFFFFFFF)
+    t0 = time.time()
+    chk('an envelope whose container count cannot fit is refused at once',
+        _raises(lambda: unwrap(bytes(spin))) and time.time() - t0 < 0.5)
+    struct.pack_into('<I', spin, 0x10, 1)
+    chk('so is one whose container declares no size', _raises(lambda: unwrap(bytes(spin))))
+    bad_hs = bytearray(gen)
+    struct.pack_into('<I', bad_hs, ENVELOPE_LEN + 8, 0xFFFFFFF0)
+    chk('a header_size inconsistent with the total is refused by split_message',
+        _raises(lambda: sp_cec.split_message(bytes(bad_hs))))
+    chk('and parse_message reports it rather than inferring a body offset',
+        sp_cec.parse_message(bytes(bad_hs[ENVELOPE_LEN:]))['problems'])
+    pad = bytearray(gen)
+    struct.pack_into('<I', pad, ENVELOPE_LEN + 4, len(gen) - ENVELOPE_LEN + 4)
+    chk('a total_size that disagrees with header, body and trailer is refused',
+        _raises(lambda: unwrap(bytes(pad) + bytes(4))))
+    chk('a body with trailing bytes after the envelope is refused',
+        _raises(lambda: unwrap(gen + bytes(4))))
     chk('build_message is build_envelope with the Plaza icon and info text',
         build_message(body, message_id=1, when=time.gmtime(0))
         == build_envelope(body, PLAZA_TITLE, message_id=1, when=time.gmtime(0),

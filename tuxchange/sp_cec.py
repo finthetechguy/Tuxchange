@@ -1,6 +1,13 @@
 #!/usr/bin/env python3
-"""CEC message container parser + StreetPass Mii Plaza body decoder."""
+"""CEC message container parser + StreetPass Mii Plaza body decoder.
+
+parse_message, parse_stream and find_container_offsets are diagnostic: they describe
+damaged or partial data instead of refusing it. split_message, and sp_cecvalid behind it,
+are the strict path for anything that is stored, sent or handed to a plugin.
+"""
 import struct, sys
+
+import sp_cecvalid
 
 MAX_BODY  = 0x18000   # body size must be != 0, <= 0x18000, and 4-byte aligned
 MAX_TOTAL = 0x19000   # bodySize + 0x70 must be <= 0x19000  (hence the 0x19000 read buffer)
@@ -67,7 +74,7 @@ def parse_timestamp(buf, off=0x60):
 
 
 def parse_message(buf):
-    """Parse a full serialised CEC message. Mirrors Message::MakeMessageBinary exactly."""
+    """Diagnostic parse of a serialised CEC message; never vouches for it. See `problems`."""
     out = {'problems': []}
     h = parse_header(buf)
     out['header'] = h
@@ -100,19 +107,10 @@ def parse_message(buf):
     tail = buf[body_start + h['body_size']:]
     out['hmac'] = tail[:0x20] if len(tail) >= 0x20 else None
 
-    if h['body_size'] == 0 or h['body_size'] > MAX_BODY:
-        out['problems'].append(f"body_size {h['body_size']:#x} outside (0, {MAX_BODY:#x}]")
-    if h['body_size'] & 3:
-        out['problems'].append(f"body_size {h['body_size']:#x} not 4-byte aligned")
-    if h['body_size'] + HDR_LEN > MAX_TOTAL:
-        out['problems'].append(f"body_size + 0x70 exceeds {MAX_TOTAL:#x}")
-    if h['total_size'] and not (0x84 <= h['total_size'] <= MAX_TOTAL):
-        out['problems'].append(
-            f"total_size {h['total_size']:#x} outside [0x84, {MAX_TOTAL:#x}] (cecd rejects this)")
-    if h['field_35'] >= 4:
-        out['problems'].append(f"header+0x35 = {h['field_35']} must be < 4")
-    if h['field_6d'] > 1 and h['field_6c'] > 1:
-        out['problems'].append("header+0x6D and +0x6C both > 1 (NewMessage would have rejected)")
+    if h['header_size'] != body_start:
+        out['problems'].append(f"header_size {h['header_size']:#x} lies outside the message; "
+                               f"body offset {body_start:#x} was inferred")
+    out['problems'] += sp_cecvalid.problems(buf, exact=False)
     return out
 
 
@@ -122,19 +120,10 @@ def split_message(message):
     Raises ValueError on anything that is not a whole, well-formed CEC message, so a
     caller handing the body to a plugin never gets a truncated one.
     """
-    message = bytes(message)
-    if message[:2] == b'\x61\x61':
-        if len(message) < 0x14 + HDR_LEN:
-            raise ValueError('envelope too short')
-        if u32(message, 0x10) > 1:
-            raise ValueError('envelope carries %d containers; split them first'
-                             % u32(message, 0x10))
-        message = message[0x14:]
-    if message[:2] != b'\x60\x60':
-        raise ValueError('not a CEC message (no 6060 or 6161 magic)')
-    m = parse_message(message)
-    if m['problems']:
-        raise ValueError('malformed CEC message: %s' % '; '.join(m['problems']))
+    found = sp_cecvalid.containers(message)
+    if len(found) != 1:
+        raise ValueError('envelope carries %d containers; split them first' % len(found))
+    m = parse_message(found[0])
     return m['header'], m['exheaders'], m['body']
 
 

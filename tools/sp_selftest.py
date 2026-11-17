@@ -49,6 +49,7 @@ def build_plaza_message(greeting="hello streetpass", country="United Kingdom",
         exblob += struct.pack('<II', t, len(d)) + d
         exblob += b'\0' * ((-len(d)) % 4)
     hdr = bytearray(sp_cec.HDR_LEN)
+    hdr[0:2] = b'\x60\x60'
     header_size = sp_cec.HDR_LEN + len(exblob)
     total = header_size + len(body) + (0x20 if with_hmac else 0)
     struct.pack_into('<I', hdr, 0x04, total)
@@ -140,7 +141,8 @@ def main():
         check(any('TRUNCATED' in w for w in why), "single fragment flagged incomplete", f"{sc}/90")
 
     print("\n=== 5. a stream of SEVERAL titles' messages ===")
-    other = bytearray(sp_cec.HDR_LEN + 0x400)
+    other = bytearray(sp_cec.HDR_LEN + 0x400 + 0x20)
+    other[0:2] = b'\x60\x60'
     struct.pack_into('<I', other, 0x04, len(other))
     struct.pack_into('<I', other, 0x08, sp_cec.HDR_LEN)
     struct.pack_into('<I', other, 0x0C, 0x400)
