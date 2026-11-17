@@ -682,8 +682,12 @@ def backfill_air_provenance(store, book, log=print):
 def import_from_log(store, log_path, log=print):
     """Ingest the messages a console sent us during a run."""
     n = 0
-    for _t, c in sp_harvest_air.messages_from_log(log_path):
-        store.add_message(c, 'inbox', origin='air:log:' + os.path.basename(log_path))
+    for _t, c in sp_harvest_air.messages_from_log(log_path, key_for=store.title_key, log=log):
+        try:
+            store.add_message(c, 'inbox', origin='air:log:' + os.path.basename(log_path))
+        except ValueError as e:
+            log('  skipped a message from %s: %s' % (log_path, e))
+            continue
         n += 1
     log('  imported %d message(s) off the air from %s' % (n, log_path))
     return n
