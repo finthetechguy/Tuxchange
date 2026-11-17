@@ -808,7 +808,7 @@ class Control:
             r.enabled = not r.enabled
             return {'ok': True, 'enabled': r.enabled}
         if cmd == 'stop':
-            r.running = False
+            r.request_stop('stop command')
             return {'ok': True, 'stopping': True}
         if cmd == 'store':
             return {'ok': True, 'store': r.describe_store()}
@@ -1091,6 +1091,10 @@ class Control:
             self.thread.join(timeout=2.0)
 
 
+# systemd allows TimeoutStopSec=30 before SIGKILL; these keep a stop well inside it.
+STOP_GRACE = 8.0             # how long an exchange already under way may run on
+STOP_DEADLINE = 20.0         # from the stop request to the end of cleanup
+
 MAX_REQUEST = 1 << 20          # a plugin's body is up to 0x18000 B, ~131 kB as base64
 REQUEST_TIMEOUT = 5.0
 
@@ -1210,6 +1214,7 @@ class Relay:
                              retry=getattr(args, 'retry', 60.0))
         self.enabled = not args.start_paused
         self.running = True
+        self.stop_at = self.stop_reason = None
         self.started = time.time()
         self.exchanges = 0
         self.last_peer = None
@@ -1693,6 +1698,7 @@ class Relay:
         if held:
             link.services = [(t,) + known.get(t, (0x30, b'')) for t in held]
         link.peer_hook = self.peer_hook
+        link.stop_check = self.stop_check
         try:
             rc = link.run()
         except Exception as e:
@@ -1766,6 +1772,58 @@ class Relay:
                  % (peer, self.book.retry))
         return False
 
+    def request_stop(self, why):
+        """Ask the main loop to wind down. Safe from a signal handler: it only sets fields."""
+        if self.stop_at is None:
+            self.stop_at, self.stop_reason = time.monotonic(), why
+        self.running = False
+
+    def stop_check(self, link):
+        """The safe point for ending a pass: no console engaged, or the grace period is up."""
+        if self.running:
+            return False
+        if link.t_engaged is None:
+            return True
+        if time.monotonic() - self.stop_at >= STOP_GRACE:
+            self.log('  stopping: abandoning the exchange in flight after %.0f s' % STOP_GRACE)
+            return True
+        return False
+
+    def nap(self, seconds):
+        end = time.monotonic() + seconds
+        while self.running:
+            left = end - time.monotonic()
+            if left <= 0:
+                return
+            time.sleep(min(left, 0.2))
+
+    def install_signals(self):
+        """SIGTERM (systemd stop) and SIGINT both request the same orderly shutdown."""
+        if threading.current_thread() is not threading.main_thread():
+            return {}
+        handler = lambda n, _f: self.request_stop(signal.Signals(n).name)
+        return {sig: signal.signal(sig, handler) for sig in (signal.SIGTERM, signal.SIGINT)}
+
+    def shut_down(self, ctl):
+        """Run once, when the main loop ends. Every step runs even if an earlier one fails, and
+        the whole of it finishes within STOP_DEADLINE of the stop request."""
+        deadline = (self.stop_at or time.monotonic()) + STOP_DEADLINE
+        sd_notify('STOPPING=1')
+        if self.stop_reason:
+            self.log('stopping (%s)' % self.stop_reason)
+        steps = (('control socket', ctl.shutdown),
+                 ('peer book', self.book.save),
+                 ('stop hook', lambda: self.hooks.fire('stop', exchanges=self.exchanges,
+                                                       passes=self.passes)))
+        for what, fn in steps:
+            try:
+                fn()
+            except Exception as e:
+                self.log('  shutdown: %s failed: %s: %s' % (what, type(e).__name__, e))
+        self.log('relay down after %d exchange(s) in %d pass(es)'
+                 % (self.exchanges, self.passes))
+        self.hooks.close(wait=max(1.0, deadline - time.monotonic()))
+
     def tick(self, *_a):
         """Called from inside the sniffing loop: the daemon is alive and the radio is turning."""
         now = time.time()
@@ -1790,6 +1848,7 @@ class Relay:
                 pass
 
     def run(self):
+        prev_handlers = self.install_signals()
         # Held for the daemon's whole life: offline tools refuse or come through the socket.
         self.store.claim()
         sock = control_socket_path(self.a.store)
@@ -1835,7 +1894,7 @@ class Relay:
                 self.tick()
                 if not self.enabled:
                     sd_notify('STATUS=paused')
-                    time.sleep(0.5)
+                    self.nap(0.5)
                     continue
                 if self.iface_failures >= self.a.max_iface_failures:
                     self.log('  %s has been unusable for %d passes; exiting so the service '
@@ -1848,7 +1907,7 @@ class Relay:
                 if gap > 0:
                     # Independent of MAC, so a rotating peer cannot evade it.
                     sd_notify('STATUS=holding %.0fs after the last exchange' % gap)
-                    time.sleep(min(gap, 1.0))
+                    self.nap(min(gap, 1.0))
                     continue
                 sd_notify('STATUS=listening (%d exchange(s), %d message(s) servable)'
                           % (self.exchanges, n_serve))
@@ -1856,17 +1915,13 @@ class Relay:
                 self.one_pass()
                 self.prune_runs()
                 n_serve = len(self.servable())
-                time.sleep(self.a.idle)
+                self.nap(self.a.idle)
         except KeyboardInterrupt:
-            self.log('interrupted')
+            self.request_stop('interrupted')
         finally:
-            sd_notify('STOPPING=1')
-            ctl.shutdown()
-            self.book.save()
-            self.log('relay down after %d exchange(s) in %d pass(es)'
-                     % (self.exchanges, self.passes))
-            self.hooks.fire('stop', exchanges=self.exchanges, passes=self.passes)
-            self.hooks.close()
+            self.shut_down(ctl)
+            for sig, h in prev_handlers.items():
+                signal.signal(sig, h)
         return rc_exit
 
 
@@ -1899,6 +1954,53 @@ def _scan_code_for_machine_kill(path):
             kept.append(tok.string)
     code = ' '.join(kept).lower()
     return [w for w in ('sysrq', 'reboot', 'poweroff', 'systemd-run') if w in code]
+
+
+def _sigterm_selftest(chk, tmp, user):
+    """A paused relay with no radio, stopped the way systemd stops it."""
+    hd, out = os.path.join(tmp, 'hooks-term'), os.path.join(tmp, 'hooks-term.out')
+    os.makedirs(hd, mode=0o755)
+    for ev in ('start', 'stop'):
+        with open(os.path.join(hd, ev), 'w') as f:
+            f.write('#!/bin/sh\necho %s >> %s\n' % (ev, out))
+        os.chmod(os.path.join(hd, ev), 0o755)
+    nsock = os.path.join(tmp, 'notify')
+    bus = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+    bus.bind(nsock)
+    bus.setblocking(False)
+    store = os.path.join(tmp, 'term-store')
+    p = subprocess.Popen([sys.executable, os.path.abspath(__file__), 'run', '--store', store,
+                          '--iface', 'sim', '--start-paused', '--hooks-dir', hd,
+                          '--control-user', user, '--verbose', '0'],
+                         env=dict(os.environ, NOTIFY_SOCKET=nsock),
+                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    try:
+        end = time.time() + 20
+        while time.time() < end and not (os.path.exists(out) and 'start' in open(out).read()):
+            time.sleep(0.1)
+        chk('the relay came up and fired its start hook',
+            os.path.exists(out) and 'start' in open(out).read())
+        t0 = time.time()
+        p.send_signal(signal.SIGTERM)
+        rc = p.wait(STOP_DEADLINE + 5)
+    except subprocess.TimeoutExpired:
+        p.kill(); p.wait()
+        rc = None
+    log = p.stdout.read().decode('utf-8', 'replace')
+    notes = []
+    while True:
+        try:
+            notes.append(bus.recv(4096).decode())
+        except OSError:
+            break
+    bus.close()
+    chk('SIGTERM ends it cleanly and promptly', rc == 0 and time.time() - t0 < 5, (rc, log[-500:]))
+    chk('it fires the stop hook', os.path.exists(out) and open(out).read().split() == ['start', 'stop'],
+        open(out).read() if os.path.exists(out) else '-')
+    chk('it tells systemd it is stopping', 'STOPPING=1' in notes, notes)
+    chk('it saves the peer book and removes its control socket',
+        os.path.exists(os.path.join(store, STATE_FILE))
+        and not os.path.exists(control_socket_path(store)))
 
 
 def _import_selftest(chk, ctl, tmp):
@@ -2573,6 +2675,15 @@ def _selftest():
         chk('status lists the events that have a runnable script',
             sr.status()['hooks']['events'] == ['exchange', 'rotate'], sr.status()['hooks'])
         sr.hooks = HookRunner(None, None, 10, lambda m: None)
+        _sigterm_selftest(chk, tmp, me)
+        rs = Relay(argparse.Namespace(**{**vars(args), 'store': os.path.join(tmp, 'stopping')}))
+        busy = argparse.Namespace(t_engaged=time.time())
+        chk('a running relay never ends a pass early', not rs.stop_check(busy))
+        rs.request_stop('test')
+        chk('a stop ends an idle pass at once', rs.stop_check(argparse.Namespace(t_engaged=None)))
+        chk('but lets an exchange under way run on', not rs.stop_check(busy))
+        rs.stop_at -= STOP_GRACE
+        chk('until the grace period is up', rs.stop_check(busy))
         chk('the store stays put until something sets it', sr.status()['store_next'] == sr.a.store)
         mine = os.path.join(tmp, 'mine'); os.makedirs(mine); os.chmod(mine, 0o755)
         for bad, why in ((mine, 'not owned by root' if os.getuid() else None),

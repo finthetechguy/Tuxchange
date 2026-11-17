@@ -212,6 +212,8 @@ class Link:
         self.advert = None
         # Liveness signal: if the radio wedges this stops, and the watchdog restarts the service.
         self.tick_hook = None
+        # stop_check(link) -> True ends the pass early; it is asked once per loop turn.
+        self.stop_check = None
         self.sightings = {}          # mac -> {'n','first','last','token','rssi'}
         # A console refusing our MAC sends no probe, so this separates refused from absent.
         self.on_air = {}
@@ -844,6 +846,9 @@ class Link:
             while time.time() < deadline and self.state != self.DONE:
                 if self.tick_hook is not None:
                     self.tick_hook(self)
+                if self.stop_check is not None and self.stop_check(self):
+                    self.log('  pass ended early: stopping')
+                    break
                 if self.state in (self.IDLE,) and time.time() >= nxt:
                     self.send(sp_parse.build_probe(self.src, self.token, self.services,
                                                    seq=self.next_seq()),
