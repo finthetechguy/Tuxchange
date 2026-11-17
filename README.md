@@ -103,7 +103,9 @@ sudo systemctl start tuxchange
 journalctl -u tuxchange -f              # check the logs to see if it's working
 ```
 
-Re-run the installer after updating the source, as the daemon runs in `/opt/tuxchange`.
+Re-run the installer after updating the source, as the daemon runs from a copy in
+`/opt/tuxchange`, then `sudo systemctl restart tuxchange`. A running daemon keeps the copy it
+started from until that restart, and a failed install leaves the previous copy in use.
 
 To watch it in a terminal instead, `sudo ./scripts/tuxchange` runs the daemon in the
 foreground.
