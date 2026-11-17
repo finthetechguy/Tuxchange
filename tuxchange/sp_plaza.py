@@ -368,7 +368,7 @@ def _selftest():
     old_mii = sp_build.build_cfl(mii_name='Relay', author_name='Tuxchange',
                                  mii_id=ident['mii_id'], creator_mac=ident['creator_mac'],
                                  face_shape=ident['face_shape'], gender=ident['gender'])
-    old = sp_build.build_body(old_mii, greeting='Hello from Linux', profile=sp_build.build_profile(
+    old = sp_build.build_body(old_mii, greeting='Hello, world!', profile=sp_build.build_profile(
         hat=ident['hat'], dream=ident['dream'], hobby=ident['hobby']))
     new = build_body(v)
     chk('the default body is byte-identical to the one sp_build always built',
@@ -420,7 +420,7 @@ def _selftest():
     msg = sp_build.build_message(new, message_id=1, when=time.gmtime(0))
     _h, _ex, mb = sp_cec.split_message(msg)
     chk('a body read back out of a full message parses', parse_body(mb)['greeting']
-        == 'Hello from Linux')
+        == 'Hello, world!')
     chk('its HMAC is the Plaza key\'s', msg[-0x20:] == hmac.new(
         sp_build.plaza_hmac_key(), mb, hashlib.sha256).digest())
 

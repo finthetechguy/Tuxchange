@@ -2297,11 +2297,27 @@ def _selftest():
         mine = os.path.join(tmp, 'mine'); os.makedirs(mine); os.chmod(mine, 0o755)
         for bad, why in ((mine, 'not owned by root' if os.getuid() else None),
                          ('relative/path', 'absolute'), (os.path.join(tmp, 'nope'), 'directory'),
-                         ('/tmp', 'other than root'), (None, 'absolute')):
+                         (None, 'absolute')):
             if why:
                 rep = sc.handle({'cmd': 'set_store', 'path': bad})
                 chk('a store at %r is refused (%s)' % (bad, why),
                     not rep['ok'] and why in rep['error'], rep)
+        # A world-writable, root-owned directory (as /tmp is on most hosts). The ownership is
+        # faked so this does not depend on who owns /tmp, or the temp dir, on the machine running.
+        wr = os.path.join(tmp, 'sticky'); os.makedirs(wr); os.chmod(wr, 0o777)
+        real_stat = os.stat
+        def as_root(path, *a, **k):
+            st = real_stat(path, *a, **k)
+            fields = list(st)
+            fields[4] = 0
+            return os.stat_result(fields)
+        os.stat = as_root
+        try:
+            why = store_problem(wr)
+        finally:
+            os.stat = real_stat
+        chk('a root-owned directory others can write to is refused',
+            why is not None and 'other than root' in why, why)
         chk('and a refused store is not saved', 'SP_STORE' not in read_env_file(envp))
         if os.getuid() == 0:
             rep = sc.handle({'cmd': 'set_store', 'path': '/'})

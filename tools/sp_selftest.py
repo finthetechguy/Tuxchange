@@ -40,7 +40,7 @@ def build_plaza_message(greeting="hello streetpass", country="United Kingdom",
     for i in range(16):
         c = f"{country}".encode('utf-16-le')[:0x3E]
         body[0x3760 + i * 0x40: 0x3760 + i * 0x40 + len(c)] = c
-    body[0x3F66] = 0x4B; body[0x3F67] = 2
+    body[0x3F66] = 0x4A; body[0x3F67] = 2
     body[0x4482] = 0x64; body[0x45D2] = 3
 
     ex = [(4, info_text.encode('utf-16-le') + b'\0\0')]

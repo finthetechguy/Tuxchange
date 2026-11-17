@@ -1651,18 +1651,48 @@ def selftest():
     chk('is_console accepts both console OUIs and rejects an AP',
         T.is_console('96:58:cb:aa:bb:cc') and T.is_console('ba:ae:6e:dd:ee:ff')
         and not T.is_console('00:00:5e:00:53:02'))
-    src = inspect.getsource(Link.verdict)
+    class _V:
+        """The least of a Link that verdict() and heartbeat() read, so their output is observable."""
+        STATE_NAME = Link.STATE_NAME
+        IDLE, SYNSENT = Link.IDLE, Link.SYNSENT
+        verdict, heartbeat, banner = Link.verdict, Link.heartbeat, Link.banner
+
+        def __init__(self, on_air=None):
+            self.lines = []
+            self.sightings = {}
+            self.on_air = on_air or {}
+            self.max_state = self.state = self.IDLE
+            self.attempts = self.rx_total = self.echoes = self.protected_seen = 0
+            self.declined = self.session = self.peer = self.pcap = self.decrypted = None
+            self.sent = {}
+            self.outbox = []
+            self.t0 = time.time() - 30
+            self.last_heartbeat = 0
+            self.a = type('A', (), {'heartbeat': 0, 'log': None, 'pcap': None})()
+
+        def log(self, m):
+            self.lines.append(m)
+
+    def said(v):
+        return '\n'.join(v.lines)
+
+    quiet = _V()
+    quiet.verdict({}, {}, 'none')
+    chk('with nothing heard, the verdict reports NONE for probes and for on-air frames',
+        'console probes heard   : NONE' in said(quiet)
+        and 'console OUI on air     : NONE' in said(quiet), said(quiet))
     chk('the verdict no longer claims absence from probe requests alone',
-        'NO CONSOLE WAS TRANSMITTING AT ALL' not in src)
-    chk('the absent branch requires BOTH counters to be empty',
-        'not self.sightings and not self.on_air' in src)
+        'NO CONSOLE WAS TRANSMITTING AT ALL' not in said(quiet))
+    chk('and with both counters empty it still points at the channel and StreetPass setting',
+        'No frames from a console on this channel' in said(quiet))
+    air = _V({'96:58:cb:aa:bb:cc': {'n': 3, 'first': 0, 'last': 4}})
+    air.verdict({}, {}, 'none')
     chk('there is a branch for on-air-but-never-engaged',
-        'not self.sightings and self.on_air' in src)
-    chk('the NONE probes line says it is not evidence of absence',
-        'not evidence of absence' in src)
-    hb = inspect.getsource(Link.heartbeat)
+        'A console OUI was on air but never engaged' in said(air)
+        and 'No frames from a console on this channel' not in said(air), said(air))
+    air.heartbeat()
     chk('the live heartbeat reports on-air frames when there are no probes',
-        'self.on_air' in hb and 'not engaging us' in hb)
+        any('3 frame(s) from 96:58:cb:aa:bb:cc' in m for m in air.lines), air.lines[-1])
     rx = inspect.getsource(Link.pump)
     chk('the receive loop feeds note_on_air only for non-probe console frames',
         'elif is_console_frame:' in rx and 'self.note_on_air(' in rx)
