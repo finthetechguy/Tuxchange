@@ -13,7 +13,7 @@ PY="$ROOT/.venv/bin/python"
 [ -x "$PY" ] || PY=python3
 
 # --store may be given in the passthrough arguments; find it so the identity matches the store.
-STORE=relay_store
+STORE=${SP_STORE:-relay_store}
 prev=""
 for arg in "$@"; do
   [ "$prev" = "--store" ] && STORE=$arg

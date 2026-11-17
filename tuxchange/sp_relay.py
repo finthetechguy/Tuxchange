@@ -3307,7 +3307,7 @@ def main():
                         '(`create --list`, `create <plugin> --info`)')
 
     run = sub.add_parser('run', help='the daemon')
-    run.add_argument('--store', default='relay_store')
+    run.add_argument('--store', default=sp_store.default_store())
     run.add_argument('--iface', default='mon0')
     run.add_argument('--channel', default='1,6,11')
     run.add_argument('--window', type=float, default=180.0,
@@ -3386,7 +3386,7 @@ def main():
 
     imp = sub.add_parser('import', help='ingest CEC data into the store')
     imp.add_argument('path', help='a save image, a mounted dump, or an emulator NAND directory')
-    imp.add_argument('--store', default='relay_store')
+    imp.add_argument('--store', default=sp_store.default_store())
     imp.add_argument('--from-log', action='store_true', help='an sp_link run log instead')
     imp.add_argument('--replace', action='store_true',
                      help='make this the only data the relay serves, in place of the current '
@@ -3399,7 +3399,7 @@ def main():
     exp.add_argument('dest', nargs='?',
                      help='a CEC folder or an emulator user folder (default: the one installed '
                           'emulator found); with --raw, any folder')
-    exp.add_argument('--store', default='relay_store')
+    exp.add_argument('--store', default=sp_store.default_store())
     exp.add_argument('--title', action='append', metavar='TITLE',
                      help='only this CEC title, 8 hex digits; may be repeated')
     exp.add_argument('--raw', action='store_true',
@@ -3412,7 +3412,7 @@ def main():
     exp.add_argument('--force', action='store_true', help='even while an emulator is running')
 
     st = sub.add_parser('status', help='print the store, or the running daemon if there is one')
-    st.add_argument('--store', default='relay_store')
+    st.add_argument('--store', default=sp_store.default_store())
 
     ct = sub.add_parser('ctl', help='talk to a running daemon')
     ct.add_argument('command', choices=['status', 'pause', 'resume', 'toggle', 'stop', 'import',
@@ -3420,7 +3420,7 @@ def main():
                                         'log', 'block', 'unblock', 'unfilter', 'title_remove',
                                         'message_remove', 'rotate', 'set_adapter', 'set_logs',
                                         'set_store'])
-    ct.add_argument('--store', default='relay_store')
+    ct.add_argument('--store', default=sp_store.default_store())
     ct.add_argument('--path', help='for `ctl import`: what to ingest')
     ct.add_argument('--replace', action='store_true',
                     help='for `ctl import`: replace the outbox; for `ctl seed`: replace the '
@@ -3445,7 +3445,7 @@ def main():
     ct.add_argument('--mii-name'); ct.add_argument('--author-name'); ct.add_argument('--greeting')
 
     idp = sub.add_parser('identity', help='print the fixed identity for this store')
-    idp.add_argument('--store', default='relay_store')
+    idp.add_argument('--store', default=sp_store.default_store())
 
     sub.add_parser('selftest')
     a = ap.parse_args()

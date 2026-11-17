@@ -10,13 +10,8 @@ from gi.repository import Gtk, Adw, GLib, Gio, Gdk        # noqa: E402
 sys.path.insert(0, os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'tuxchange'))
 import sp_relay                                            # noqa: E402
+import sp_store                                            # noqa: E402
 import sp_plugin_gui                                       # noqa: E402
-
-def default_store():
-    """Where the store lives when nobody says otherwise: $XDG_DATA_HOME/tuxchange/store."""
-    base = os.environ.get('XDG_DATA_HOME') or os.path.join(os.path.expanduser('~'), '.local', 'share')
-    return os.path.join(base, 'tuxchange', 'store')
-
 
 APP_ID = 'org.tuxchange.Tuxchange'
 UNIT = 'tuxchange.service'
@@ -1120,7 +1115,7 @@ class RelayApp(Adw.Application):
 
 def main():
     ap = argparse.ArgumentParser(description='GTK front end for Tuxchange.')
-    ap.add_argument('--store', default=default_store())
+    ap.add_argument('--store', default=sp_store.default_store())
     ap.add_argument('--blocklist', action='store_true')
     a = ap.parse_args()
     Adw.init()

@@ -14,16 +14,7 @@ it in the outbox, so it is served from the next exchange.
 import os, sys, json, base64, argparse
 
 import sp_plugin as P
-
-
-INSTALLED_STORE = '/var/lib/tuxchange'      # where install/install.sh puts the service's store
-
-
-def default_store():
-    """./relay_store when there is one (a checkout), else the installed service's store."""
-    if not os.path.isdir('relay_store') and os.path.isdir(INSTALLED_STORE):
-        return INSTALLED_STORE
-    return 'relay_store'
+import sp_store
 
 
 def daemon_call(store, cmd, **kw):
@@ -121,8 +112,8 @@ def make_parser(plugin):
                                  description='Make a %s message. --info lists every field.'
                                              % plugin.game)
     ap.add_argument('--store', default=None,
-                    help='the daemon\'s store (default: ./relay_store if present, else %s)'
-                         % INSTALLED_STORE)
+                    help='the daemon\'s store (default: $SP_STORE, else relay_store in this '
+                         'checkout if present, else %s)' % sp_store.INSTALLED_STORE)
     ap.add_argument('--info', action='store_true', help='describe the plugin and its fields')
     ap.add_argument('--edit', action='store_true',
                     help="start from the message already in the daemon's outbox")
@@ -193,7 +184,7 @@ def confirm(question):
 def run(plugin, argv, out=print):
     a = make_parser(plugin).parse_args(argv)
     if a.store is None:
-        a.store = default_store()
+        a.store = sp_store.default_store()
     if a.info:
         describe(plugin, out)
         return 0

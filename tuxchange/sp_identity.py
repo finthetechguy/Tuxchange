@@ -249,7 +249,7 @@ def main():
     sub = ap.add_subparsers(dest='cmd')
     for name in ('show', 'build', 'seed'):
         p = sub.add_parser(name)
-        p.add_argument('--store', default='relay_store')
+        p.add_argument('--store', default=sp_store.default_store())
         if name != 'show':
             p.add_argument('--mii-name', default='Relay')
             p.add_argument('--author-name', default='Tuxchange')

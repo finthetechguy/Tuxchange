@@ -12,6 +12,20 @@ QUARANTINE_DIR = 'quarantine'
 TMP_SUFFIX = '.tmp'
 MBOXLIST_HDR, MBOXLIST_ENTRY, MBOXLIST_MAX = 12, 16, 24
 BOXES = {'inbox': 'InBox___', 'outbox': 'OutBox__'}
+INSTALLED_STORE = '/var/lib/tuxchange'      # where install/install.sh puts the service's store
+CHECKOUT_STORE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                              'relay_store')
+
+
+def default_store():
+    """The store every tool uses when not given one, matching scripts/sp_monitor.sh:
+    $SP_STORE, else relay_store in this checkout, else the installed service's store."""
+    env = os.environ.get('SP_STORE')
+    if env:
+        return env
+    if not os.path.isdir(CHECKOUT_STORE) and os.path.isdir(INSTALLED_STORE):
+        return INSTALLED_STORE
+    return CHECKOUT_STORE
 DEFAULT_MAX_BYTES, DEFAULT_MAX_MESSAGES = 0x100000, 24
 
 
@@ -588,6 +602,19 @@ def _selftest():
     try:
         def mode(p):
             return stat.S_IMODE(os.stat(p).st_mode)
+
+        saved = os.environ.pop('SP_STORE', None)
+        try:
+            here = default_store()
+            chk('the default store does not depend on the working directory',
+                os.path.isabs(here) and here in (CHECKOUT_STORE, INSTALLED_STORE), here)
+            os.environ['SP_STORE'] = os.path.join(tmp, 'from-env')
+            chk('and $SP_STORE overrides it, as it does for the shell scripts',
+                default_store() == os.path.join(tmp, 'from-env'))
+        finally:
+            os.environ.pop('SP_STORE', None)
+            if saved is not None:
+                os.environ['SP_STORE'] = saved
 
         p0 = Store(os.path.join(tmp, 'private'))
         p0.add_title(0x00020800, name='Mii Plaza', hmac_key=b'k' * 32)
