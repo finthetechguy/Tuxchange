@@ -61,6 +61,7 @@ jobs:
           python tuxchange/sp_plaza.py || rc=1
           python tuxchange/sp_create.py --selftest || rc=1
           python tools/macfilter_decode.py --selftest || rc=1
+          python tools/lp_extract_keys.py --selftest || rc=1
           exit $rc
 
       - name: Installer against a fake root

@@ -2,6 +2,7 @@
 """Write tuxchange.keys by reading constants out of your own console dumps."""
 import argparse
 import os
+import stat
 import string
 import sys
 
@@ -9,6 +10,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(os.path.dirname(HERE), 'tuxchange'))
 
 import lp_keys as keys                                              # noqa: E402
+import sp_store                                                     # noqa: E402
 
 # The development key is a generic string that marks where the retail key sits.
 DEV_NEEDLE = (string.digits + 'abcdef').encode('ascii') + b'\x00'
@@ -99,6 +101,14 @@ def render(values):
     return '\n'.join(lines) + '\n'
 
 
+def write_keys(out, text):
+    """Replace `out` with a file only its owner can read, whatever was there before."""
+    d = os.path.dirname(out)
+    if d:
+        os.makedirs(d, mode=0o700, exist_ok=True)
+    sp_store.write_atomic(out, text.encode(), 0o600, durable=True)
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(
         description='Write tuxchange.keys from your own console dumps.',
@@ -144,15 +154,59 @@ def main(argv=None):
         'tuxchange', keys.CONSTANTS_FILE)
     if os.path.exists(out) and not a.force and not existing:
         raise SystemExit('error: %s exists; pass --force to overwrite' % out)
-    os.makedirs(os.path.dirname(out), exist_ok=True)
-    fd = os.open(out, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, 'w') as fh:
-        fh.write(text)
-    print('\nwrote %d value(s) to %s (mode 0600)' % (len(merged), out))
+    write_keys(out, text)
+    print('\nwrote %d value(s) to %s (mode %04o)'
+          % (len(merged), out, stat.S_IMODE(os.stat(out).st_mode)))
     ok, report = keys.status()
     print('\n'.join(report))
     return 0 if ok else 1
 
 
+def _selftest():
+    import tempfile, shutil
+    ok = tot = 0
+
+    def chk(n, c, g=''):
+        nonlocal ok, tot
+        tot += 1; ok += bool(c)
+        print('  [%s] %s%s' % ('PASS' if c else 'FAIL', n, ('  %s' % (g,)) if g else ''))
+
+    tmp, cwd = tempfile.mkdtemp(), os.getcwd()
+    try:
+        out = os.path.join(tmp, keys.CONSTANTS_FILE)
+        with open(out, 'w') as fh:
+            fh.write('old\n')
+        os.chmod(out, 0o644)
+        write_keys(out, 'new\n')
+        chk('an existing world-readable keys file ends up private',
+            stat.S_IMODE(os.stat(out).st_mode) == 0o600, oct(os.stat(out).st_mode))
+        chk('and holds the new contents', open(out).read() == 'new\n')
+        os.chdir(tmp)
+        write_keys(keys.CONSTANTS_FILE, 'bare\n')
+        chk('a bare file name writes into the current directory',
+            open(out).read() == 'bare\n')
+        real = sp_store.os.fsync
+        sp_store.os.fsync = lambda fd: (_ for _ in ()).throw(OSError(28, 'No space left'))
+        try:
+            write_keys(out, 'lost\n')
+            failed = False
+        except OSError:
+            failed = True
+        finally:
+            sp_store.os.fsync = real
+        chk('a failed write leaves the old keys file as it was',
+            failed and open(out).read() == 'bare\n' and os.listdir(tmp) == [keys.CONSTANTS_FILE])
+        write_keys(os.path.join(tmp, 'sub', 'dir', keys.CONSTANTS_FILE), 'x\n')
+        chk('a missing directory is created private',
+            stat.S_IMODE(os.stat(os.path.join(tmp, 'sub', 'dir')).st_mode) == 0o700)
+    finally:
+        os.chdir(cwd)
+        shutil.rmtree(tmp, ignore_errors=True)
+    print('\n%d/%d checks passed' % (ok, tot))
+    return 0 if ok == tot else 1
+
+
 if __name__ == '__main__':
+    if sys.argv[1:] == ['--selftest']:
+        sys.exit(_selftest())
     sys.exit(main())
