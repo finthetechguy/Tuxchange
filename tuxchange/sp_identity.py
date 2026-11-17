@@ -101,7 +101,8 @@ def _selftest():
     import tempfile, shutil
     ok = tot = 0
     import lp_keys as _k
-    if _k.selftest_keys():
+    throwaway = _k.selftest_keys()
+    if throwaway:
         print('  (no console keys found, so running on generated throwaway keys)')
 
     def chk(n, c, g=''):
@@ -206,18 +207,30 @@ def _selftest():
         if os.path.exists(dump):
             st2 = sp_store.Store(os.path.join(tmp, 'mixed'))
             sp_relay.import_into(st2, dump, log=lambda m: None)
-            seed(st2, os.path.join(tmp, 'mixed'), replace=True, log=lambda m: None)
-            serv = sp_relay.select_for_peer(st2, st2.titles())
-            titles = {sp_cec.parse_header(x)['cec_title_id'] for x in serv}
-            chk('an authored Mii and imported titles are served together',
-                sp_build.PLAZA_TITLE in titles and len(titles) > 1,
-                ['%08X' % t for t in sorted(titles)])
-            plaza = [x for x in serv
-                     if sp_cec.parse_header(x)['cec_title_id'] == sp_build.PLAZA_TITLE]
-            chk('and the plaza message served is OURS, not the console\'s',
-                len(plaza) == 1
-                and st2.origin(plaza[0], 'outbox')['source'].startswith('authored:'),
-                st2.origin(plaza[0], 'outbox'))
+            if throwaway:
+                held = st2.messages(sp_build.PLAZA_TITLE, 'outbox')
+                try:
+                    seed(st2, os.path.join(tmp, 'mixed'), replace=True, log=lambda m: None)
+                    refused = False
+                except sp_store.KeyConflict:
+                    refused = True
+                chk('seeding under a Plaza key other than the console\'s is refused',
+                    refused and st2.messages(sp_build.PLAZA_TITLE, 'outbox') == held)
+                print('  [SKIP] serving an authored Mii beside imported titles: it needs the '
+                      'real Plaza key')
+            else:
+                seed(st2, os.path.join(tmp, 'mixed'), replace=True, log=lambda m: None)
+                serv = sp_relay.select_for_peer(st2, st2.titles())
+                titles = {sp_cec.parse_header(x)['cec_title_id'] for x in serv}
+                chk('an authored Mii and imported titles are served together',
+                    sp_build.PLAZA_TITLE in titles and len(titles) > 1,
+                    ['%08X' % t for t in sorted(titles)])
+                plaza = [x for x in serv
+                         if sp_cec.parse_header(x)['cec_title_id'] == sp_build.PLAZA_TITLE]
+                chk('and the plaza message served is OURS, not the console\'s',
+                    len(plaza) == 1
+                    and st2.origin(plaza[0], 'outbox')['source'].startswith('authored:'),
+                    st2.origin(plaza[0], 'outbox'))
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     print('\n%d/%d checks passed' % (ok, tot))
@@ -274,7 +287,11 @@ def main():
     except sp_store.StoreBusy as e:
         print('%s; use `sp_relay.py ctl seed` to seed it through the daemon' % e)
         return 1
-    seed(st, a.store, replace=a.replace, **kw)
+    try:
+        seed(st, a.store, replace=a.replace, **kw)
+    except sp_store.KeyConflict as e:
+        print('%s; the Plaza key in tuxchange.keys does not match this store' % e)
+        return 1
     print()
     print(st.summary())
     return 0
