@@ -106,6 +106,8 @@ class YYSession:
         self.repeat_worked = False
         self.peer_fin = False
         self.verdict_hold = VERDICT_HOLD
+        # The titles the peer's 0x34 admitted and refused.
+        self.admitted = self.refused = None
         self.send_at = None             # deferred start_send(), driven by poll()
         self.stats = {'sent_objects': 0, 'recv_objects': 0, 'tx_frames': 0, 'rx_frames': 0,
                       'resends': 0, 'dup_tails': 0, 'syn_resends': 0, 'gaps': 0,

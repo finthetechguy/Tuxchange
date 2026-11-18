@@ -442,6 +442,8 @@ class Link:
                             self.EE_CODE.get(code, '?')))
                 if otype == 0x34 and code == 2:
                     self.log('  *** the console REFUSED title %08X.' % tid)
+        if otype == 0x34:
+            self.apply_title_verdict(obj, sess)
         if otype == 0x32 and len(ee) >= 0x2C and ee[0:2] == b'ee':
             offered = [struct.unpack_from('<I', ee, 0x2C + i * 0x20)[0]
                        for i in range(min(struct.unpack_from('<I', ee, 8)[0],
@@ -470,6 +472,29 @@ class Link:
                     self.log('  OUR object 0x33 AS SENT entry %d: title %08X send_mode=%d '
                              'flags=%d size=%#x  code=%d (%s)'
                              % (i, tid, mode, hf, size, code, self.EE_CODE.get(code, '?')))
+
+    def apply_title_verdict(self, verdict, sess):
+        """Send only what the console's 0x34 admitted: our 0x81 and the envelopes, together."""
+        i81 = object_index(sess.outbox, 0x81)
+        if i81 is None:
+            return
+        old = sess.outbox[i81]
+        if i81 < sess.idx_tx or (sess.role == 'send' and sess.tx_obj is old):
+            self.log('  the verdict came after our 0x81 went out; the list stands as sent')
+            return
+        try:
+            new, admitted, refused = sp_build.apply_verdict(sess.outbox, verdict)
+        except ValueError as e:
+            self.log('  could not apply the verdict (%s); sending the list unchanged' % e)
+            return
+        sess.outbox[:] = new
+        sess.admitted, sess.refused = admitted, refused
+        if sess.repeat_obj is old:
+            sess.repeat_obj = new[i81]
+        self.outbox = list(new)
+        self.log('  verdict applied: sending %d title(s) %s, withholding %d refused %s'
+                 % (len(admitted), ['%08X' % t for t in admitted],
+                    len(refused), ['%08X' % t for t in refused]))
 
     def decline_peer(self, mac):
         """Serve this console nothing for the rest of the pass, and stop its handshake now."""
@@ -1756,10 +1781,95 @@ def selftest():
         'elif is_console_frame:' in rx and 'self.note_on_air(' in rx)
 
     attempt_checks(chk)
+    title_verdict_checks(chk)
 
     print('\n%d/%d checks passed%s' % (ok, tot,
           '' if not skipped else ', %d skipped (no test corpus)' % skipped))
     return 0 if ok == tot else 1
+
+
+def title_verdict_checks(chk):
+    """The console's 0x34 cuts our 0x81 and payloads before they go, through a live session."""
+    T1, T2, T3 = 0x00020800, 0x00030600, 0x0008C500
+
+    def msg(tid, n=1):
+        return sp_build.envelope([sp_build.unwrap(sp_build.build_envelope(
+            bytes(0x40 + 4 * i), tid, key=b'k' * 32))[0] for i in range(n)])
+
+    def verdict(codes):
+        ee = bytearray(sp_build.build_ee_list([(t, 3, 0x100, 1) for t, _c in codes]))
+        for i, (_t, c) in enumerate(codes):
+            struct.pack_into('<H', ee, 0x2C + i * 0x20 + 6, c)
+        return sp_build.cec_object(0x34, bytes(ee))
+
+    class _L:
+        EE_CODE = Link.EE_CODE
+        on_object_received = Link.on_object_received
+        apply_title_verdict = Link.apply_title_verdict
+
+        def __init__(self, outbox):
+            self.lines, self.services, self.outbox = [], [], list(outbox)
+            self.a = argparse.Namespace(mirror_offer=False)
+
+        def log(self, m, level=1):
+            self.lines.append(m)
+
+    def run(codes, at=None, repeat=False):
+        objs = sp_build.build_outbox([msg(T1), msg(T2, 2), msg(T3)])
+        L, sent = _L(objs), []
+        s = sp_yysession.YYSession(lambda f, sq, a, p=b'': (sent.append((f, sq, a, bytes(p))),
+                                                            True)[1],
+                                   L.log, objs, on_received=L.on_object_received)
+        i81 = object_index(objs, 0x81)
+        s.idx_tx = i81 - 1 if at is None else at
+        if repeat:
+            s.repeat_slot, s.repeat_obj, s.repeat_max = i81, objs[i81], 1
+        peer = [sp_build.cec_object(0x32, bytes(0x2C)), verdict(codes)]
+        for o in peer:
+            s.on_frame(sp_yy.parse(sp_yysession.build_yy_frame(sp_yy.SYN, 0, 0)))
+            s.on_frame(sp_yy.parse(sp_yysession.build_yy_frame(
+                sp_yy.ACK | sp_yy.PSH | sp_yy.URG, 0, 0, o)))
+            if s.role == 'send':
+                s.on_frame(sp_yy.parse(sp_yysession.build_yy_frame(sp_yy.SYN | sp_yy.ACK, 0, 0)))
+                s.on_frame(sp_yy.parse(sp_yysession.build_yy_frame(sp_yy.ACK, 0,
+                                                                   len(s.tx_obj))))
+                sent.clear()
+        return L, s, sent, objs, peer
+
+    L, s, sent, objs, peer = run([(T1, 2), (T2, 1), (T3, 1)])
+    i81 = object_index(objs, 0x81)
+    envs = [struct.unpack_from('<I', o, 8)[0] for o in s.outbox if o[:2] == b'aa']
+    chk('a mixed verdict leaves only the admitted envelopes queued', envs == [T2, T3],
+        ['%08X' % t for t in envs])
+    chk('the queued 0x81 lists those two titles',
+        struct.unpack_from('<I', s.outbox[i81], 0x10)[0] == 2)
+    chk('the session records what was admitted and refused',
+        s.admitted == [T2, T3] and s.refused == [T1], (s.admitted, s.refused))
+    chk('our 0x81 still waits out the post-verdict hold',
+        s.send_at is not None and not any(f == sp_yy.SYN for f, _s, _a, _p in sent))
+    chk('the inbound objects keep their own order', s.received == peer)
+    s.send_at -= 1.0
+    s.poll()
+    s.on_frame(sp_yy.parse(sp_yysession.build_yy_frame(sp_yy.SYN | sp_yy.ACK, 0, 0)))
+    wire = b''.join(p for f, _s, _a, p in sent if p)
+    chk('the 0x81 that goes on the air is the rebuilt one', wire == s.outbox[i81],
+        wire[:0x14].hex())
+    chk('the link\'s own list matches what the session sends', L.outbox == s.outbox)
+
+    _L2, s2, _sent2, _o2, _p2 = run([(T1, 2), (T2, 2), (T3, 2)])
+    chk('an all-refused verdict queues a zero-entry 0x81 and no payloads',
+        not any(o[:2] == b'aa' for o in s2.outbox)
+        and struct.unpack_from('<I', s2.outbox[i81], 0x10)[0] == 0
+        and s2.refused == [T1, T2, T3], len(s2.outbox))
+
+    L3, s3, _sent3, o3, _p3 = run([(T1, 2), (T2, 1), (T3, 1)], at=i81 + 1)
+    chk('a verdict after our 0x81 went out changes nothing',
+        s3.outbox == o3 and s3.admitted is None
+        and any('after our 0x81 went out' in m for m in L3.lines))
+
+    _L4, s4, _sent4, o4, _p4 = run([(T1, 2), (T2, 1), (T3, 1)], repeat=True)
+    chk('a repeated 0x81 repeats the rebuilt list, not the original',
+        s4.repeat_obj is s4.outbox[i81] and s4.repeat_obj != o4[i81])
 
 
 def attempt_checks(chk):

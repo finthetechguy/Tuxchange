@@ -280,6 +280,57 @@ def build_ee_list(entries):
     return bytes(r)
 
 
+def parse_ee_list(ee):
+    """-> [{'title', 'mode', 'flags', 'code', 'size'}] for each entry of an `ee` record."""
+    if len(ee) < 0x2C or ee[0:2] != b'ee':
+        raise ValueError('not an ee record')
+    count = struct.unpack_from('<I', ee, 8)[0]
+    out = []
+    for i in range(min(count, (len(ee) - 0x2C) // 0x20)):
+        o = 0x2C + i * 0x20
+        out.append({'title': struct.unpack_from('<I', ee, o)[0], 'mode': ee[o + 4],
+                    'flags': ee[o + 5], 'code': struct.unpack_from('<H', ee, o + 6)[0],
+                    'size': struct.unpack_from('<I', ee, o + 8)[0]})
+    return out
+
+
+VERDICT_ADMIT = 1
+
+
+def object_type(obj):
+    """The type of a 0x6363 object, or None for anything else (an envelope, say)."""
+    if len(obj) < 0x10 or obj[:2] != b'cc':
+        return None
+    return struct.unpack_from('<I', obj, 4)[0]
+
+
+def apply_verdict(objects, verdict):
+    """-> (objects, admitted, refused) with the 0x81 and the envelopes after it cut to the verdict."""
+    if object_type(verdict) != 0x34:
+        raise ValueError('not a 0x34 verdict')
+    entries = parse_ee_list(verdict[0x10:])
+    admitted = list(dict.fromkeys(e['title'] for e in entries if e['code'] == VERDICT_ADMIT))
+    i81 = next((i for i, o in enumerate(objects) if object_type(o) == 0x81), None)
+    if i81 is None:
+        raise ValueError('no 0x81 to rebuild')
+    head, tail = list(objects[:i81]), list(objects[i81 + 1:])
+    envs = {}
+    for o in tail:
+        if o[:2] == b'\x61\x61':
+            envs.setdefault(struct.unpack_from('<I', o, 0x08)[0], []).append(o)
+    refused = [t for t in envs if t not in admitted]
+    keep = [m for t in admitted for m in envs.get(t, [])]
+    o81 = bytearray(4 + O81_SLOTS * 8)
+    struct.pack_into('<I', o81, 0, len(keep))
+    for i, m in enumerate(keep):
+        struct.pack_into('<II', o81, 4 + i * 8, struct.unpack_from('<I', m, 0x08)[0],
+                         struct.unpack_from('<I', m, 0x04)[0])
+    rest = [o for o in tail if o[:2] != b'\x61\x61']
+    old = objects[i81]
+    return (head + [old[:0x10] + bytes(o81)] + keep + rest,
+            [t for t in admitted if t in envs], refused)
+
+
 def header_send_mode(message):
     """The message header's +0x35 ("send mode", 0..3)."""
     off = ENVELOPE_LEN if message[:2] == b'\x61\x61' else 0
@@ -824,6 +875,56 @@ def _selftest():
         tg3 == _h2.new(_keys.plaza_hmac_key(), bd3, _hh2.sha256).digest())
     chk('set_message_id works on a bare container too',
         sp_cec.parse_header(set_message_id(bare)[ENVELOPE_LEN:])['cec_title_id'] == PLAZA_TITLE)
+
+    def _msg(tid, n=1):
+        return envelope([unwrap(build_envelope(bytes(0x40 + 4 * i), tid, key=b'k' * 32))[0]
+                         for i in range(n)])
+
+    def _verdict(codes):
+        e = [(t, 3, 0x100, 1) for t, _c in codes]
+        ee = bytearray(build_ee_list(e))
+        for i, (_t, c) in enumerate(codes):
+            struct.pack_into('<H', ee, 0x2C + i * 0x20 + 6, c)
+        return cec_object(0x34, bytes(ee))
+
+    T1, T2, T3 = 0x00020800, 0x00030600, 0x0008C500
+    vob = build_outbox([_msg(T1), _msg(T2, 2), _msg(T3)])
+    o81 = lambda objs: next(o for o in objs if object_type(o) == 0x81)
+    o81_entries = lambda o: [struct.unpack_from('<II', o, 0x14 + i * 8)
+                             for i in range(struct.unpack_from('<I', o, 0x10)[0])]
+    envs_of = lambda objs: [struct.unpack_from('<I', o, 8)[0] for o in objs if o[:2] == b'aa']
+    chk('parse_ee_list reads back what build_ee_list wrote',
+        [e['title'] for e in parse_ee_list(_verdict([(T1, 1), (T2, 2)])[0x10:])] == [T1, T2]
+        and [e['code'] for e in parse_ee_list(_verdict([(T1, 1), (T2, 2)])[0x10:])] == [1, 2])
+
+    mixed, adm, ref = apply_verdict(vob, _verdict([(T1, 2), (T2, 1), (T3, 1)]))
+    chk('a mixed verdict sends only the admitted envelopes', envs_of(mixed) == [T2, T3],
+        ['%08X' % t for t in envs_of(mixed)])
+    chk('and the 0x81 lists exactly those, with their envelope sizes',
+        o81_entries(o81(mixed)) == [(struct.unpack_from('<I', o, 8)[0],
+                                     struct.unpack_from('<I', o, 4)[0])
+                                    for o in mixed if o[:2] == b'aa'], o81_entries(o81(mixed)))
+    chk('the 0x81 keeps its header and the console\'s 196 B size',
+        o81(mixed)[:0x10] == o81(vob)[:0x10] and len(o81(mixed)) == len(o81(vob)))
+    chk('the refused title is reported, the admitted ones in the verdict\'s order',
+        adm == [T2, T3] and ref == [T1], (adm, ref))
+    chk('everything before the 0x81 is untouched', mixed[:4] == vob[:4])
+    chk('the envelope carrying two messages goes whole',
+        len(unwrap(next(o for o in mixed if o[:2] == b'aa'))) == 2)
+
+    order, adm2, _r = apply_verdict(vob, _verdict([(T3, 1), (T1, 1), (T2, 1)]))
+    chk('the payloads follow the verdict\'s planned order', envs_of(order) == [T3, T1, T2]
+        and [t for t, _s in o81_entries(o81(order))] == [T3, T1, T2], envs_of(order))
+
+    none, adm3, ref3 = apply_verdict(vob, _verdict([(T1, 2), (T2, 2), (T3, 2)]))
+    chk('an all-refused verdict leaves a zero-entry 0x81 and no envelopes',
+        o81_entries(o81(none)) == [] and envs_of(none) == [] and len(none) == 5
+        and adm3 == [] and ref3 == [T1, T2, T3], len(none))
+    unk, _a, ref4 = apply_verdict(vob, _verdict([(T1, 1), (T2, 0)]))
+    chk('a title the verdict does not admit is withheld, listed or not',
+        envs_of(unk) == [T1] and ref4 == [T2, T3], ref4)
+    chk('a verdict that is not a 0x34 is rejected',
+        _raises(lambda: apply_verdict(vob, cec_object(0x32, _verdict([(T1, 1)])[0x10:]))))
 
     print('\n%d/%d checks passed%s' % (ok, tot,
           '' if not skipped else ', %d skipped (no test corpus)' % skipped))

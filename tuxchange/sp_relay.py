@@ -1215,6 +1215,27 @@ def credited_objects(sess, log=print):
     return delivered
 
 
+def envelope_ids(objects, log=None):
+    """-> the message ids carried by the envelopes among `objects`, in order."""
+    ids = []
+    for o in objects:
+        if o[:2] != b'\x61\x61':
+            continue
+        try:
+            ids += [c[0x20:0x28] for c in sp_build.unwrap(o)]
+        except ValueError as e:
+            if log:
+                log('  could not read the ids in a envelope: %s' % e)
+    return ids
+
+
+def credited_messages(sess, wanted, log=print):
+    """-> the ids in `wanted` that rode in an envelope the console acknowledged."""
+    delivered = credited_objects(sess, log)
+    went = set(envelope_ids(sess.outbox[:delivered], log)) if delivered else set()
+    return [m for m in wanted if m in went]
+
+
 def recovery_argv(a):
     """The --manifest-repeat/--repeat-type pair to hand sp_link, honouring --no-silent-recovery."""
     rep = int(getattr(a, 'manifest_repeat', 0) or 0)
@@ -1275,7 +1296,6 @@ class Relay:
         self.passes = 0
         self.last_tick = time.time()
         self._pending_sent = []
-        self._pending_map = {}
         self.iface_mismatch = None
 
     def log(self, msg):
@@ -1659,7 +1679,7 @@ class Relay:
     def peer_hook(self, link, mac, peer_services):
         """Called the instant a console engages: choose what to serve this console."""
         import sp_link
-        self._pending_sent, self._pending_map, self._detail, self._declined = [], {}, {}, None
+        self._pending_sent, self._detail, self._declined = [], {}, None
         if self.book.is_blocked(mac):
             r = self._decline(link, 'blocked',
                               '  %s is on the denylist; refusing to exchange with it' % mac)
@@ -1698,16 +1718,6 @@ class Relay:
         objects = prefix + sp_build.build_outbox(picked)
         ids = [c[sp_build.ENVELOPE_LEN + 0x20:sp_build.ENVELOPE_LEN + 0x28] for c in picked]
         self._pending_sent = list(ids)
-        # One envelope can hold several messages, so map objects to messages explicitly.
-        groups, order = {}, []
-        for c, mid in zip(picked, ids):
-            t = sp_build.message_title(c)
-            if t not in groups:
-                groups[t] = []
-                order.append(t)
-            groups[t].append(mid)
-        env_idx = [i for i, o in enumerate(objects) if o[:2] == b'\x61\x61']
-        self._pending_map = {i: groups[t] for i, t in zip(env_idx, order)}
         self._detail = {mid: {'title': '%08X' % sp_build.message_title(c), 'bytes': len(c)}
                         for c, mid in zip(picked, ids)}
         return services, objects
@@ -1732,7 +1742,7 @@ class Relay:
         if self.a.pcap:
             argv += ['--pcap', os.path.join(runs, 'relay_%d.pcap' % stamp)]
         a = sp_link.build_parser().parse_args(argv)
-        self._pending_sent, self._pending_map, self._declined = [], {}, None
+        self._pending_sent, self._declined = [], None
         link = sp_link.Link(a)
         link.tick_hook = self.tick
         # The broadcast probe must advertise every title held. The peer hook narrows it later.
@@ -1763,9 +1773,7 @@ class Relay:
         got = []
         sess = getattr(link, 'session', None)
         # Record only what was delivered, or a failed exchange would use up its messages.
-        delivered = credited_objects(sess, self.log)
-        self._pending_sent = [mid for i, ids in sorted(self._pending_map.items())
-                              if i < delivered for mid in ids]
+        self._pending_sent = credited_messages(sess, self._pending_sent, self.log)
         got_detail = []
         for obj in (getattr(sess, 'received', None) or []):
             if obj[:2] != b'\x61\x61':
@@ -2248,6 +2256,30 @@ def _selftest():
         chk('a pass where the console sent its 0x81 credits what was delivered',
             credited_objects(_sess([0x32, 0x34, 0x81], 10), quiet.append) == 10)
         chk('no session credits nothing', credited_objects(None, quiet.append) == 0)
+
+        def _env(tid, n=1):
+            return sp_build.envelope([sp_build.unwrap(sp_build.build_envelope(
+                bytes(0x40 + 4 * i), tid, key=b'k' * 32, message_id=tid * 16 + i))[0]
+                for i in range(n)])
+
+        def _34(codes):
+            ee = bytearray(sp_build.build_ee_list([(t, 3, 0x100, 1) for t, _c in codes]))
+            for i, (_t, c) in enumerate(codes):
+                struct.pack_into('<H', ee, 0x2C + i * 0x20 + 6, c)
+            return sp_build.cec_object(0x34, bytes(ee))
+        vt = (0x00020800, 0x00030600, 0x0008C500)
+        vmsgs = [_env(vt[0]), _env(vt[1], 2), _env(vt[2])]
+        vids = envelope_ids(vmsgs)
+        vout = sp_build.build_outbox(vmsgs)
+        cut, _adm, _ref = sp_build.apply_verdict(vout, _34([(vt[0], 2), (vt[1], 1), (vt[2], 1)]))
+        vs = _sess([0x32, 0x34, 0x81], len(cut))
+        vs.outbox = cut
+        chk('a mixed verdict credits only the admitted titles\' messages',
+            credited_messages(vs, vids, quiet.append) == vids[1:], len(vids))
+        vs.outbox, vs.stats['sent_objects'] = sp_build.apply_verdict(
+            vout, _34([(t, 2) for t in vt]))[0], 5
+        chk('an all-refused verdict credits nothing',
+            credited_messages(vs, vids, quiet.append) == [])
         chk('the silent-send recovery is armed by default',
             recovery_argv(NS(manifest_repeat=1, repeat_type='0xf2'))
             == ['--manifest-repeat', '1', '--repeat-type', '0xf2'])
@@ -3207,22 +3239,17 @@ def _selftest():
             chk('the peer hook serves the titles the peer declared', got is not None)
             if got:
                 services, objects = got
-                mp = r3._pending_map
                 n_msg = len(r3._pending_sent)
+                env_at = [i for i, o in enumerate(objects) if o[:2] == b'\x61\x61']
                 chk('Tomodachi Life\'s two messages ride in ONE object',
-                    len(mp) < n_msg and sum(len(v) for v in mp.values()) == n_msg,
-                    '%d object(s) carry %d message(s)' % (len(mp), n_msg))
-                chk('every mapped index really is an envelope in the object list',
-                    all(objects[i][:2] == b'\x61\x61' for i in mp))
-                chk('and every envelope in the object list is mapped',
-                    {i for i, o in enumerate(objects) if o[:2] == b'\x61\x61'} == set(mp))
-                first = min(mp)
-                part = [m for i, ids in sorted(mp.items()) if i < first + 1 for m in ids]
+                    len(env_at) < n_msg, '%d object(s) carry %d message(s)' % (len(env_at), n_msg))
+                chk('every message id is found in the envelopes of the object list',
+                    sorted(envelope_ids(objects)) == sorted(r3._pending_sent))
+                part = envelope_ids(objects[:env_at[0] + 1])
                 chk('a partial transfer credits only the messages that actually went',
-                    len(part) == len(mp[first]) and len(part) < n_msg,
-                    '%d of %d' % (len(part), n_msg))
-                chk('and nothing is credited when no object was delivered',
-                    [m for i, ids in sorted(mp.items()) if i < 0 for m in ids] == [])
+                    part and len(part) < n_msg, '%d of %d' % (len(part), n_msg))
+                chk('and nothing is credited when no envelope was delivered',
+                    envelope_ids(objects[:env_at[0]]) == [])
 
         if src is not None:
             import sp_link
@@ -3256,8 +3283,8 @@ def _selftest():
                     [t for t, _f, _tr in svc] == [0x00020800], svc)
                 chk('and a complete object list, prefix included',
                     len(objs) >= 9 and objs[0][:2] == b'\x63\x63', len(objs))
-                chk('with every message id accounted for in the delivery map',
-                    sum(len(v) for v in rsim._pending_map.values()) == len(rsim._pending_sent))
+                chk('with every message id carried by an envelope',
+                    sorted(envelope_ids(objs)) == sorted(rsim._pending_sent))
 
             rdec = Relay(argparse.Namespace(**{**vars(args),
                                                'store': os.path.join(tmp, 'store')}))
@@ -3297,11 +3324,11 @@ def _selftest():
         chk('declining without a link does not raise',
             rnl.peer_hook(None, 'DE:AD:BE:EF:00:02', [{'titleID': '00020800'}]) is None)
         chk('and still records the reason on the relay', rnl._declined == 'blocked')
-        rnl._pending_sent, rnl._pending_map = [b'A' * 8], {3: [b'A' * 8]}
+        rnl._pending_sent = [b'A' * 8]
         rnl._detail = {b'A' * 8: {'title': '00020800', 'bytes': 1}}
         rnl.peer_hook(None, 'DE:AD:BE:EF:00:02', [{'titleID': '00020800'}])
         chk("a decline drops the previous peer's pending deliveries",
-            rnl._pending_sent == [] and rnl._pending_map == {} and rnl._detail == {})
+            rnl._pending_sent == [] and rnl._detail == {})
 
         class _NoLog:
             src = b'\x00' * 6
