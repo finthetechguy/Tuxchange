@@ -256,9 +256,9 @@ def _selftest():
         chk('and the derived Mii id', struct.unpack_from('<I', cfl, 0x0C)[0] == a['mii_id'],
             '%08x' % struct.unpack_from('<I', cfl, 0x0C)[0])
         chk('the greeting is in the body where the plaza reads it',
-            body[sp_build.OFF_GREETING:sp_build.OFF_GREETING + 32]
+            body[sp_plaza.OFF_GREETING:sp_plaza.OFF_GREETING + 32]
             .decode('utf-16-le').split('\x00')[0] == 'Hello from Linux',
-            body[sp_build.OFF_GREETING:sp_build.OFF_GREETING + 32]
+            body[sp_plaza.OFF_GREETING:sp_plaza.OFF_GREETING + 32]
             .decode('utf-16-le', 'replace').split('\x00')[0])
 
         chk('an over-long Mii name is refused',

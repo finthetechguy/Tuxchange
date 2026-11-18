@@ -5,7 +5,7 @@ from collections import deque
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import sp_parse, sp_ccmp, sp_yy, sp_yysession
-import sp_mii, sp_smdh, sp_cec, sp_build
+import sp_mii, sp_smdh, sp_cec, sp_build, sp_plaza
 import sp_probe_tx as T
 from sp_ccmp import derive_ccmp_key
 import lp_keys
@@ -138,18 +138,17 @@ class Link:
                                      birthday_month=bm, birthday_day=bd_,
                                      favourite_colour=int(getattr(a, 'colour', 0) or 0),
                                      gender=int(getattr(a, 'gender', 0) or 0))
-            profile = sp_build.build_profile(
+            profile = dict(
                 streetpass_hits=int(getattr(a, 'hits', 0) or 0),
                 plaza_population=int(getattr(a, 'population', 0) or 0),
                 hat=int(getattr(a, 'hat', 0) or 0), pet=int(getattr(a, 'pet', 0) or 0),
                 dream=int(getattr(a, 'dream', 0) or 0), hobby=int(getattr(a, 'hobby', 0) or 0))
             tid = int(a.title_id, 0) if getattr(a, 'title_id', None) else 0x0004000012345600
-            body = sp_build.build_body(mii, greeting=a.greeting or 'Built from zero',
-                                       title_id=tid,
-                                       title_short=getattr(a, 'title_name', None) or 'Tuxchange',
-                                       title_long='StreetPass from Linux',
-                                       title_publisher='Tuxchange', profile=profile,
-                                       bubble=int(getattr(a, 'bubble', 0) or 0))
+            body = sp_plaza.build_body(sp_plaza.values_for(
+                mii, greeting=a.greeting or 'Built from zero', title_id=tid,
+                title_short=getattr(a, 'title_name', None) or 'Tuxchange',
+                title_long='StreetPass from Linux', title_publisher='Tuxchange',
+                profile=profile, bubble=int(getattr(a, 'bubble', 0) or 0)))
             self.outbox = sp_build.build_outbox(sp_build.build_message(body))
             info = sp_mii.parse_cfl(mii)
             self.log('  FROM SCRATCH: no captured input. 6 objects %s'
@@ -161,9 +160,9 @@ class Link:
             self.log('    title id %016X  %r' % (tid, getattr(a, 'title_name', None) or 'Tuxchange'))
             self.log('    card: hits=%d pop=%d hat=%d pet=%d dream=%d hobby=%d '
                      'birthday=%d/%d colour=%d creator=%r'
-                     % (struct.unpack_from('<I', profile, 0)[0],
-                        struct.unpack_from('<H', profile, 4)[0], profile[6], profile[7],
-                        profile[8], profile[9], bm, bd_,
+                     % (profile['streetpass_hits'], profile['plaza_population'],
+                        profile['hat'], profile['pet'], profile['dream'], profile['hobby'],
+                        bm, bd_,
                         int(getattr(a, 'colour', 0) or 0), a.author_name or 'Tuxchange'))
             self.log('    gates: validate_cfl=%s  region_a=%s'
                      % (okv, sp_smdh.validate_region_a(body)[0]))

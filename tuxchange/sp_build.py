@@ -12,10 +12,6 @@ INFO_TEXT    = "You've got company!"
 CEC_ICON_DIM = 40              # the CEC icon is 40x40 RGB565 = 0xC80 bytes
 O81_SLOTS    = 24              # the 0x81 payload is 196 B = 4 + 24*8
 
-OFF_PRESENT, OFF_MII, OFF_ADDR = 0x36B8, 0x36BC, 0x375C
-OFF_COUNTRY, OFF_REGION, OFF_GREETING = 0x3760, 0x3B60, 0x3F70
-PRESENT_FLAG = 0x100
-
 
 def cec_icon(path=None, **draw_kw):
     """The 0xC80-byte 40x40 CEC icon that rides along with the message."""
@@ -118,38 +114,12 @@ def build_cfl(mii_name='Linux', author_name='', mii_id=None, creator_mac='b8:ae:
     return sp_mii.reseal_cfl(bytes(c))
 
 
-# Mii-card profile block at body+0x3F60. Bounds are the receive-side clamps.
-PROFILE = [('streetpass_hits', 0x00, 4, 999999), ('plaza_population', 0x04, 2, 3000),
-           ('hat', 0x06, 1, 203), ('pet', 0x07, 1, 2),
-           ('dream', 0x08, 1, 19), ('hobby', 0x09, 1, 27)]
-
 # The expansion build's hat validator resets these ids to 0.
 HAT_EXCLUDED = frozenset((69, 75, 168, 169))
-PROFILE_EXCLUDED = {'hat': HAT_EXCLUDED}
 
-# Inferred, not proven: body+0x614C is the speech-bubble style.
-OFF_BUBBLE = 0x614C
 BUBBLE_MAX = 5
 
 DAYS_IN_MONTH = (31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31)
-
-
-def build_profile(**kw):
-    """-> the 0x10-byte block for body+0x3F60."""
-    b = bytearray(0x10)
-    for name, off, size, ub in PROFILE:
-        v = int(kw.pop(name, 0))
-        if not (0 <= v <= ub):
-            raise ValueError('%s = %d out of range [0, %d]' % (name, v, ub))
-        if v in PROFILE_EXCLUDED.get(name, ()):
-            raise ValueError('%s = %d is one the game resets to 0 (it refuses %s)'
-                             % (name, v, sorted(PROFILE_EXCLUDED[name])))
-        if size == 4:   struct.pack_into('<I', b, off, v)
-        elif size == 2: struct.pack_into('<H', b, off, v)
-        else:           b[off] = v
-    if kw:
-        raise ValueError('unknown profile field(s) %s' % sorted(kw))
-    return bytes(b)
 
 
 def check_birthday(month, day):
@@ -160,39 +130,6 @@ def check_birthday(month, day):
         raise ValueError('birthday_month must be 1..12 (or 0 with day 0)')
     if not (1 <= day <= DAYS_IN_MONTH[month - 1]):
         raise ValueError('birthday_day must be 1..%d for month %d' % (DAYS_IN_MONTH[month - 1], month))
-
-
-def build_body(mii_cfl, greeting='Sent from Linux', title_id=0x0004000000000000,
-               title_short='Tuxchange', title_long='StreetPass from Linux',
-               title_publisher='Tuxchange', icon_small=None, icon_large=None,
-               country='United Kingdom', region='England', address_code=0, profile=None,
-               bubble=0):
-    body = bytearray(BODY_LEN)
-    if icon_small is None and icon_large is None:
-        icon_small, icon_large = build_icons()
-    ra = sp_smdh.build_region_a(title_id, title_short, title_long, title_publisher)
-    rb = sp_smdh.build_region_b(small=icon_small, large=icon_large)
-    body[sp_smdh.REGION_A_OFF:sp_smdh.REGION_A_OFF + sp_smdh.REGION_A_LEN] = ra
-    body[sp_smdh.REGION_B_OFF:sp_smdh.REGION_B_OFF + sp_smdh.REGION_B_LEN] = rb
-    struct.pack_into('<I', body, OFF_PRESENT, PRESENT_FLAG)
-    struct.pack_into('<I', body, OFF_ADDR, address_code)
-    body[0x3F60:0x3F70] = profile if profile is not None else build_profile()
-    if not (0 <= bubble <= BUBBLE_MAX):
-        raise ValueError('bubble must be 0..%d (sanitiser clamps < 6)' % BUBBLE_MAX)
-    body[OFF_BUBBLE] = bubble
-    for base, txt in ((OFF_COUNTRY, country), (OFF_REGION, region)):
-        names = list(txt) if isinstance(txt, (list, tuple)) else [txt] * 16
-        if len(names) != 16:
-            raise ValueError('country/region must be one string or exactly 16')
-        for i, s16 in enumerate(names):
-            e = s16.encode('utf-16-le')[:0x3E]
-            body[base + i * 0x40: base + i * 0x40 + len(e)] = e
-    g = greeting.encode('utf-16-le')[:0x20]
-    body[OFF_GREETING:OFF_GREETING + len(g)] = g
-    struct.pack_into('<4sI', body, OFF_MII, sp_mii.MAGIC_CFPB, 1)
-    struct.pack_into('<H', body, OFF_MII + 0x14, 1)
-    body = sp_mii.write_plaza_mii(bytes(body), mii_cfl)
-    return body
 
 
 EXH_ICON, EXH_INFO_TEXT = 2, 4
@@ -470,7 +407,8 @@ def build(**kw):
                        if k in kw})
     msg_kw = {k: kw.pop(k) for k in
               ('message_id', 'when', 'info_text', 'icon', 'cec_title_id', 'key') if k in kw}
-    return build_message(build_body(mii, **kw), **msg_kw)
+    import sp_plaza
+    return build_message(sp_plaza.build_body(sp_plaza.values_for(mii, **kw)), **msg_kw)
 
 
 def _raises(fn):
@@ -495,6 +433,11 @@ def _selftest():
         print('  [SKIP] %s  (%s)' % (name, why))
 
     import lp_corpus as corpus, lp_keys as _k
+    import sp_plaza
+
+    def body_of(cfl, **kw):
+        return sp_plaza.build_body(sp_plaza.values_for(cfl, **kw))
+
     if _k.selftest_keys():
         print('  (no console keys found, so running on generated throwaway keys)')
     msg = build(mii_name='Linux', author_name='Tuxchange', greeting='Built from zero',
@@ -542,7 +485,7 @@ def _selftest():
     chk('Mii name and author round-trip',
         pl['mii']['mii_name'] == 'Linux' and pl['mii']['author_name'] == 'Tuxchange')
     chk('present_flag is 0x100 as the shipping build writes',
-        struct.unpack_from('<I', body, OFF_PRESENT)[0] == 0x100)
+        struct.unpack_from('<I', body, sp_plaza.OFF_PRESENT)[0] == 0x100)
 
     cfl, macok = sp_mii.read_plaza_mii(body)
     okv, why = sp_mii.validate_cfl(cfl)
@@ -584,20 +527,21 @@ def _selftest():
                                     rb['header']['header_size'] + rb['header']['body_size']]
         rpl = sp_cec.parse_plaza_body(rbody)
         rta = sp_smdh.parse_region_a(rbody)
-        clone = build_body(sp_mii.read_plaza_mii(rbody)[0], greeting=rpl['greeting'],
-                           title_id=rta['title_id'], title_short=rta['titles'][0]['short'],
-                           title_long=rta['titles'][0]['long'],
-                           title_publisher=rta['titles'][0]['publisher'],
-                           icon_small=sp_smdh.decode_icon(rbody, large=False),
-                           icon_large=sp_smdh.decode_icon(rbody, large=True),
-                           country=rpl['country'], region=rpl['region'],
-                           address_code=struct.unpack_from('<I', rbody, OFF_ADDR)[0])
+        clone = body_of(sp_mii.read_plaza_mii(rbody)[0], greeting=rpl['greeting'],
+                        title_id=rta['title_id'], title_short=rta['titles'][0]['short'],
+                        title_long=rta['titles'][0]['long'],
+                        title_publisher=rta['titles'][0]['publisher'],
+                        icon_small=sp_smdh.decode_icon(rbody, large=False),
+                        icon_large=sp_smdh.decode_icon(rbody, large=True),
+                        country=rpl['country'], region=rpl['region'],
+                        address_code=struct.unpack_from('<I', rbody, sp_plaza.OFF_ADDR)[0])
         diff = [i for i in range(BODY_LEN) if clone[i] != rbody[i]]
         outside = [i for i in diff if not (0x3F60 <= i < 0x3F70 or 0x45C4 <= i < 0x45D3
                                            or 0x45D3 <= i < 0x60EB or 0x60EB <= i < 0x7280
                                            or 0x0 <= i < 0x30)]
         chk('rebuilding the real 2DS body reproduces the Mii exactly',
-            clone[OFF_MII:OFF_MII + 0xA0] == rbody[OFF_MII:OFF_MII + 0xA0])
+            clone[sp_plaza.OFF_MII:sp_plaza.OFF_MII + 0xA0]
+            == rbody[sp_plaza.OFF_MII:sp_plaza.OFF_MII + 0xA0])
         chk('rebuilding reproduces regions A and B exactly',
             clone[0x30:0x36B8] == rbody[0x30:0x36B8])
         chk('rebuilding reproduces the localised country/region tables exactly',
@@ -641,14 +585,14 @@ def _selftest():
     chk('drawn icon is not a solid colour (the first run shipped all-zero = black)',
         len({v for row in large for v in row}) >= 4,
         '%d distinct colours' % len({v for row in large for v in row}))
-    body2 = build_body(cfl2)
+    body2 = body_of(cfl2)
     chk('icons survive the region B encode/decode round trip',
         sp_smdh.decode_icon(body2, large=True) == large
         and sp_smdh.decode_icon(body2, large=False) == small)
 
-    prof = build_profile(streetpass_hits=1234, plaza_population=56, hat=7, pet=1, dream=3, hobby=11)
-    mb = build_body(build_cfl(mii_name='Tux', birthday_month=8, birthday_day=4,
-                              favourite_colour=6), profile=prof)
+    prof = dict(streetpass_hits=1234, plaza_population=56, hat=7, pet=1, dream=3, hobby=11)
+    mb = body_of(build_cfl(mii_name='Tux', birthday_month=8, birthday_day=4,
+                           favourite_colour=6), profile=prof)
     got = mb[0x3F60:0x3F70]
     chk('streetpass_hits round-trips', struct.unpack_from('<I', got, 0)[0] == 1234)
     chk('plaza_population round-trips', struct.unpack_from('<H', got, 4)[0] == 56)
@@ -659,15 +603,17 @@ def _selftest():
         (ap2['birthday_month'], ap2['birthday_day']) == (8, 4))
     chk('favourite colour (shirt) round-trips', ap2['favourite_colour'] == 6)
     chk('author name is the card Creator field',
-        sp_mii.parse_cfl(sp_mii.read_plaza_mii(build_body(
+        sp_mii.parse_cfl(sp_mii.read_plaza_mii(body_of(
             build_cfl(mii_name='Tux', author_name='Tuxchange')))[0])['author_name'] == 'Tuxchange')
     for k, v in (('streetpass_hits', 1000000), ('plaza_population', 3001), ('hat', 204),
                  ('hat', 69), ('hat', 75), ('hat', 168), ('hat', 169),
                  ('pet', 3), ('dream', 20), ('hobby', 28)):
-        chk('profile %s=%d rejected' % (k, v), _raises(lambda: build_profile(**{k: v})))
+        chk('profile %s=%d rejected' % (k, v), _raises(lambda: body_of(cfl2, profile={k: v})))
     chk('expansion hat ids above the old 75 limit are accepted',
-        build_profile(hat=76)[6] == 76 and build_profile(hat=203)[6] == 203)
-    chk('unknown profile field rejected', _raises(lambda: build_profile(favourite_snack=1)))
+        body_of(cfl2, profile=dict(hat=76))[sp_plaza.OFF_PROFILE + 6] == 76
+        and body_of(cfl2, profile=dict(hat=203))[sp_plaza.OFF_PROFILE + 6] == 203)
+    chk('unknown profile field rejected',
+        _raises(lambda: body_of(cfl2, profile=dict(favourite_snack=1))))
     chk('birthday 0/0 accepted', build_cfl(birthday_month=0, birthday_day=0) is not None)
     for m_, d_ in ((13, 1), (0, 5), (2, 30), (1, 0)):
         chk('birthday %d/%d rejected' % (m_, d_),
@@ -678,18 +624,19 @@ def _selftest():
     else:
         rprof = rbody[0x3F60:0x3F70]
         chk('a captured profile block re-encodes exactly',
-            build_profile(streetpass_hits=struct.unpack_from('<I', rprof, 0)[0],
-                          plaza_population=struct.unpack_from('<H', rprof, 4)[0],
-                          hat=rprof[6], pet=rprof[7], dream=rprof[8], hobby=rprof[9]) == rprof)
+            body_of(cfl2, profile=dict(streetpass_hits=struct.unpack_from('<I', rprof, 0)[0],
+                                       plaza_population=struct.unpack_from('<H', rprof, 4)[0],
+                                       hat=rprof[6], pet=rprof[7], dream=rprof[8],
+                                       hobby=rprof[9]))[0x3F60:0x3F70] == rprof)
 
-    bb = build_body(build_cfl(mii_name='Tux'), bubble=4)
-    chk('bubble style round-trips at body+0x614C', bb[OFF_BUBBLE] == 4)
-    chk('bubble style 6 is rejected', _raises(lambda: build_body(build_cfl(), bubble=6)))
+    bb = body_of(build_cfl(mii_name='Tux'), bubble=4)
+    chk('bubble style round-trips at body+0x614C', bb[sp_plaza.OFF_BUBBLE] == 4)
+    chk('bubble style 6 is rejected', _raises(lambda: body_of(build_cfl(), bubble=6)))
     if real is None:
         skip('both captured consoles carry bubble=1', corpus.why_skipped())
         skip('the per-person arrays match the met16 list', corpus.why_skipped())
     else:
-        chk('both captured consoles carry bubble=1', rbody[OFF_BUBBLE] == 1)
+        chk('both captured consoles carry bubble=1', rbody[sp_plaza.OFF_BUBBLE] == 1)
         chk('the per-person arrays are non-zero only where met16 is populated',
             [i for i in range(16) if rbody[0x612C + i]] ==
             [e['idx'] for e in sp_cec.parse_plaza_body(rbody)['met16']])

@@ -33,7 +33,9 @@ OFF_PROFILE, OFF_GREETING, GREETING_MAX = 0x3F60, 0x3F70, 16
 # History.
 OFF_MET16, OFF_NAMES_A, OFF_NAMES_B, MET_NAME_STRIDE, MET_NAME_MAX = 0x3F92, 0x4032, 0x4252, 0x22, 16
 OFF_CACHE_COUNT, CACHE_MAX, OFF_MET32 = 0x4482, 100, 0x4484
-OFF_BUBBLE = sp_build.OFF_BUBBLE
+# Inferred, not proven: body+0x614C is the speech-bubble style.
+OFF_BUBBLE = 0x614C
+PRESENT_FLAG = 0x100
 CFPB_HDR = 0x18
 MII_NAME_MAX = 10
 NAME_FORBID = '%\\'
@@ -125,6 +127,35 @@ def fields():
 FIELDS = fields()
 
 
+def values_for(mii_cfl, greeting='Sent from Linux', title_id=0x0004000000000000,
+               title_short='Tuxchange', title_long='StreetPass from Linux',
+               title_publisher='Tuxchange', icon_small=None, icon_large=None,
+               country='United Kingdom', region='England', address_code=0, profile=None,
+               bubble=0):
+    """Validated values for a new body around a whole Mii. `country` and `region` are one
+    string or 16; `profile` is a dict of the profile fields."""
+    v = {f.key: f.make_default() for f in FIELDS}
+    apply_mii(v, mii_cfl)
+    v['greeting'] = greeting
+    v['bubble'] = bubble
+    v['profile'].update(profile or {})
+    s = v['sender']
+    s['country'] = list(country) if isinstance(country, (list, tuple)) else [country] * 16
+    s['region'] = list(region) if isinstance(region, (list, tuple)) else [region] * 16
+    s['address_code'] = address_code
+    s['presence'] = PRESENT_FLAG
+    f = v['featured']
+    f['title_id'] = title_id
+    f['short_name'], f['long_name'], f['publisher'] = (
+        [title_short] * 16, [title_long] * 16, [title_publisher] * 16)
+    if icon_small is None and icon_large is None:
+        icon_small, icon_large = sp_build.build_icons()
+    f['small_icon'], f['large_icon'] = icon_small, icon_large
+    f['region_lockout'] = 0x7FFFFFFF
+    validate(v)
+    return v
+
+
 def default_values(store_path=None, identity=None):
     """Fresh values. The Mii is the store's own (or `identity`, from sp_identity), so the
     same store keeps the same Mii. Without a store this process can read, it is a one-off."""
@@ -137,24 +168,12 @@ def default_values(store_path=None, identity=None):
             pass
     if ident is None:
         ident = sp_identity.from_seed(os.urandom(32))
-    v = {f.key: f.make_default() for f in FIELDS}
-    v['mii'].update(mii_name='Relay', author_name='Tuxchange', mii_id=ident['mii_id'],
-                    creator_mac=sp_cec.macbytes(ident['creator_mac']))
-    v['mii']['mii_data'] = sp_build.build_cfl(
+    mii = sp_build.build_cfl(
         mii_name='Relay', author_name='Tuxchange', mii_id=ident['mii_id'],
         creator_mac=ident['creator_mac'], face_shape=ident['face_shape'],
         gender=ident['gender'])
-    v['profile'].update(hat=ident['hat'], dream=ident['dream'], hobby=ident['hobby'])
-    v['sender']['country'] = ['United Kingdom'] * 16
-    v['sender']['region'] = ['England'] * 16
-    v['sender']['presence'] = sp_build.PRESENT_FLAG
-    f = v['featured']
-    f['title_id'] = 0x0004000000000000
-    f['short_name'], f['long_name'], f['publisher'] = (
-        ['Tuxchange'] * 16, ['StreetPass from Linux'] * 16, ['Tuxchange'] * 16)
-    f['small_icon'], f['large_icon'] = sp_build.build_icons()
-    f['region_lockout'] = 0x7FFFFFFF
-    return v
+    return values_for(mii, greeting='Hello, world!',
+                      profile=dict(hat=ident['hat'], dream=ident['dream'], hobby=ident['hobby']))
 
 
 def validate(values):
@@ -371,14 +390,24 @@ def _selftest():
     ident = sp_identity.from_seed(hashlib.sha256(b'plaza selftest').digest())
     v = default_values(identity=ident)
     chk('the defaults are valid values', validate(v) is not None)
-    old_mii = sp_build.build_cfl(mii_name='Relay', author_name='Tuxchange',
-                                 mii_id=ident['mii_id'], creator_mac=ident['creator_mac'],
-                                 face_shape=ident['face_shape'], gender=ident['gender'])
-    old = sp_build.build_body(old_mii, greeting='Hello, world!', profile=sp_build.build_profile(
-        hat=ident['hat'], dream=ident['dream'], hobby=ident['hobby']))
     new = build_body(v)
-    chk('the default body is byte-identical to the one sp_build always built',
-        new == old, [hex(i) for i in range(len(new)) if new[i] != old[i]][:6])
+
+    vf = values_for(v['mii']['mii_data'], greeting='Hi', title_id=0x0004000012345600,
+                    title_short='S', title_long='L', title_publisher='P',
+                    country=['C%d' % i for i in range(16)], region='R', address_code=0x6E0201,
+                    profile=dict(hat=7, streetpass_hits=12), bubble=3)
+    rv = parse_body(build_body(vf))
+    chk('values_for sets every value it is given',
+        (rv['greeting'], rv['featured']['title_id'], rv['featured']['short_name'][5],
+         rv['featured']['long_name'][0], rv['featured']['publisher'][15],
+         rv['sender']['country'][9], rv['sender']['region'][3], rv['sender']['address_code'],
+         rv['profile']['hat'], rv['profile']['streetpass_hits'], rv['bubble'],
+         rv['sender']['presence'], rv['featured']['region_lockout'])
+        == ('Hi', 0x0004000012345600, 'S', 'L', 'P', 'C9', 'R', 0x6E0201, 7, 12, 3,
+            PRESENT_FLAG, 0x7FFFFFFF))
+    chk('values_for refuses values the game would not keep',
+        raises(lambda: values_for(v['mii']['mii_data'], profile=dict(hat=69)))
+        and raises(lambda: values_for(v['mii']['mii_data'], bubble=6)))
 
     back = parse_body(new)
     chk('parse then build reproduces the body exactly', build_body(back) == new)
