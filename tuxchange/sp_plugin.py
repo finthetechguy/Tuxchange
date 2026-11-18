@@ -177,9 +177,6 @@ class Enum(Field):
             pass
         return self.validate(text, path)
 
-    def label_of(self, v):
-        return dict(self.choices).get(v, str(v))
-
     def describe(self):
         return 'one of ' + ', '.join('%s=%s' % c if str(c[0]) != c[1] else c[1]
                                      for c in self.choices)
@@ -815,11 +812,6 @@ def rgb565(r, g, b):
 def rgb565_to_rgb(v):
     r, g, b = (v >> 11) & 0x1F, (v >> 5) & 0x3F, v & 0x1F
     return (r * 255 + 15) // 31, (g * 255 + 31) // 63, (b * 255 + 15) // 31
-
-
-def image_to_rgb_bytes(px):
-    """Rows of RGB565 -> packed RGB888, for showing in the GUI."""
-    return bytes(c for row in px for v in row for c in rgb565_to_rgb(v))
 
 
 def read_png(data):

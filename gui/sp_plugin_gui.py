@@ -83,7 +83,6 @@ class Context:
     def __init__(self, app, plugin, values, page):
         self.app, self.plugin, self.values, self._page = app, plugin, values, page
         self.errors = {}
-        self.dirty = False
 
     @property
     def window(self):
@@ -101,7 +100,6 @@ class Context:
 
     def changed(self, keys, value):
         P.set_path(self.values, keys, value)
-        self.dirty = True
 
     # -- the generated form --------------------------------------------------------------
 
@@ -333,7 +331,6 @@ class Context:
                 return self.error('Import failed', str(res))
             self.values.clear()
             self.values.update(res)
-            self.dirty = True
             self.reload()
             self.toast('Imported')
         work_values = P.values_from_json(self.plugin, P.values_to_json(self.plugin, self.values))
@@ -435,11 +432,10 @@ class PluginPage(Adw.NavigationPage):
     """One plugin's full-window page: its own content and background, About at the top right,
     and Save."""
 
-    def __init__(self, app, plugin, values, editing=False):
+    def __init__(self, app, plugin, values):
         super().__init__(title=plugin.game, tag='plugin-%s' % plugin.id)
         self.app, self.plugin = app, plugin
         self.ctx = Context(app, plugin, values, self)
-        self.editing = editing
         header = Adw.HeaderBar()
         about = Gtk.Button(icon_name='help-about-symbolic', tooltip_text='About this plugin')
         about.connect('clicked', lambda _b: self.show_about())
@@ -525,7 +521,6 @@ class PluginPage(Adw.NavigationPage):
                 return self._confirm_overwrite(rep['exists'])
             if not rep.get('ok'):
                 return self.app.error('Not saved', rep.get('error') or 'the daemon refused it')
-            self.ctx.dirty = False
             self.app.toast('%s message saved to the outbox' % self.plugin.game)
             self.app.win.nav.pop()
             self.app.refresh_now()
@@ -569,14 +564,14 @@ class Plugins:
     def for_title(self, tid):
         return P.for_title(tid, self.plugins)
 
-    def open(self, plugin, values=None, editing=False):
+    def open(self, plugin, values=None):
         if values is None:
             try:
                 values = plugin.defaults()
             except Exception as e:                         # noqa: BLE001
                 return self.app.error('%s could not start' % plugin.game,
                                       '%s: %s' % (type(e).__name__, e))
-        self.app.win.nav.push(PluginPage(self.app, plugin, values, editing))
+        self.app.win.nav.push(PluginPage(self.app, plugin, values))
 
     def picker(self):
         self.reload()
@@ -648,5 +643,5 @@ class Plugins:
                 return d.present(self.app.win)
             if isinstance(res, Exception):
                 return self.app.error('Could not load the message', str(res))
-            self.open(plugin, res, editing=True)
+            self.open(plugin, res)
         run_async(load, loaded)

@@ -8,8 +8,6 @@ _sys.path.insert(0, _os.path.join(
     _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))), 'tuxchange'))
 from sp_parse import parse_vendor_ie, NIN_OUI, is_laa
 
-TITLE_DB = {}
-
 def rt_field(pkt, name):
     try:
         return pkt[RadioTap].getfieldval(name)

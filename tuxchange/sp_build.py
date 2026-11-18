@@ -134,13 +134,6 @@ PROFILE = [('streetpass_hits', 0x00, 4, 999999), ('plaza_population', 0x04, 2, 3
 HAT_EXCLUDED = frozenset((69, 75, 168, 169))
 PROFILE_EXCLUDED = {'hat': HAT_EXCLUDED}
 
-DREAM_OPTIONS = ['big', 'champ', 'fly', 'hero', 'long', 'love', 'magic', 'marry', 'master', 'nice',
-                 'president', 'princess', 'rich', 'secret', 'space', 'sports', 'star',
-                 'supernatural']
-HOBBY_OPTIONS = ['book', 'camera', 'cleaning', 'cook', 'dance', 'dressup', 'drive', 'drow', 'eat',
-                 'fish', 'game', 'help', 'in', 'money', 'movie', 'music', 'out', 'party', 'pet',
-                 'secret', 'shop', 'sleep', 'sports', 'study', 'talk', 'travel']
-
 # Inferred, not proven: body+0x614C is the speech-bubble style.
 OFF_BUBBLE = 0x614C
 BUBBLE_MAX = 5
@@ -348,11 +341,6 @@ def cec_object(otype, payload, flags=0xFFFF):
             + struct.pack('<I', 0) + struct.pack('<I', len(payload)) + bytes(payload))
 
 
-def build_ee_record(cec_title_id, size, index=1, flags=0x300, count=1):
-    """One `ee` message-list record: 0x2C header + `count` 32-byte entries."""
-    return build_ee_list([(cec_title_id, flags, size, index)] * count)
-
-
 def build_ee_list(entries):
     """An `ee` record carrying one 32-byte entry per (title, flags, size, index) tuple."""
     entries = list(entries)
@@ -376,11 +364,6 @@ def header_flags(message):
     """The message header's +0x34. Goes to ee entry +0x05. cecd never reads it back."""
     off = ENVELOPE_LEN if message[:2] == b'\x61\x61' else 0
     return message[off + 0x34]
-
-
-def ee_flags(message, phase):
-    """The u32 an ee entry needs for `message`: phase 0 for a 0x31/0x32, 1 for a 0x33."""
-    return header_send_mode(message) | (header_flags(message) << 8) | (phase << 16)
 
 
 def message_title(message):

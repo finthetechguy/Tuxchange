@@ -122,16 +122,6 @@ def validate_region_a(body):
     return (not why), why
 
 
-def ascii_icon(px, ramp=' .:-=+*#%@'):
-    def lum(v):
-        r = ((v >> 11) & 0x1F) * 255 // 31
-        g = ((v >> 5) & 0x3F) * 255 // 63
-        b = (v & 0x1F) * 255 // 31
-        return (r * 299 + g * 587 + b * 114) // 1000
-    return '\n'.join(''.join(ramp[min(len(ramp) - 1, lum(v) * len(ramp) // 256)] for v in row)
-                     for row in px)
-
-
 def _selftest():
     import sp_cec
     ok = tot = skipped = 0

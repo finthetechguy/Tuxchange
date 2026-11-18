@@ -89,11 +89,6 @@ def candidate_timefields(blob, entries, stride, tol=TOL):
     return out
 
 
-HEADER_DOC = """The 20-byte header, already decoded from the 1-2 Sep dumps (see the
-cec-macfilter-format note): +0x00 MAC, +0x06 two bytes the loader never reads, +0x08 u32 year,
-+0x0C month/day/day-of-week/hour, +0x10 minute/second/u16 milliseconds."""
-
-
 def decode_header(blob):
     """Decode the 20-byte header using the layout recovered from the 1-2 Sep dumps."""
     if len(blob) < 20:

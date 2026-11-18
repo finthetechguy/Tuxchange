@@ -20,7 +20,6 @@ SERVICES_FULL = [
 
 CH_FREQ = {c: 2412 + (c - 1) * 5 for c in range(1, 14)}
 CH_FREQ[14] = 2484
-DISCOVERY_CHANNELS = (1, 6, 11)
 
 
 def is_console(mac):

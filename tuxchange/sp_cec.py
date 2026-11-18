@@ -342,22 +342,6 @@ def parse_stream(blob, max_msgs=64):
     return msgs
 
 
-def dump_stream(blob):
-    msgs = parse_stream(blob)
-    print(f"stream: {len(blob)} bytes -> {len(msgs)} CEC message(s)")
-    for i, m in enumerate(msgs):
-        h = m['header']
-        name = KNOWN_SERVICES.get(h['cec_title_id'])
-        print(f"\n[{i}] offset {m['offset']:#x}  cec_title_id {h['cec_title_id']:#010x}"
-              f"  (uniqueId {h['unique_id']:#x})"
-              + (f"  = {name}" if name else
-                 "  = not Mii Plaza; container decoded, body left raw"))
-        total = h['total_size']
-        end = m['offset'] + total if (0 < total <= MAX_TOTAL and m['offset'] + total <= len(blob)) else len(blob)
-        dump(blob[m['offset']:end])
-    return msgs
-
-
 def dump(buf):
     m = parse_message(buf)
     h = m['header']

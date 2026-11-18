@@ -26,9 +26,6 @@ NIN_OUIS = {"00:1f:32","00:1a:e9","00:09:bf","00:16:56","00:17:ab","00:19:1d","0
             "40:d2:8a","58:bd:a3","5c:52:1e","78:a2:a0","8c:cd:e8","98:b6:e9","a4:5c:27",
             "a4:c0:e1","b8:ae:6e","cc:9e:00","d8:6b:f7","dc:68:eb","e0:0c:7f","e8:4e:ce","ec:c4:0d"}
 
-def _nin_oui(mac):
-    return bool(mac) and mac[:8].lower() in NIN_OUIS
-
 def is_laa(mac):
     """Locally-administered (randomized) unicast MAC, as 3DS StreetPass probes use."""
     if not mac or mac.lower() == "ff:ff:ff:ff:ff:ff":

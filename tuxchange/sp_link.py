@@ -9,20 +9,10 @@ import sp_mii, sp_smdh, sp_cec
 import sp_probe_tx as T
 from streetpass_ccmp_key import derive_ccmp_key
 
-YY_SNAP = b'\xaa\xaa\x03\x00\x00\x00' + b'\x08\x00' + b'\x00\x00'
-WINDOW = 0x38B8                      # 14520, what both consoles advertise
 DATA_DURATION = 0x002C               # 44 us -- the value on all 108 captured bulk frames
 # Per-pass diagnostics, bounded so a peer flooding authenticated frames cannot exhaust memory.
 HISTORY_MAX = 4096
 LOG_LINES_MAX = 20000
-
-
-def build_yy(flags, seq=0, ack=0, window=WINDOW, payload=b''):
-    """One YY segment as it appears INSIDE the CCMP payload (LLC/SNAP + 2 pad + 24-byte header)."""
-    yy = (struct.pack('<HHHH', 0x5959, 0x30 + len(payload), 0xDEAD, 0xBEAF)
-          + struct.pack('<II', seq, ack)
-          + bytes([12, flags]) + struct.pack('<H', window) + b'\x00\x00\x00\x00')
-    return YY_SNAP + yy + bytes(payload)
 
 
 def ccmp_header(pn):
@@ -1115,11 +1105,6 @@ def edit_mii(obj5, mii_name=None, author_name=None, fresh_identity=False, log=No
     return reseal(bytes(b), log)
 
 
-def fresh_mii(obj5, log=None):
-    """Back-compat shim: a new Mii identity, done correctly."""
-    return edit_mii(obj5, fresh_identity=True, log=log)
-
-
 def reseal(obj5, log=None):
     """Recompute the container's 32-byte trailer = HMAC-SHA256(plaza key, body)."""
     import hmac as _hmac, hashlib as _hashlib
@@ -1386,7 +1371,8 @@ def simulate(verbose=1, peer_hook=None, out=None, link_at=0.60):
         synack = bytes.fromhex(V['synack'])
     else:
         synack = build_encrypted_data(expect_key, T.macbytes(CON), T.macbytes(US),
-                                      T.macbytes(CON), 1, build_yy(0x12), seq=95)
+                                      T.macbytes(CON), 1,
+                                      sp_yysession.build_yy_frame(0x12, 0, 0), seq=95)
 
     FOREIGN = '00:00:5e:00:53:01'
     foreign = bytes.fromhex(
@@ -1456,7 +1442,8 @@ def simulate(verbose=1, peer_hook=None, out=None, link_at=0.60):
         try:
             pt = sp_ccmp.decrypt(L.keys[0][1], syn[0])
             y = sp_yy.parse(pt)
-            chk('our SYN decrypts under the shared key', pt == build_yy(sp_yy.SYN), pt.hex())
+            chk('our SYN decrypts under the shared key',
+                pt == sp_yysession.build_yy_frame(sp_yy.SYN, 0, 0), pt.hex())
             chk('our SYN parses as a YY SYN', y and y['ok'] and y['flags'] == sp_yy.SYN,
                 sp_yy.flagstr(y['flags']) if y else '-')
         except Exception as e:
@@ -1564,13 +1551,14 @@ def selftest():
         print('  [SKIP] %s  (%s)' % (n, why))
 
     want = bytes.fromhex('aaaa030000000800000059593000addeafbe00000000000000000c12b83800000000')
-    chk('build_yy(SYN|ACK) == decrypted spectral_attempt1 #73', build_yy(0x12) == want)
-    syn = build_yy(sp_yy.SYN)
-    chk('build_yy(SYN) differs only in the flags byte',
+    chk('build_yy_frame(SYN|ACK) == decrypted spectral_attempt1 #73',
+        sp_yysession.build_yy_frame(0x12, 0, 0) == want)
+    syn = sp_yysession.build_yy_frame(sp_yy.SYN, 0, 0)
+    chk('build_yy_frame(SYN) differs only in the flags byte',
         sum(a != b for a, b in zip(syn, want)) == 1 and syn[27] == 0x02)
-    y = sp_yy.parse(build_yy(sp_yy.SYN))
+    y = sp_yy.parse(sp_yysession.build_yy_frame(sp_yy.SYN, 0, 0))
     chk('our SYN parses back', y and y['ok'] and y['flags'] == sp_yy.SYN and y['length'] == 0x30)
-    chk('our SYN advertises the observed window', y['window'] == WINDOW, y['window'])
+    chk('our SYN advertises the observed window', y['window'] == sp_yysession.WINDOW, y['window'])
 
     chk('ccmp_header(1) matches capture', ccmp_header(1).hex() == '0100002000000000')
     chk('ccmp_header(2) matches capture', ccmp_header(2).hex() == '0200002000000000')
@@ -1583,7 +1571,7 @@ def selftest():
         _bargs = (key, T.macbytes(V['console_mac']), T.macbytes(V['our_mac']),
                   T.macbytes(V['console_mac']), 1)
         _bseq = V.get('synack_seq', 95)
-        built = build_encrypted_data(*_bargs, build_yy(0x12), seq=_bseq)
+        built = build_encrypted_data(*_bargs, sp_yysession.build_yy_frame(0x12, 0, 0), seq=_bseq)
         chk('build_encrypted_data reproduces the captured console frame byte-for-byte',
             built == mpdu)
     else:
@@ -1593,7 +1581,7 @@ def selftest():
         _bargs = (key, T.macbytes('96:58:cb:11:22:33'), T.macbytes('ba:ae:6e:44:55:66'),
                   T.macbytes('96:58:cb:11:22:33'), 1)
         _bseq = 95
-        built = build_encrypted_data(*_bargs, build_yy(0x12), seq=_bseq)
+        built = build_encrypted_data(*_bargs, sp_yysession.build_yy_frame(0x12, 0, 0), seq=_bseq)
     chk('pn_of reads our own frame back', sp_ccmp.pn_of(built) == 1, sp_ccmp.pn_of(built))
     chk('our frame decrypts to the YY SYN|ACK', sp_ccmp.decrypt(key, built) == want)
 
@@ -1622,7 +1610,7 @@ def selftest():
 
     sp_ccmp.HAVE_PYCRYPTO = False
     chk('pure-stdlib backend builds the identical frame',
-        build_encrypted_data(*_bargs, build_yy(0x12), seq=_bseq) == built)
+        build_encrypted_data(*_bargs, sp_yysession.build_yy_frame(0x12, 0, 0), seq=_bseq) == built)
     sp_ccmp.HAVE_PYCRYPTO = hasattr(sp_ccmp, 'AES') and sp_ccmp.AES is not None
 
     class _L(Link):
