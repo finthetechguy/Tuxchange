@@ -6,7 +6,7 @@ from scapy.all import PcapReader, Dot11, Dot11Elt, RadioTap
 import os as _os, sys as _sys
 _sys.path.insert(0, _os.path.join(
     _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))), 'tuxchange'))
-from sp_parse import parse_vendor_ie, NIN_OUI, is_laa
+from sp_parse import parse_vendor_ie, NIN_OUI, NIN_OUIS, SP_SSID, is_laa
 
 def rt_field(pkt, name):
     try:
@@ -43,6 +43,10 @@ def report(path):
     prot_data = []      # every protected data frame: (a1, a2, len, hex48)
     action = []
     t0 = None
+    all_ssids = Counter()
+    scan_probes = 0
+    all_macs = set()
+    nin_macs = set()
 
     for pkt in PcapReader(path):
         total += 1
@@ -50,6 +54,11 @@ def report(path):
             continue
         d = pkt[Dot11]
         types[(d.type, d.subtype)] += 1
+        for m in (d.addr1, d.addr2, d.addr3):
+            if m:
+                all_macs.add(m)
+                if m[:8].lower() in NIN_OUIS:
+                    nin_macs.add(m)
         ch = freq_to_ch(rt_field(pkt, "ChannelFrequency"))
         if ch: rt_channels[ch] += 1
 
@@ -65,6 +74,9 @@ def report(path):
                     else:
                         other_vendor_oui[raw[:3].hex(':')] += 1
                 el = el.payload.getlayer(Dot11Elt)
+            if ssid is not None:
+                all_ssids[ssid] += 1
+                scan_probes += ssid == SP_SSID
             if nie:
                 kind = "probe_req" if d.subtype == 4 else "probe_resp"
                 sp_probe_ch[(kind, ch)] += 1
@@ -170,6 +182,13 @@ def report(path):
     else:
         print("    (none: no protected data between consoles. Capture DURING the exchange on a")
         print("     fixed channel; retry ch 1 -> 6 -> 11.)")
+
+    print(f"\n[9] DISCOVERY OVERVIEW  ({len(all_macs)} unique MACs)")
+    print(f"    {SP_SSID.decode()} probes: {scan_probes}")
+    print("    probe SSIDs (top 15):")
+    for s, n in all_ssids.most_common(15):
+        print(f"      {n:5}  {s!r}")
+    print(f"    MACs with a Nintendo OUI: {sorted(nin_macs) or 'none'}")
     print()
 
 if __name__ == "__main__":

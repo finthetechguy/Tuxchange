@@ -1,13 +1,13 @@
 #!/bin/bash
 # Run sp_link.py once by hand, with a capture and a log, for debugging.
-#   sudo ./scripts/tuxchange-link <iface> [channel] [sp_link.py arguments]
+#   sudo ./scripts/tuxchange-link [iface] [channel] [sp_link.py arguments]
 # WARNING: arms a forced SysRq reboot before touching the radio, cancelled on a clean exit.
 set -u
 
-IFACE=${1:-}
+IFACE=${1:-}          # empty: sp_monitor.sh picks a usable adapter
 CH=${2:-1,6,11}
 shift 2 2>/dev/null || shift $# 2>/dev/null
-MON=mon0
+MON=${SP_MON:-mon0}
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/.." && pwd)
 PY="$ROOT/.venv/bin/python"
@@ -18,13 +18,6 @@ RUN_SECS=$(printf '%s\n' "$@" | awk '/^--secs$/{getline; print; exit}')
 DEADMAN_MIN=${DEADMAN_MIN:-$(( RUN_SECS / 60 + 8 ))}
 
 if [ "$(id -u)" -ne 0 ]; then echo "needs root; re-run with sudo."; exit 1; fi
-for t in iw ip timeout; do command -v $t >/dev/null || { echo "install $t"; exit 1; }; done
-
-if ! timeout 10 iw dev "$IFACE" info >/dev/null 2>&1; then
-  echo "no such wireless interface: $IFACE"; iw dev | sed -n 's/^\tInterface /  /p'; exit 1
-fi
-DRIVER=$(basename "$(readlink -f "/sys/class/net/$IFACE/device/driver" 2>/dev/null)" 2>/dev/null)
-echo "interface $IFACE (driver ${DRIVER:-unknown}), channel $CH"
 
 DEADMAN_ARMED=0
 # Not `shutdown -r +N`: it writes /run/nologin, which blocks the SSH login needed to cancel it.
@@ -47,63 +40,21 @@ disarm_deadman() {
   echo "forced reboot cancelled"
 }
 
-# Only an adapter that was up before this script ran gets brought back up.
-IFACE_WAS_UP=0
-note_iface_state() {
-  case "$(ip -o link show "$IFACE" 2>/dev/null)" in
-    *'<UP,'*|*',UP,'*|*',UP>'*) IFACE_WAS_UP=1 ;;
-  esac
-}
-restore_iface() {
-  [ "$IFACE_WAS_UP" -eq 1 ] || return 0
-  IFACE_WAS_UP=0    # INT and EXIT both run cleanup
-  if timeout 15 ip link set "$IFACE" up 2>/dev/null; then
-    echo "$IFACE brought back up"
-  else
-    echo "could not bring $IFACE back up; run: sudo ip link set $IFACE up"
-  fi
-}
+OURMAC=${OURMAC:-$(printf 'ba:ae:6e:%02x:%02x:%02x' $((RANDOM%256)) $((RANDOM%256)) $((RANDOM%256)))}
 
-NM_WAS_ACTIVE=0
 cleanup() {
   echo
   echo "cleaning up..."
-  timeout 10 iw dev "$MON" del 2>/dev/null
-  if [ "$NM_WAS_ACTIVE" -eq 1 ]; then systemctl start NetworkManager; fi
-  restore_iface
+  SP_IFACE=$IFACE SP_MON=$MON "$HERE/sp_monitor.sh" down
   disarm_deadman
 }
 trap cleanup EXIT INT TERM
 
 arm_deadman
-note_iface_state
-
-if command -v systemctl >/dev/null && systemctl is-active --quiet NetworkManager; then
-  NM_WAS_ACTIVE=1
-  echo "stopping NetworkManager..."
-  command -v nmcli >/dev/null && nmcli device disconnect "$IFACE" >/dev/null 2>&1
-  systemctl stop NetworkManager
-fi
-
-# `flags active` must be on the create command, or ath9k dereferences a NULL txq and oopses.
-OURMAC=${OURMAC:-$(printf 'ba:ae:6e:%02x:%02x:%02x' $((RANDOM%256)) $((RANDOM%256)) $((RANDOM%256)))}
-
-timeout 10 iw dev "$MON" del 2>/dev/null
-if ! timeout 15 iw dev "$IFACE" interface add "$MON" type monitor flags active; then
-  echo "could not create an ACTIVE monitor interface on $IFACE"
-  exit 1
-fi
-timeout 10 ip link set "$MON" down
-if ! timeout 10 ip link set "$MON" address "$OURMAC"; then
-  echo "could not set $MON MAC to $OURMAC"; exit 1
-fi
-# A full YY segment is 1538 bytes at the socket, over the default 1500 MTU.
-timeout 10 ip link set "$MON" mtu 2000 2>/dev/null \
-  || echo "WARNING: could not raise $MON MTU; 1452-byte segments will fail with EMSGSIZE"
-timeout 15 ip link set "$MON" up || { echo "could not bring $MON up"; exit 1; }
-# The managed vif holds the channel; with it up, `iw set channel` on mon0 returns EBUSY.
-timeout 15 ip link set "$IFACE" down 2>/dev/null
-echo "active monitor $MON up, MAC $OURMAC (hardware will ACK frames addressed to it)"
+SP_IFACE=$IFACE SP_MON=$MON SP_MAC=$OURMAC SP_CHANNELS=$CH "$HERE/sp_monitor.sh" up || exit 1
+[ -r /run/tuxchange.iface ] && IFACE=$(cat /run/tuxchange.iface)
+DRIVER=$(basename "$(readlink -f "/sys/class/net/$IFACE/device/driver" 2>/dev/null)" 2>/dev/null)
+echo "interface $IFACE (driver ${DRIVER:-unknown}), channel $CH"
 echo
 
 # Only ath9k has hardware TX counters; check the radio in use, not any radio on the machine.

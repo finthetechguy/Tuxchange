@@ -19,12 +19,16 @@ def _need_scapy(what):
 NIN_OUI = b'\x00\x1f\x32'
 SP_SSID = b"Nintendo_3DS_continuous_scan_000"
 
-# StreetPass probes use randomized MACs, so detect peers by the vendor IE.
-NIN_OUIS = {"00:1f:32","00:1a:e9","00:09:bf","00:16:56","00:17:ab","00:19:1d","00:1b:ea",
-            "00:1c:be","00:1d:bc","00:1e:35","00:21:bd","00:22:4c","00:23:cc","00:24:1e",
-            "00:24:44","00:25:a0","00:26:59","00:27:09","0c:fe:45","2c:10:c1","34:af:2c",
-            "40:d2:8a","58:bd:a3","5c:52:1e","78:a2:a0","8c:cd:e8","98:b6:e9","a4:5c:27",
-            "a4:c0:e1","b8:ae:6e","cc:9e:00","d8:6b:f7","dc:68:eb","e0:0c:7f","e8:4e:ce","ec:c4:0d"}
+# Nintendo's OUIs, for spotting a console's real address. StreetPass probes themselves use
+# randomized MACs, so peers are found by the vendor IE.
+NIN_OUIS = {"00:09:bf","00:16:56","00:17:ab","00:19:1d","00:19:fd","00:1a:e9","00:1b:7a",
+            "00:1b:ea","00:1c:be","00:1d:bc","00:1e:35","00:1e:a9","00:1f:32","00:1f:c5",
+            "00:21:47","00:21:bd","00:22:4c","00:22:aa","00:22:d7","00:23:31","00:23:cc",
+            "00:24:1e","00:24:44","00:24:f3","00:25:a0","00:26:59","00:27:09","04:03:d6",
+            "0c:fe:45","18:2a:7b","2c:10:c1","34:af:2c","40:d2:8a","40:f4:07","58:bd:a3",
+            "5c:52:1e","60:6b:ff","64:b5:c6","78:a2:a0","7c:bb:8a","8c:56:c5","8c:cd:e8",
+            "98:b6:e9","9c:e6:35","a4:5c:27","a4:c0:e1","b8:8a:ec","b8:ae:6e","cc:9e:00",
+            "cc:fb:65","d8:6b:f7","dc:68:eb","e0:0c:7f","e0:e7:51","e8:4e:ce","ec:c4:0d"}
 
 def is_laa(mac):
     """Locally-administered (randomized) unicast MAC, as 3DS StreetPass probes use."""

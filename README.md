@@ -66,7 +66,7 @@ Optional:
 | Package | What it adds |
 |---|---|
 | `pycryptodome` | Faster AES.  |
-| `scapy` | Reading packet captures: `tools/sp_report.py`, `tools/sp_diag.py`, and the `--replay` modes. |
+| `scapy` | Reading packet captures: `tools/sp_report.py` and the `--replay` modes. |
 | `PyGObject` + GTK4 + libadwaita | The GUI. |
 
 ### You must supply your own keys
