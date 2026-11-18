@@ -96,6 +96,8 @@ class YYSession:
         self.rx_done_len = 0
         self.syn_at = None
         self.syn_resends = 0
+        self.peer_window = WINDOW
+        self.window_probes = 0
         self.rx_expect = None
         self.rx_refused = None
         self.rx_total = 0
@@ -113,7 +115,8 @@ class YYSession:
         self.send_at = None             # deferred start_send(), driven by poll()
         self.stats = {'sent_objects': 0, 'recv_objects': 0, 'tx_frames': 0, 'rx_frames': 0,
                       'resends': 0, 'dup_tails': 0, 'syn_resends': 0, 'gaps': 0,
-                      'short_holds': 0, 'manifest_repeats': 0, 'refused': 0}
+                      'short_holds': 0, 'manifest_repeats': 0, 'refused': 0,
+                      'window_probes': 0}
 
     def _emit(self, flags, seq, ack, payload=b''):
         self.stats['tx_frames'] += 1
@@ -135,6 +138,8 @@ class YYSession:
         self.tx_obj = obj
         self.dup_acks = self.resends = 0
         self.syn_resends = 0
+        self.peer_window = WINDOW
+        self.window_probes = 0
         self.last_progress = time.time()
         self.segs = segment(obj)
         self.log('  --> opening connection for object %d (%d B, %d segment(s))'
@@ -142,19 +147,29 @@ class YYSession:
         self.syn_at = time.time()
         return self._emit(sp_yy.SYN, 0, 0)
 
-    def _pump_send(self, peer_ack, peer_window):
+    def _pump_send(self):
         """Send as much of the current object as the peer's window allows."""
+        # Retail peers always advertise 14,520 B; END still falls on those boundaries.
+        limit = self.tx_acked + min(self.peer_window, WINDOW)
         sent_any = False
         while self.segs:
             flags, seq, chunk = self.segs[0]
-            if seq + len(chunk) > peer_ack + max(peer_window, MAX_SEG):
+            room = limit - seq
+            if room <= 0 and chunk:
                 break
-            self.segs.pop(0)
+            if len(chunk) > room:
+                # Only the bytes the peer has room for; the rest keeps the segment's flags.
+                self.segs[0] = (flags, seq + room, chunk[room:])
+                flags, chunk = sp_yy.ACK, chunk[:room]
+            else:
+                self.segs.pop(0)
             self._emit(flags, seq, 0, chunk)
             self.tx_seq = max(self.tx_seq, seq + len(chunk))
             sent_any = True
-            if flags & sp_yy.URG:
+            if flags & sp_yy.URG or seq + len(chunk) >= limit:
                 break
+        if sent_any:
+            self.window_probes = 0
         return sent_any
 
     def _retransmit(self, why):
@@ -169,7 +184,8 @@ class YYSession:
         self.resends += 1
         self.stats['resends'] += 1
         self.dup_acks = 0
-        self.segs = [seg for seg in segment(self.tx_obj) if seg[1] + len(seg[2]) > self.tx_acked]
+        self.segs = [(fl, max(sq, self.tx_acked), p[max(0, self.tx_acked - sq):])
+                     for fl, sq, p in segment(self.tx_obj) if sq + len(p) > self.tx_acked]
         self.tx_seq = self.tx_acked
         self.last_progress = time.time()
         self.log('  RETRANSMIT object %d from %#x (%d of %d B acknowledged, %d segment(s)): %s'
@@ -202,9 +218,11 @@ class YYSession:
             if self.role != 'send':
                 return False
             self.syn_at = None
+            if self.tx_acked == 0:
+                self.peer_window = y['window']
             self._emit(sp_yy.ACK, 0, 0)
             if self.tx_seq == 0:
-                self._pump_send(0, y['window'])
+                self._pump_send()
             return True
 
         # A non-zero seq on an empty buffer is the peer resending its last END, so repeat the ACK.
@@ -294,10 +312,18 @@ class YYSession:
                          % (y['ack'], self.idx_tx, len(self.tx_obj),
                             ', no SYN|ACK yet' if self.syn_at is not None else ''), 2)
                 return False
-            before = self.tx_acked
+            before, window_before = self.tx_acked, self.peer_window
+            if y['ack'] >= self.tx_acked:
+                # A reordered older ACK carries an older window too.
+                self.peer_window = y['window']
+                if self.peer_window != window_before:
+                    self.log('  peer window for object %d is now %d B at %#x'
+                             % (self.idx_tx, self.peer_window, y['ack']), 2)
             self.tx_acked = max(self.tx_acked, y['ack'])
             if self.tx_acked > before:
                 self.dup_acks = 0
+                self.last_progress = time.time()
+            elif self.peer_window != window_before:
                 self.last_progress = time.time()
             elif self.tx_seq > self.tx_acked and self.tx_acked > 0:
                 # `tx_acked > 0` separates a duplicate ACK from handshake ACKs, which carry ack=0.
@@ -314,7 +340,7 @@ class YYSession:
                 self.role = None
                 self.idle_since = time.time()
                 return False
-            return self._pump_send(self.tx_acked, y['window'])
+            return self._pump_send()
         return False
 
     def _refuse(self, why):
@@ -354,8 +380,12 @@ class YYSession:
         if (self.role == 'send' and self.tx_obj and self.tx_seq > self.tx_acked
                 and time.time() - self.last_progress > RETRANSMIT_AFTER):
             if self._retransmit('no acknowledgement for %.0f ms' % (RETRANSMIT_AFTER * 1000)):
-                return self._pump_send(self.tx_acked, WINDOW)
+                return self._pump_send()
             return False
+        if (self.role == 'send' and self.syn_at is None and self.segs
+                and self.tx_seq <= self.tx_acked
+                and time.time() - self.last_progress > RETRANSMIT_AFTER):
+            return self._probe_window()
         if self.role is not None or self.idle_since is None:
             return False
         if time.time() - self.idle_since < idle_timeout:
@@ -365,6 +395,23 @@ class YYSession:
                  % (idle_timeout * 1000))
         self._maybe_repeat_manifest()
         return self.start_send()
+
+    def _probe_window(self):
+        """Ask a peer whose window is closed for a fresh ACK, without sending it any data."""
+        if self.window_probes >= MAX_RESENDS:
+            if self.window_probes == MAX_RESENDS:
+                self.window_probes += 1
+                self.log('  the peer kept its window closed through %d probe(s); giving up on '
+                         'object %d at %d of %d B' % (MAX_RESENDS, self.idx_tx, self.tx_acked,
+                                                      len(self.tx_obj)))
+            return False
+        self.window_probes += 1
+        self.stats['window_probes'] += 1
+        self.last_progress = time.time()
+        self.log('  peer window is %d B with %d B of object %d left; probing (%d)'
+                 % (self.peer_window, len(self.tx_obj) - self.tx_acked, self.idx_tx,
+                    self.window_probes))
+        return self._emit(sp_yy.ACK, self.tx_seq, 0)
 
     def _maybe_repeat_manifest(self):
         """Send our 0x81 again when the console answers it with nothing."""
@@ -994,6 +1041,134 @@ def _selftest():
         s29.delivered == [big_o] and s29.idx_tx == 1, s29.idx_tx)
     s29.on_frame(sp_yy.parse(build_yy_frame(sp_yy.ACK, 0, len(small_o))))
     chk('its own ACK does', s29.delivered == [big_o, small_o] and s29.idx_tx == 2)
+
+    class WindowPeer:
+        """A receiver that advertises a chosen window and checks every byte against it."""
+
+        def __init__(self, obj, window):
+            self.obj, self.window = obj, window
+            self.buf = bytearray()
+            self.frames, self.over = [], []
+            self.s = YYSession(self.wire, lambda m, l=1: None, [obj])
+            self.s.start_send()
+            self.edge = 0
+            self.tell(sp_yy.SYN | sp_yy.ACK, 0)
+
+        def wire(self, flags, seq, ack, payload=b''):
+            self.frames.append((flags, seq, bytes(payload)))
+            if payload and seq + len(payload) > self.edge:
+                self.over.append((seq, len(payload), self.edge))
+            if payload and seq == len(self.buf):
+                self.buf += payload
+            return True
+
+        def tell(self, flags, ack, window=None):
+            if window is not None:
+                self.window = window
+            self.edge = ack + self.window
+            self.s.on_frame(sp_yy.parse(build_yy_frame(flags, 0, ack, window=self.window)))
+
+        def ack(self, window=None):
+            self.tell(sp_yy.ACK, len(self.buf), window)
+
+        def timeout(self):
+            self.s.last_progress -= RETRANSMIT_AFTER + 0.1
+            return self.s.poll()
+
+        def data(self):
+            return [(f, sq, p) for f, sq, p in self.frames if p]
+
+    wobj = bytes(range(251)) * 131
+
+    w0 = WindowPeer(wobj, 0)
+    chk('a SYN|ACK with a zero window releases no data', w0.data() == [], len(w0.data()))
+    w0.timeout()
+    chk('nor does the timeout: it sends an empty window probe instead',
+        w0.data() == [] and w0.frames[-1] == (sp_yy.ACK, 0, b'')
+        and w0.s.stats['window_probes'] == 1 and w0.s.stats['resends'] == 0,
+        (len(w0.data()), w0.s.stats))
+    w0.ack(window=WINDOW)
+    chk('a reopened window resumes the transfer from 0',
+        w0.data() and w0.data()[0][1] == 0 and len(w0.buf) == WINDOW, len(w0.buf))
+    for _ in range(20):
+        if w0.s.delivered:
+            break
+        w0.ack()
+    chk('and the object is delivered whole', w0.s.delivered == [wobj] and bytes(w0.buf) == wobj)
+    chk('without a byte beyond the advertised credit', w0.over == [], w0.over[:3])
+
+    w1 = WindowPeer(wobj, 500)
+    for _ in range(200):
+        if w1.s.delivered:
+            break
+        w1.ack()
+    chk('a sub-segment window is filled exactly, never overrun',
+        w1.over == [] and all(len(p) <= 500 for _f, _s, p in w1.data()), w1.over[:3])
+    chk('and the object still arrives whole', w1.s.delivered == [wobj] and bytes(w1.buf) == wobj)
+    ends = [sq + len(p) for f, sq, p in w1.data() if f & sp_yy.URG]
+    chk('END stays on the window and object boundaries', ends == [WINDOW, 2 * WINDOW, len(wobj)],
+        ends)
+
+    w2 = WindowPeer(wobj, WINDOW)
+    chk('a full window goes out at once', w2.s.tx_seq == WINDOW, w2.s.tx_seq)
+    w2.buf = w2.buf[:2 * MAX_SEG]
+    w2.ack(window=MAX_SEG)
+    chk('a window that shrinks below what is in flight sends nothing more',
+        w2.s.tx_seq == WINDOW and w2.over == [], w2.s.tx_seq)
+    n = len(w2.frames)
+    w2.timeout()
+    resent = [(sq, len(p)) for f, sq, p in w2.frames[n:] if p]
+    chk('the timeout resends only what the shrunken window admits',
+        resent == [(2 * MAX_SEG, MAX_SEG)] and w2.over == [], resent)
+    w2.ack(window=0)
+    n = len(w2.frames)
+    w2.timeout()
+    chk('a window that closes stops even retransmission', not any(p for _f, _s, p in w2.frames[n:])
+        and w2.s.stats['window_probes'] == 1, w2.frames[n:])
+    w2.ack(window=WINDOW)
+    for _ in range(20):
+        if w2.s.delivered:
+            break
+        w2.ack()
+    chk('and reopening it completes the object',
+        w2.s.delivered == [wobj] and bytes(w2.buf) == wobj and w2.over == [], w2.over[:3])
+
+    w3 = WindowPeer(wobj, 3000)
+    w3.ack()
+    w3.ack()
+    w3.tell(sp_yy.ACK, 0, window=0)
+    chk('a reordered older ACK does not overwrite the newer window',
+        w3.s.peer_window == 3000, w3.s.peer_window)
+
+    w4 = WindowPeer(wobj[:4000], WINDOW)
+    w4.buf = w4.buf[:MAX_SEG]
+    w4.ack()
+    for wnd in (WINDOW - 1, WINDOW - 2, WINDOW - 3):
+        w4.ack(window=wnd)
+    chk('window updates are not counted as duplicate ACKs', w4.s.stats['resends'] == 0,
+        w4.s.stats['resends'])
+
+    w5 = WindowPeer(wobj, 0)
+    w5_log = []
+    w5.s.log = lambda m, l=1: w5_log.append(m)
+    for _ in range(MAX_RESENDS + 4):
+        w5.timeout()
+    chk('probing a window that never opens is bounded',
+        w5.s.stats['window_probes'] == MAX_RESENDS and w5.data() == [],
+        w5.s.stats['window_probes'])
+    chk('and the give-up is logged once', sum('giving up' in m for m in w5_log) == 1)
+
+    w6 = WindowPeer(wobj, WINDOW)
+    for _ in range(20):
+        if w6.s.delivered:
+            break
+        w6.ack()
+    chk('an ordinary 14,520 B window sends exactly the retail segmentation',
+        w6.data() == segment(wobj) and w6.s.stats['window_probes'] == 0,
+        len(w6.data()))
+    w7 = WindowPeer(wobj, 0xFFFF)
+    chk('a window wider than retail still stops at the first window boundary',
+        w7.s.tx_seq == WINDOW, w7.s.tx_seq)
 
     print('\n%d/%d checks passed' % (ok, tot))
     return 0 if ok == tot else 1
