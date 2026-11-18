@@ -591,6 +591,15 @@ def select_for_peer(store, peer_titles, book=None, mac=None, max_titles=None, lo
     return out
 
 
+def reciprocated(container, sent_modes):
+    """Retail files a send-mode-0 message only once its own mode-0 send of that title finished.
+
+    `sent_modes` maps each title to the send modes of our messages the peer acknowledged.
+    """
+    h = sp_cec.parse_header(container)
+    return h['send_mode'] != 0 or 0 in sent_modes.get(h['cec_title_id'], ())
+
+
 def import_into(store, path, log=print, replace=False, allow_empty=False, source=None):
     """Ingest CEC data from a save image, a mounted directory, or an emulator NAND.
 
@@ -977,6 +986,19 @@ class Control:
                 return {'ok': True, 'messages_removed': n}
             except Exception as e:
                 return {'ok': False, 'error': '%s: %s' % (type(e).__name__, e)}
+        if cmd == 'set_receive':
+            on = req.get('enabled')
+            if not isinstance(on, bool):
+                return {'ok': False, 'error': 'enabled must be true or false'}
+            try:
+                tid = parse_titles([req.get('title')])[0]
+                with r.lock:
+                    r.store.set_receive(tid, on)
+            except (ValueError, TypeError, IndexError) as e:
+                return {'ok': False, 'error': str(e) or 'set_receive needs a title'}
+            r.log('  title %08X %s' % (tid, 'will receive even with nothing to send' if on
+                                       else 'receives only alongside its own outbox'))
+            return {'ok': True, 'title': '%08x' % tid, 'receive': on}
         if cmd == 'message_remove':
             try:
                 tid = int(req['title'], 16) if isinstance(req['title'], str) else req['title']
@@ -1554,6 +1576,7 @@ class Relay:
         with self.lock:
             serv = {c[0x20:0x28] for c in self.servable()}
             out = {'titles': [], 'max_titles': sp_store.MBOXLIST_MAX}
+            receiving = set(self.store.receive_titles())
             for t in self.store.titles():
                 ms = []
                 for tid, box, c in self.store.messages(t):
@@ -1571,6 +1594,7 @@ class Relay:
                 out['titles'].append({
                     'title': '%08X' % t, 'name': self.store.title_name(t),
                     'has_key': self.store.title_key(t) is not None,
+                    'receive': t in receiving,
                     'messages': ms,
                 })
             return out
@@ -1698,7 +1722,9 @@ class Relay:
             picked = select_for_peer(self.store, titles, self.book, mac, log=self.log)
             held = ['%08X' % sp_cec.parse_header(c)['cec_title_id']
                     for _t, _b, c in self.store.messages(box='outbox')]
-        if not picked:
+            receiving = set(self.store.receive_titles())
+        inbound = [t for t in dict.fromkeys(titles) if t in receiving]
+        if not picked and not inbound:
             r = self._decline(link, 'nothing to serve',
                               '  nothing to serve %s (it declares %s; our outbox holds %s)'
                               % (mac, ['%08X' % t for t in titles], held))
@@ -1708,15 +1734,19 @@ class Relay:
         for i, c in enumerate(picked):
             picked[i] = sp_build.set_message_id(c)          # never a duplicate id
         known = {t: (f, tr) for t, f, tr in sp_link.T.SERVICES_FULL}
-        tids = list(dict.fromkeys(sp_build.message_title(c) for c in picked))
+        tids = list(dict.fromkeys([sp_build.message_title(c) for c in picked] + inbound))
         services = [(t,) + known.get(t, (0x30, b'')) for t in tids]
+        if not picked:
+            self.log('  nothing to send %s; registered to receive %s'
+                     % (mac, ['%08X' % t for t in inbound]))
         prefix = [sp_link.build_obj_41(link.src),
                   sp_build.cec_object(0x43, sp_link.OBJ_43_PAYLOAD, flags=0x0000),
                   sp_link.build_obj_11(link.token, services)]
-        objects = prefix + sp_build.build_outbox(picked)
+        objects = prefix + sp_build.build_outbox(picked, allow_empty=True)
         ids = [c[sp_build.ENVELOPE_LEN + 0x20:sp_build.ENVELOPE_LEN + 0x28] for c in picked]
         self._pending_sent = list(ids)
-        self._detail = {mid: {'title': '%08X' % sp_build.message_title(c), 'bytes': len(c)}
+        self._detail = {mid: {'title': '%08X' % sp_build.message_title(c), 'bytes': len(c),
+                              'mode': sp_build.header_send_mode(c)}
                         for c, mid in zip(picked, ids)}
         return services, objects
 
@@ -1782,6 +1812,11 @@ class Relay:
                      '%d acknowledged, %d withheld as refused, %d admitted but not acknowledged'
                      % (len(sess.admitted), len(refused_titles), len(offered),
                         len(self._pending_sent), len(withheld), len(unacked)))
+        sent_modes = {}
+        for m in self._pending_sent:
+            d = detail.get(m)
+            if d:
+                sent_modes.setdefault(int(d['title'], 16), set()).add(d.get('mode'))
         got_detail = []
         for obj in (getattr(sess, 'received', None) or []):
             if obj[:2] != b'\x61\x61':
@@ -1794,6 +1829,11 @@ class Relay:
                 continue
             for c in containers:
                 tid = sp_cec.parse_header(c)['cec_title_id']
+                if not reciprocated(c, sent_modes):
+                    self.log('  not filing %08X/%s from %s: it is send mode 0, and our own mode-0 '
+                             'send of that title did not complete'
+                             % (tid, c[0x20:0x28].hex(), peer or '?'))
+                    continue
                 try:
                     # Filed in the inbox with its origin, which keeps it from being offered to a console.
                     with self.lock:
@@ -3380,6 +3420,69 @@ def _selftest():
             rnl2.peer_hook(nl, 'DE:AD:BE:EF:00:03', [{'titleID': '00020800'}]) is None)
         chk('and it is still marked on that link', getattr(nl, 'declined', None) == 'blocked')
 
+        LETTERS, MARIO, PLAZA = 0x00040800, 0x0010BF00, 0x00020800
+        rk = b'r' * 32
+
+        def _wire(tid, mode, mid):
+            return sp_build.build_envelope(bytes(0x40), tid, key=rk, message_id=mid,
+                                           send_mode=mode, ex_headers=[])
+        rrx = Relay(argparse.Namespace(**{**vars(args), 'store': os.path.join(tmp, 'recv')}))
+        for t in (LETTERS, MARIO, PLAZA):
+            rrx.store.add_title(t, hmac_key=rk)
+        rx_peer = [{'titleID': '%08x' % t} for t in (MARIO, LETTERS)]
+        chk('a registered title with an empty outbox is still declined until enabled',
+            rrx.peer_hook(nl, 'DE:AD:BE:EF:01:01', rx_peer) is None
+            and rrx._declined == 'nothing to serve')
+        sc_rx = Control(os.path.join(tmp, 'rx.sock'), rrx)
+        chk('set_receive refuses a non-boolean',
+            not sc_rx.handle({'cmd': 'set_receive', 'title': '00040800', 'enabled': 'on'})['ok'])
+        chk('and a title that is not registered',
+            not sc_rx.handle({'cmd': 'set_receive', 'title': '00999900', 'enabled': True})['ok'])
+        chk('set_receive enables a registered title',
+            sc_rx.handle({'cmd': 'set_receive', 'title': '00040800', 'enabled': True})['ok']
+            and rrx.store.receive_titles() == [LETTERS])
+        chk('and the store description shows it',
+            [x['title'] for x in rrx.describe_store()['titles'] if x['receive']] == ['00040800'])
+        got_rx = rrx.peer_hook(nl, 'DE:AD:BE:EF:01:02', rx_peer)
+        chk('an enabled title with an empty outbox is served a receive-only session',
+            got_rx is not None and rrx._declined is None)
+        if got_rx:
+            svc_rx, objs_rx = got_rx
+            chk('it advertises only the enabled title the peer declared',
+                [t for t, _f, _tr in svc_rx] == [LETTERS], svc_rx)
+            chk('with an empty offer and manifest, and no envelope',
+                [sp_build.object_type(o) for o in objs_rx][-5:] == [0x21, 0x23, 0x31, 0x33, 0x81]
+                and sp_build.parse_ee_list(objs_rx[-3][0x10:]) == []
+                and sp_build.parse_ee_list(objs_rx[-2][0x10:]) == []
+                and struct.unpack_from('<I', objs_rx[-1], 0x10)[0] == 0
+                and envelope_ids(objs_rx) == [])
+            chk('and nothing is pending to credit', rrx._pending_sent == [])
+        chk('a peer that does not declare the enabled title is still declined',
+            rrx.peer_hook(nl, 'DE:AD:BE:EF:01:03', [{'titleID': '%08x' % MARIO}]) is None)
+        rrx.store.add_message(sp_build.unwrap(_wire(MARIO, 3, 0x5151))[0], 'outbox')
+        got_mix = rrx.peer_hook(nl, 'DE:AD:BE:EF:01:04', rx_peer)
+        chk('an enabled title rides alongside unrelated outbound data',
+            got_mix is not None
+            and [t for t, _f, _tr in got_mix[0]] == [MARIO, LETTERS], got_mix and got_mix[0])
+        if got_mix:
+            chk('but only the outbound title is offered and carried',
+                [e['title'] for e in sp_build.parse_ee_list(
+                    next(o for o in got_mix[1] if sp_build.object_type(o) == 0x31)[0x10:])]
+                 == [MARIO]
+                and len(envelope_ids(got_mix[1])) == 1)
+        chk('set_receive turns it off again',
+            sc_rx.handle({'cmd': 'set_receive', 'title': '00040800', 'enabled': False})['ok']
+            and rrx.store.receive_titles() == [])
+
+        letter3 = sp_build.unwrap(_wire(LETTERS, 3, 0x6161))[0]
+        plaza0 = sp_build.unwrap(_wire(PLAZA, 0, 0x7171))[0]
+        chk('one-way content needs no send of ours', reciprocated(letter3, {}))
+        chk('mode-0 content is refused when we sent nothing', not reciprocated(plaza0, {}))
+        chk('or sent only another title', not reciprocated(plaza0, {MARIO: {0}}))
+        chk('or sent that title in another mode', not reciprocated(plaza0, {PLAZA: {3}}))
+        chk('and is filed once our own mode-0 send of that title completed',
+            reciprocated(plaza0, {PLAZA: {0}}))
+
         r4 = Relay(argparse.Namespace(**{**vars(args), 'store': os.path.join(tmp, 'keep'),
                                          'keep_runs': 3}))
         rd = os.path.join(tmp, 'keep', 'runs')
@@ -3563,7 +3666,7 @@ def main():
                                         'forget', 'seed', 'store', 'encounters', 'encounters_clear', 'denylist',
                                         'log', 'block', 'unblock', 'unfilter', 'title_remove',
                                         'message_remove', 'rotate', 'set_adapter', 'set_logs',
-                                        'set_store'])
+                                        'set_store', 'set_receive'])
     ct.add_argument('--store', default=sp_store.default_store())
     ct.add_argument('--path', help='for `ctl import`: what to ingest')
     ct.add_argument('--replace', action='store_true',
@@ -3582,7 +3685,10 @@ def main():
     ct.add_argument('--adapter', help='for `ctl set_adapter`: the interface name')
     ct.add_argument('--logs', choices=['on', 'off'], help='for `ctl set_logs`')
     ct.add_argument('--new-store', help='for `ctl set_store`: a root-owned directory')
-    ct.add_argument('--title', help='for title_remove / message_remove, 8 hex digits')
+    ct.add_argument('--title', help='for title_remove / message_remove / set_receive, '
+                                    '8 hex digits')
+    ct.add_argument('--receive', choices=['on', 'off'],
+                    help='for `ctl set_receive`: receive for --title even with an empty outbox')
     ct.add_argument('--id', help='for `ctl message_remove`: the message id, 16 hex digits')
     ct.add_argument('--box', default='outbox', choices=['inbox', 'outbox'])
     ct.add_argument('--limit', type=int, help='for encounters / log')
@@ -3683,6 +3789,10 @@ def main():
             if not a.logs:
                 print('ctl set_logs needs --logs on|off'); return 2
             kw = {'enabled': a.logs == 'on'}
+        elif a.command == 'set_receive':
+            if not (a.title and a.receive):
+                print('ctl set_receive needs --title and --receive on|off'); return 2
+            kw = {'title': a.title, 'enabled': a.receive == 'on'}
         elif a.command == 'set_store':
             if not a.new_store:
                 print('ctl set_store needs --new-store'); return 2
