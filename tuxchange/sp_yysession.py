@@ -79,6 +79,8 @@ class YYSession:
         self.on_received = on_received  # hook(idx, obj) -> may rewrite self.outbox
         self.idx_tx = 0
         self.received = []
+        # Each of our objects the peer acknowledged in full, in order, as the bytes that went.
+        self.delivered = []
         self.role = None
         self.tx_seq = 0
         self.tx_acked = 0
@@ -286,6 +288,12 @@ class YYSession:
         if f & sp_yy.ACK:
             if self.role != 'send':
                 return False
+            if y['ack'] > len(self.tx_obj) or (self.syn_at is not None and y['ack']):
+                # No data of this object is out yet, or it is shorter: the ACK is for another.
+                self.log('  ignoring an ACK of %d B that is not for object %d (%d B%s)'
+                         % (y['ack'], self.idx_tx, len(self.tx_obj),
+                            ', no SYN|ACK yet' if self.syn_at is not None else ''), 2)
+                return False
             before = self.tx_acked
             self.tx_acked = max(self.tx_acked, y['ack'])
             if self.tx_acked > before:
@@ -300,6 +308,7 @@ class YYSession:
             if not self.segs and self.tx_acked >= self.tx_seq and self.tx_seq > 0:
                 self.log('  ==> object %d delivered (%d B acknowledged)'
                          % (self.idx_tx, self.tx_acked))
+                self.delivered.append(self.tx_obj)
                 self.idx_tx += 1
                 self.stats['sent_objects'] += 1
                 self.role = None
@@ -967,6 +976,24 @@ def _selftest():
     s28.rx_total = MAX_RECEIVED_BYTES - 8
     push(s28, cc(0x40, bytes(4)), sp_yy.ACK | sp_yy.PSH | sp_yy.URG)
     chk('and at most MAX_RECEIVED_BYTES in all', not s28.received and s28.stats['refused'] == 1)
+
+    big_o, small_o = b'\xB1' * 4000, b'\xB2' * 100
+    s29 = YYSession(lambda *_a: True, lambda m, l=1: None, [big_o, small_o])
+    s29.start_send()
+    s29.on_frame(sp_yy.parse(build_yy_frame(sp_yy.SYN | sp_yy.ACK, 0, 0)))
+    s29.on_frame(sp_yy.parse(build_yy_frame(sp_yy.ACK, 0, len(big_o))))
+    chk('a delivered object is recorded as the bytes that went', s29.delivered == [big_o])
+    s29.idle_since -= 1.0
+    s29.poll()
+    s29.on_frame(sp_yy.parse(build_yy_frame(sp_yy.ACK, 0, len(big_o))))
+    chk('an ACK before the next object\'s SYN|ACK is not taken for it',
+        s29.delivered == [big_o] and s29.tx_acked == 0 and s29.tx_seq == 0)
+    s29.on_frame(sp_yy.parse(build_yy_frame(sp_yy.SYN | sp_yy.ACK, 0, 0)))
+    s29.on_frame(sp_yy.parse(build_yy_frame(sp_yy.ACK, 0, len(big_o))))
+    chk('a repeated ACK of the longer object before it does not complete a shorter one',
+        s29.delivered == [big_o] and s29.idx_tx == 1, s29.idx_tx)
+    s29.on_frame(sp_yy.parse(build_yy_frame(sp_yy.ACK, 0, len(small_o))))
+    chk('its own ACK does', s29.delivered == [big_o, small_o] and s29.idx_tx == 2)
 
     print('\n%d/%d checks passed' % (ok, tot))
     return 0 if ok == tot else 1

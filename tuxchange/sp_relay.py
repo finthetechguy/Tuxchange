@@ -1201,20 +1201,6 @@ def outbox_put(r, req):
             'bytes': len(container), 'replaced': n, 'servable': len(r.servable())}
 
 
-def credited_objects(sess, log=print):
-    """How many of our objects the console really kept, for recording an exchange.
-
-    A console that never sent its own 0x81 list drops everything it acknowledged (no green LED),
-    and recording it would filter the MAC for an exchange that never happened.
-    """
-    delivered = sess.stats.get('sent_objects', 0) if sess else 0
-    if delivered and not sess.peer_sent_manifest():
-        log('  the console acknowledged %d object(s) but never sent its own list, so it stored '
-            'none of them; not counting this as an exchange' % delivered)
-        return 0
-    return delivered
-
-
 def envelope_ids(objects, log=None):
     """-> the message ids carried by the envelopes among `objects`, in order."""
     ids = []
@@ -1230,9 +1216,21 @@ def envelope_ids(objects, log=None):
 
 
 def credited_messages(sess, wanted, log=print):
-    """-> the ids in `wanted` that rode in an envelope the console acknowledged."""
-    delivered = credited_objects(sess, log)
-    went = set(envelope_ids(sess.outbox[:delivered], log)) if delivered else set()
+    """-> the ids in `wanted` whose envelope the console acknowledged in full.
+
+    Only the objects the session saw acknowledged count, so a recovery probe or a control object
+    credits nothing. An acknowledgement is not storage either: cecd files what it received only
+    after the session, and a console that never sent its own 0x81 list drops all of it (no green
+    LED), so recording that would filter the MAC for an exchange that never happened.
+    """
+    acked = list(getattr(sess, 'delivered', None) or [])
+    if not acked:
+        return []
+    if not sess.peer_sent_manifest():
+        log('  the console acknowledged %d object(s) but never sent its own list, so it will '
+            'keep none of them; not counting this as an exchange' % len(acked))
+        return []
+    went = set(envelope_ids(acked, log))
     return [m for m in wanted if m in went]
 
 
@@ -1773,7 +1771,17 @@ class Relay:
         got = []
         sess = getattr(link, 'session', None)
         # Record only what was delivered, or a failed exchange would use up its messages.
-        self._pending_sent = credited_messages(sess, self._pending_sent, self.log)
+        offered = self._pending_sent
+        self._pending_sent = credited_messages(sess, offered, self.log)
+        detail = getattr(self, '_detail', {})
+        refused_titles = {'%08X' % t for t in (getattr(sess, 'refused', None) or [])}
+        withheld = [m for m in offered if detail.get(m, {}).get('title') in refused_titles]
+        unacked = [m for m in offered if m not in self._pending_sent and m not in withheld]
+        if sess is not None and getattr(sess, 'admitted', None) is not None:
+            self.log('  its verdict admitted %d title(s) and refused %d; of our %d message(s), '
+                     '%d acknowledged, %d withheld as refused, %d admitted but not acknowledged'
+                     % (len(sess.admitted), len(refused_titles), len(offered),
+                        len(self._pending_sent), len(withheld), len(unacked)))
         got_detail = []
         for obj in (getattr(sess, 'received', None) or []):
             if obj[:2] != b'\x61\x61':
@@ -1801,18 +1809,21 @@ class Relay:
         if not peer:
             return False
         self.last_peer = peer
-        detail = getattr(self, '_detail', {})
         if self._pending_sent or got:
             self.book.record(peer, self._pending_sent, got)
             self.exchanges += 1
             self.last_success = time.time()
             self.note_encounter({'peer': peer, 'result': 'exchanged',
                                  'sent': [detail.get(m, {}) for m in self._pending_sent],
+                                 'refused': [detail.get(m, {}) for m in withheld],
                                  'received': got_detail})
-            self.log('  exchanged with %s: sent %d, received %d (store now holds %d)'
-                     % (peer, len(self._pending_sent), len(got), len(self.store.messages())))
+            self.log('  exchanged with %s: %d of ours acknowledged, %d refused by title, '
+                     'received %d (store now holds %d)'
+                     % (peer, len(self._pending_sent), len(withheld), len(got),
+                        len(self.store.messages())))
             self.hooks.fire('exchange', peer=peer, sent=len(self._pending_sent),
-                            received=len(got), exchanges=self.exchanges)
+                            refused=len(withheld), received=len(got),
+                            exchanges=self.exchanges)
             return True
         # A declined peer did not fail, so do not re-arm its retry backoff.
         if self._declined or self.book.is_blocked(peer):
@@ -2244,18 +2255,11 @@ def _selftest():
         NS = argparse.Namespace
         import sp_yysession
 
-        def _sess(types, sent):
+        def _sess(types, acked):
             s = sp_yysession.YYSession(lambda *a: True, lambda *a: None, [])
             s.received = [b'cc\x00\x00' + struct.pack('<III', t, 0, 0) for t in types]
-            s.stats['sent_objects'] = sent
+            s.delivered = list(acked)
             return s
-        quiet = []
-        chk('a silent pass (the console stopped at its 0x34) credits nothing',
-            credited_objects(_sess([0x42, 0x43, 0x12, 0x22, 0x24, 0x32, 0x34], 10),
-                             quiet.append) == 0 and quiet, quiet)
-        chk('a pass where the console sent its 0x81 credits what was delivered',
-            credited_objects(_sess([0x32, 0x34, 0x81], 10), quiet.append) == 10)
-        chk('no session credits nothing', credited_objects(None, quiet.append) == 0)
 
         def _env(tid, n=1):
             return sp_build.envelope([sp_build.unwrap(sp_build.build_envelope(
@@ -2270,16 +2274,52 @@ def _selftest():
         vt = (0x00020800, 0x00030600, 0x0008C500)
         vmsgs = [_env(vt[0]), _env(vt[1], 2), _env(vt[2])]
         vids = envelope_ids(vmsgs)
+        quiet = []
+        chk('a silent pass (the console stopped at its 0x34) credits nothing',
+            credited_messages(_sess([0x42, 0x43, 0x12, 0x22, 0x24, 0x32, 0x34], vmsgs), vids,
+                              quiet.append) == [] and quiet, quiet)
+        chk('a pass where the console sent its 0x81 credits what was acknowledged',
+            credited_messages(_sess([0x32, 0x34, 0x81], vmsgs), vids, quiet.append) == vids)
+        chk('no session credits nothing', credited_messages(None, vids, quiet.append) == [])
+        chk('control objects credit nothing, however many were acknowledged',
+            credited_messages(_sess([0x81], [sp_build.cec_object(t, b'') for t in
+                                             (0x41, 0x43, 0x11, 0x81, 0xF2)]),
+                              vids, quiet.append) == [])
+
         vout = sp_build.build_outbox(vmsgs)
         cut, _adm, _ref = sp_build.apply_verdict(vout, _34([(vt[0], 2), (vt[1], 1), (vt[2], 1)]))
-        vs = _sess([0x32, 0x34, 0x81], len(cut))
-        vs.outbox = cut
+        tail = cut[next(i for i, o in enumerate(cut) if sp_build.object_type(o) == 0x81):]
         chk('a mixed verdict credits only the admitted titles\' messages',
-            credited_messages(vs, vids, quiet.append) == vids[1:], len(vids))
-        vs.outbox, vs.stats['sent_objects'] = sp_build.apply_verdict(
-            vout, _34([(t, 2) for t in vt]))[0], 5
+            credited_messages(_sess([0x81], tail), vids, quiet.append) == vids[1:])
+        none = sp_build.apply_verdict(vout, _34([(t, 2) for t in vt]))[0]
         chk('an all-refused verdict credits nothing',
-            credited_messages(vs, vids, quiet.append) == [])
+            credited_messages(_sess([0x81], none[-1:]), vids, quiet.append) == [])
+
+        import sp_yy
+
+        def _yy(sess, flags, ack=0, seq=0, pl=b''):
+            sess.on_frame(sp_yy.parse(sp_yysession.build_yy_frame(flags, seq, ack, pl)))
+        rs = sp_yysession.YYSession(lambda *a: True, lambda *a, **k: None, tail)
+        rs.repeat_slot, rs.repeat_max = 0, 1
+        rs.repeat_obj = sp_build.cec_object(0xF2, bytes(4))
+        rs.start_send()
+        _yy(rs, sp_yy.SYN | sp_yy.ACK)
+        _yy(rs, sp_yy.ACK, ack=len(tail[0]))
+        rs.idle_since -= 1.0
+        rs.poll()
+        _yy(rs, sp_yy.SYN | sp_yy.ACK)
+        _yy(rs, sp_yy.ACK, ack=len(rs.repeat_obj))
+        _yy(rs, sp_yy.SYN)
+        _yy(rs, sp_yy.ACK | sp_yy.PSH | sp_yy.URG, pl=sp_build.cec_object(0x81, bytes(196)))
+        _yy(rs, sp_yy.SYN | sp_yy.ACK)
+        chk('the recovery probe was inserted and acknowledged, then the first envelope went out',
+            rs.stats['sent_objects'] == 2 and rs.tx_obj is tail[1] and rs.tx_seq > 0,
+            rs.stats['sent_objects'])
+        chk('a probe ACK and then a timeout before the first payload ACK credits nothing',
+            credited_messages(rs, vids, quiet.append) == [])
+        _yy(rs, sp_yy.ACK, ack=len(tail[1]))
+        chk('once that envelope is acknowledged, both of its messages are credited',
+            credited_messages(rs, vids, quiet.append) == vids[1:3], len(rs.delivered))
         chk('the silent-send recovery is armed by default',
             recovery_argv(NS(manifest_repeat=1, repeat_type='0xf2'))
             == ['--manifest-repeat', '1', '--repeat-type', '0xf2'])

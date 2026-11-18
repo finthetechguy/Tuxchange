@@ -564,7 +564,8 @@ class EncountersPage(Page):
             ic.add_css_class({'exchanged': 'success', 'blocked': 'error'}
                              .get(res_txt, 'warning'))
             ex.add_prefix(ic)
-            for label, items in (('Sent', sent), ('Received', got)):
+            for label, items in (('Sent', sent), ('Refused', e.get('refused') or []),
+                                 ('Received', got)):
                 for it in items:
                     ex.add_row(row('%s  %s' % (label, it.get('title', '?')),
                                    human_bytes(it.get('bytes', 0))))

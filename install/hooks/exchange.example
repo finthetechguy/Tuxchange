@@ -8,8 +8,9 @@
 # NOTE: An event hook that takes longer than 10 seconds is killed, anything it starts in the
 # background is killed as soon as it exits, and only the first 2000 bytes of its output are logged.
 #
-# Available: TUXCHANGE_EVENT, TUXCHANGE_PEER, TUXCHANGE_SENT, TUXCHANGE_RECEIVED,
-#            TUXCHANGE_EXCHANGES
+# Available: TUXCHANGE_EVENT, TUXCHANGE_PEER, TUXCHANGE_SENT (messages the console acknowledged),
+#            TUXCHANGE_REFUSED (messages withheld because the console refused their title),
+#            TUXCHANGE_RECEIVED, TUXCHANGE_EXCHANGES
 # Other events: rotate (TUXCHANGE_MAC, _OLD_MAC, _ROTATIONS), error (TUXCHANGE_ERROR),
 #               start (TUXCHANGE_MAC, _STORE), stop (TUXCHANGE_EXCHANGES, _PASSES)
 
