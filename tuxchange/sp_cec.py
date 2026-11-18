@@ -5,13 +5,10 @@ parse_message, parse_stream and find_container_offsets are diagnostic: they desc
 damaged or partial data instead of refusing it. split_message, and sp_cecvalid behind it,
 are the strict path for anything that is stored, sent or handed to a plugin.
 """
-import struct, sys
+import struct, sys, time
 
 import sp_cecvalid
-
-MAX_BODY  = 0x18000   # body size must be != 0, <= 0x18000, and 4-byte aligned
-MAX_TOTAL = 0x19000   # bodySize + 0x70 must be <= 0x19000  (hence the 0x19000 read buffer)
-HDR_LEN   = 0x70
+from sp_cecvalid import MAX_BODY, MAX_TOTAL, HDR_LEN
 
 PLAZA_CEC_TITLE_ID = 0x00020800
 PLAZA_BODY_SIZE    = 0x60F0
@@ -58,7 +55,27 @@ def decode_utf16_name(raw):
     return raw.decode('utf-16-le', 'replace').split('\x00', 1)[0]
 
 
+def macstr(b):
+    return ':'.join('%02x' % c for c in b)
+
+
+def macbytes(s):
+    return bytes.fromhex(s.replace(':', ''))
+
+
 WEEKDAYS = ('Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat')
+
+
+def pack_timestamp(tm, ms=0):
+    """A struct_time -> the 12-byte CecTimestamp. The console counts weekdays from Sunday."""
+    return struct.pack('<IBBBBBBH', tm.tm_year, tm.tm_mon, tm.tm_mday, (tm.tm_wday + 1) % 7,
+                       tm.tm_hour, tm.tm_min, tm.tm_sec, ms)
+
+
+def timestamp(when=None):
+    """A CecTimestamp for `when` (default now) in local time, as the console's clock keeps it."""
+    when = time.time() if when is None else when
+    return pack_timestamp(time.localtime(when), int((when % 1) * 1000))
 
 
 def parse_timestamp(buf, off=0x60):
@@ -182,11 +199,6 @@ PLAZA_CLAMPS = {0x3F66: 0xCC, 0x3F67: 0x03, 0x3F68: 0x14, 0x3F69: 0x1C,
 PLAZA_EXCLUDED = {0x3F66: (69, 75, 168, 169)}
 
 
-def _utf16z(b):
-    s = b.decode('utf-16-le', errors='replace')
-    return s.split('\x00', 1)[0]
-
-
 def parse_plaza_body(body):
     out = {'fields': {}, 'problems': []}
     for off, size, name, note in PLAZA_MAP:
@@ -201,20 +213,20 @@ def parse_plaza_body(body):
         if off < len(body) and body[off] in bad:
             out['problems'].append(f"+{off:#06x} = {body[off]} is refused (receiver would zero it)")
     if 0x36BC <= len(body):
-        out['greeting'] = _utf16z(body[0x3F70:0x3F92]) if len(body) >= 0x3F92 else None
-        out['country'] = [_utf16z(body[0x3760 + i * 0x40: 0x3760 + (i + 1) * 0x40])
+        out['greeting'] = decode_utf16_name(body[0x3F70:0x3F92]) if len(body) >= 0x3F92 else None
+        out['country'] = [decode_utf16_name(body[0x3760 + i * 0x40: 0x3760 + (i + 1) * 0x40])
                           for i in range(16)] if len(body) >= 0x3B60 else []
-        out['region'] = [_utf16z(body[0x3B60 + i * 0x40: 0x3B60 + (i + 1) * 0x40])
+        out['region'] = [decode_utf16_name(body[0x3B60 + i * 0x40: 0x3B60 + (i + 1) * 0x40])
                          for i in range(16)] if len(body) >= 0x3F60 else []
         out['met16'] = []
         if len(body) >= 0x4482:
             for i in range(16):
                 r = body[0x3F92 + i * 10: 0x3F92 + (i + 1) * 10]
-                na = _utf16z(body[0x4032 + i * 0x22: 0x4032 + (i + 1) * 0x22])
-                nb = _utf16z(body[0x4252 + i * 0x22: 0x4252 + (i + 1) * 0x22])
+                na = decode_utf16_name(body[0x4032 + i * 0x22: 0x4032 + (i + 1) * 0x22])
+                nb = decode_utf16_name(body[0x4252 + i * 0x22: 0x4252 + (i + 1) * 0x22])
                 if any(r) or na or nb:
                     out['met16'].append({'idx': i, 'id': struct.unpack_from('<I', r, 0)[0],
-                                         'mac': ':'.join('%02x' % c for c in r[4:]),
+                                         'mac': macstr(r[4:]),
                                          'name_a': na, 'name_b': nb, 'flag': body[0x4472 + i]})
         met = []
         if len(body) >= 0x45C4:
@@ -222,7 +234,7 @@ def parse_plaza_body(body):
                 r = body[0x4484 + i * 10: 0x4484 + (i + 1) * 10]
                 if any(r):
                     met.append({'idx': i, 'id': struct.unpack_from('<I', r, 0)[0],
-                                'mac': ':'.join('%02x' % c for c in r[4:])})
+                                'mac': macstr(r[4:])})
         out['met_consoles'] = met
         out['plaza_mii_count'] = body[0x4482] if len(body) > 0x4482 else None
         # The 10 bytes at body+0x36D4 are the CCM nonce, not the identity.
@@ -356,7 +368,7 @@ def dump(buf):
     print(f"  ex-headers: {len(m['exheaders'])}")
     for e in m['exheaders']:
         tag = ' (InfoText)' if e['type'] == 4 else ''
-        prev = _utf16z(e['data']) if e['type'] == 4 else e['data'][:24].hex()
+        prev = decode_utf16_name(e['data']) if e['type'] == 4 else e['data'][:24].hex()
         print(f"    type {e['type']}{tag} size {e['size']:#x}: {prev!r}")
     print(f"  hmac: {'present (0x20)' if m['hmac'] else 'absent (EXPECTED for Mii Plaza)'}")
     for p in m['problems']:

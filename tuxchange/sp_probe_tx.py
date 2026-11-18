@@ -4,10 +4,11 @@ import sys, os, time, socket, struct, select, random, re, argparse
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import sp_parse
+from sp_parse import SP_SSID
+from sp_cec import macstr, macbytes
 
 # Consoles set the locally-administered bit on a Nintendo OUI, and both forms are on air.
 CONSOLE_PREFIXES = ('ba:ae:6e', '96:58:cb', 'b8:ae:6e', '94:58:cb')
-SP_SSID = b'Nintendo_3DS_continuous_scan_000'
 MIIPLAZA = 0x00020800
 
 SERVICES_MIIPLAZA = [(MIIPLAZA, 0x00, b'')]
@@ -24,14 +25,6 @@ CH_FREQ[14] = 2484
 
 def is_console(mac):
     return bool(mac) and mac.lower()[:8] in CONSOLE_PREFIXES
-
-
-def macstr(b):
-    return ':'.join('%02x' % c for c in b)
-
-
-def macbytes(s):
-    return bytes.fromhex(s.replace(':', ''))
 
 
 def radiotap_tx(rate_mbps=1.0, noack=True, noseq=True):

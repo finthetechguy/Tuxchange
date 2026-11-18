@@ -5,7 +5,7 @@ from collections import deque
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import sp_parse, sp_ccmp, sp_yy, sp_yysession
-import sp_mii, sp_smdh, sp_cec
+import sp_mii, sp_smdh, sp_cec, sp_build
 import sp_probe_tx as T
 from streetpass_ccmp_key import derive_ccmp_key
 
@@ -85,7 +85,6 @@ class Link:
         self.log_lines = deque(maxlen=LOG_LINES_MAX)
         self.session = None
         if getattr(a, 'forward', None):
-            import sp_build
             paths = a.forward if isinstance(a.forward, list) else [a.forward]
             wires, tids = [], []
             for path in paths:
@@ -128,7 +127,6 @@ class Link:
                 self.log('    multi-title: --mirror-offer enabled automatically, so our 0x33 is in '
                          "the console's own entry order (cecd 0x1148C0 compares them pairwise)")
         elif getattr(a, 'from_scratch', False):
-            import sp_build
             bm, bd_ = 0, 0
             if getattr(a, 'birthday', None):
                 bm, bd_ = (int(x) for x in a.birthday.split('/'))
@@ -181,7 +179,7 @@ class Link:
             self.outbox[5] = set_greeting(self.outbox[5], a.greeting, self.log)
         if self.outbox and a.full_sequence:
             pre = [build_obj_41(self.src),
-                   cec_object(0x43, OBJ_43_PAYLOAD, flags=0x0000),
+                   sp_build.cec_object(0x43, OBJ_43_PAYLOAD, flags=0x0000),
                    build_obj_11(self.token, self.services)]
             self.log('  FULL SEQUENCE: prepending 0x41 (%d B), 0x43 (%d B), 0x11 (%d B, %d services)'
                      % (len(pre[0]), len(pre[1]), len(pre[2]), len(self.services)))
@@ -514,7 +512,7 @@ class Link:
                     obj = self.outbox[islot]
                 elif rt == 0xF2:
                     # cecd answers 0xF2 before reading its state, so it can nudge a silent console.
-                    obj = cec_object(0xF2, b'\x00' * 4)
+                    obj = sp_build.cec_object(0xF2, b'\x00' * 4)
                     islot = -1
                 if i81 is None or obj is None:
                     self.log('  --manifest-repeat: no 0x%02X/0x81 in the outbox, nothing to repeat'
@@ -1012,31 +1010,15 @@ def freshen_identity(objs, log, msgid=True, consoleid=True):
 OBJ_43_PAYLOAD = bytes.fromhex('1b0010001a800f00ffffffff84541200')
 
 
-def cec_object(otype, payload, flags=0xFFFF):
-    """Wrap a payload in the 0x6363 object header (builder at cecd 0x1076BA)."""
-    return (b'\x63\x63' + struct.pack('<H', flags) + struct.pack('<I', otype)
-            + struct.pack('<I', 0) + struct.pack('<I', len(payload)) + bytes(payload))
-
-
-def cec_timestamp(t=None):
-    """The 12-byte CEC timestamp: u32 year, u8 month/day/weekday/hour/min/sec, u16 millisecond."""
-    import time as _t
-    lt = _t.localtime(t if t is not None else _t.time())
-    ms = int((_t.time() % 1) * 1000)
-    return (struct.pack('<I', lt.tm_year) +
-            bytes([lt.tm_mon, lt.tm_mday, (lt.tm_wday + 1) % 7, lt.tm_hour, lt.tm_min, lt.tm_sec])
-            + struct.pack('<H', ms))
-
-
 def build_obj_41(mac, log=None):
     """Session-open object. Carries a nonce, the sender's MAC and a timestamp (payload 0x28)."""
     payload = (bytes(random.getrandbits(8) for _ in range(8))
                + b'\x00' * 8
                + bytes(random.getrandbits(8) for _ in range(4))
                + bytes(mac) + b'\x00\x00'
-               + cec_timestamp())
+               + sp_cec.timestamp())
     assert len(payload) == 0x28, len(payload)
-    return cec_object(0x41, payload, flags=0x0000)
+    return sp_build.cec_object(0x41, payload, flags=0x0000)
 
 
 def build_obj_11(token8, services):
@@ -1044,7 +1026,7 @@ def build_obj_11(token8, services):
     svc = b''.join(struct.pack('>I', t) + bytes([f]) + bytes(tr) for t, f, tr in services)
     tlv = struct.pack('<H', (len(svc) << 8) | (1 << 4) | 1) + svc
     tlv += struct.pack('<H', (8 << 8) | (0xF << 4) | 0) + bytes(token8)
-    return cec_object(0x11, tlv, flags=0xFFFF)
+    return sp_build.cec_object(0x11, tlv, flags=0xFFFF)
 
 
 def plaza_hmac_key():
@@ -1666,14 +1648,13 @@ def selftest():
             rebuilt += yy['payload']
         chk('every segment survives a build/parse round trip', bytes(rebuilt) == obj)
 
-    import sp_build
     pmsg = corpus.load('plaza_outbox')
     mmsg = corpus.load('second_title_outbox')
     if pmsg is None or mmsg is None:
         skip('two-title offer alignment (needs two real outbox messages)', corpus.why_skipped())
     else:
         ob = [build_obj_41(b'\xba\xae\x6e\x01\x02\x03'),
-              cec_object(0x43, OBJ_43_PAYLOAD, flags=0x0000),
+              sp_build.cec_object(0x43, OBJ_43_PAYLOAD, flags=0x0000),
               build_obj_11(b'\x01' * 8, [(0x00020800, 0x00, b''), (0x00030600, 0x30, b'')])] \
              + sp_build.build_outbox([pmsg, mmsg], console_id=1)
         chk('object_index finds the 0x33 past the --full-sequence prefix',
@@ -1705,7 +1686,7 @@ def selftest():
                                  b'ee\x00\x00' + struct.pack('<II', 0x4C, 1) + b'\x00' * 0x20
                                  + struct.pack('<IIII', 0x00141000, 0x00303, 0x100, 1)
                                  + b'\x00' * 0x10, lambda m, l=1: None) is not None)
-    f2 = cec_object(0xF2, b'\x00' * 4)
+    f2 = sp_build.cec_object(0xF2, b'\x00' * 4)
     chk('the 0xF2 probe is a well-formed 0x6363 wrapper',
         f2[0:2] == b'cc' and struct.unpack_from('<I', f2, 4)[0] == 0xF2, f2.hex())
     chk('its body length passes cecd 0x107404 (0 < len <= 0x5DC)',
@@ -1792,7 +1773,7 @@ def attempt_checks(chk):
     A, B, C = '96:58:cb:00:00:0a', '96:58:cb:00:00:0b', '96:58:cb:00:00:0c'
     A_TOK = '0011223344556677'
     base_svc = [(0x00020800, 0x00, b''), (0x00030600, 0x30, b'')]
-    a_pick = ([(0x00020800, 0x00, b'')], [cec_object(0x41, b'A' * 0x28)])
+    a_pick = ([(0x00020800, 0x00, b'')], [sp_build.cec_object(0x41, b'A' * 0x28)])
 
     def new_link():
         L = Link(_sim_args(mac=US, token=US_TOK))

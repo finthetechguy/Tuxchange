@@ -3,11 +3,10 @@
 import os, struct, hashlib
 
 import sp_cec
+import sp_cecvalid
 import sp_savefs
 
 MBOXLIST_MAGIC = 0x6868
-ENVELOPE_MAGIC = 0x6161
-CONTAINER_MAGIC = 0x6060
 MBOXLIST_HDR = 12
 MBOXLIST_ENTRY = 16
 MBOXLIST_MAX = 24
@@ -89,11 +88,11 @@ def container_at(data, off=0):
     """If a valid CEC container starts at `off`, return its parsed form, else None."""
     if off + 0x70 > len(data):
         return None
-    if struct.unpack_from('<H', data, off)[0] == ENVELOPE_MAGIC:
+    if data[off:off + 2] == sp_cecvalid.ENVELOPE_MAGIC:
         off += 0x14
         if off + 0x70 > len(data):
             return None
-    if struct.unpack_from('<H', data, off)[0] != CONTAINER_MAGIC:
+    if data[off:off + 2] != sp_cecvalid.CONTAINER_MAGIC:
         return None
     try:
         h = sp_cec.parse_header(data[off:])

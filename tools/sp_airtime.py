@@ -1,18 +1,15 @@
 #!/usr/bin/env python3
 """Radio-time analysis of a relay pcap: when was the console actually listening?"""
-import sys, struct, json, argparse
+import os, sys, struct, json, argparse
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                'tuxchange'))
+from sp_cec import macstr
 
 _RT_FIELDS = [(8, 8), (1, 1), (1, 1), (4, 2), (2, 2), (1, 1), (1, 1), (2, 2), (2, 2), (2, 2),
               (1, 1), (1, 1), (1, 1), (1, 1), (2, 2), (2, 2), (2, 2), (1, 1), (3, 1), (8, 4)]
 TSFT, FLAGS, RATE, CHANNEL, FHSS, DBM_ANT, DBM_NOISE, LOCK, TX_ATT, DB_TX_ATT, DBM_TX, \
     ANTENNA, DB_SIG, DB_NOISE, RX_FLAGS, TX_FLAGS, RTS_RETRIES, DATA_RETRIES, MCS, AMPDU = range(20)
-
-MAC_FMT = '%02x:%02x:%02x:%02x:%02x:%02x'
-
-
-def macstr(b):
-    return MAC_FMT % tuple(b)
-
 
 def read_pcap(path):
     """-> [(timestamp, raw_frame)]. Handles both microsecond and nanosecond pcap."""

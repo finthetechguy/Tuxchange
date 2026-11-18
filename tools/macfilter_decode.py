@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
 """Decode the 3DS `data:/CEC/MacFilter___` entry format from planted known plaintext."""
 import argparse
+import os
 import struct
 import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                'tuxchange'))
+from sp_cec import macstr, macbytes
 
 PLANT = [
     ('ba:ae:6e:77:88:99', 1788626863.099),
@@ -16,14 +21,6 @@ PLANT = [
 ]
 
 TOL = 10.0
-
-
-def macbytes(s):
-    return bytes(int(x, 16) for x in s.split(':'))
-
-
-def macstr(b):
-    return ':'.join('%02x' % c for c in b)
 
 
 def find_entries(blob, plant=PLANT):

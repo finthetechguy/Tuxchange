@@ -1693,7 +1693,7 @@ class Relay:
         tids = list(dict.fromkeys(sp_build.message_title(c) for c in picked))
         services = [(t,) + known.get(t, (0x30, b'')) for t in tids]
         prefix = [sp_link.build_obj_41(link.src),
-                  sp_link.cec_object(0x43, sp_link.OBJ_43_PAYLOAD, flags=0x0000),
+                  sp_build.cec_object(0x43, sp_link.OBJ_43_PAYLOAD, flags=0x0000),
                   sp_link.build_obj_11(link.token, services)]
         objects = prefix + sp_build.build_outbox(picked)
         ids = [c[sp_build.ENVELOPE_LEN + 0x20:sp_build.ENVELOPE_LEN + 0x28] for c in picked]

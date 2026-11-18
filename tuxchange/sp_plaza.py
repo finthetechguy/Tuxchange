@@ -13,7 +13,7 @@ command uses it directly, so the daemon never has to load a plugin.
 import os, sys, struct
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import sp_plugin as P, sp_build, sp_mii, sp_smdh
+import sp_plugin as P, sp_build, sp_cec, sp_mii, sp_smdh
 
 TITLE_ID = sp_build.PLAZA_TITLE
 GAME = 'StreetPass Mii Plaza'
@@ -138,7 +138,7 @@ def default_values(store_path=None, identity=None):
         ident = sp_identity.from_seed(os.urandom(32))
     v = {f.key: f.make_default() for f in FIELDS}
     v['mii'].update(mii_name='Relay', author_name='Tuxchange', mii_id=ident['mii_id'],
-                    creator_mac=bytes.fromhex(ident['creator_mac'].replace(':', '')))
+                    creator_mac=sp_cec.macbytes(ident['creator_mac']))
     v['mii']['mii_data'] = sp_build.build_cfl(
         mii_name='Relay', author_name='Tuxchange', mii_id=ident['mii_id'],
         creator_mac=ident['creator_mac'], face_shape=ident['face_shape'],
@@ -168,11 +168,11 @@ def _put_str(b, off, cap, s):
 
 
 def _get_str(b, off, cap):
-    return b[off:off + cap].decode('utf-16-le', 'replace').split('\x00', 1)[0]
+    return sp_cec.decode_utf16_name(b[off:off + cap])
 
 
 def _mac(b):
-    return bytes(b) if not isinstance(b, str) else bytes.fromhex(b.replace(':', ''))
+    return bytes(b) if not isinstance(b, str) else sp_cec.macbytes(b)
 
 
 def build_body(values):
@@ -328,7 +328,6 @@ def parse_body(body):
 
 
 def sp_cec_base_len():
-    import sp_cec
     return sp_cec.PLAZA_BODY_SIZE
 
 

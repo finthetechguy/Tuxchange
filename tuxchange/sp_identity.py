@@ -12,8 +12,6 @@ import os, sys, json, struct, hashlib, argparse
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import sp_build, sp_cec, sp_store, sp_mii
 
-MII_NAME_MAX = 10          # 20 bytes of UTF-16LE at CFL+0x1A
-GREETING_MAX = 16          # 0x20 bytes at body+OFF_GREETING
 
 
 class NoIdentity(LookupError):
@@ -87,15 +85,15 @@ def build_message(store_path, mii_name='Relay', author_name='Tuxchange',
                   title_publisher='Tuxchange', when=None, **extra):
     """-> a complete Mii Plaza wire message that is this relay's own."""
     import sp_plaza
-    if len(mii_name) > MII_NAME_MAX:
+    if len(mii_name) > sp_plaza.MII_NAME_MAX:
         raise ValueError('a Mii name is at most %d characters, got %d (%r)'
-                         % (MII_NAME_MAX, len(mii_name), mii_name))
-    if len(author_name) > MII_NAME_MAX:
+                         % (sp_plaza.MII_NAME_MAX, len(mii_name), mii_name))
+    if len(author_name) > sp_plaza.MII_NAME_MAX:
         raise ValueError('an author name is at most %d characters, got %d'
-                         % (MII_NAME_MAX, len(author_name)))
-    if len(greeting) > GREETING_MAX:
+                         % (sp_plaza.MII_NAME_MAX, len(author_name)))
+    if len(greeting) > sp_plaza.GREETING_MAX:
         raise ValueError('a greeting is at most %d characters, got %d (%r)'
-                         % (GREETING_MAX, len(greeting), greeting))
+                         % (sp_plaza.GREETING_MAX, len(greeting), greeting))
     v = sp_plaza.default_values(identity=derive(store_path))
     v['mii'].update(mii_name=mii_name, author_name=author_name)
     v['greeting'] = greeting
@@ -146,6 +144,7 @@ def seed(store, store_path=None, replace=False, log=print, **kw):
 
 def _selftest():
     import tempfile, shutil
+    import sp_plaza
     ok = tot = 0
     import lp_keys as _k
     throwaway = _k.selftest_keys()
@@ -264,7 +263,7 @@ def _selftest():
         chk('an over-long Mii name is refused',
             _raises(lambda: build_message(sp, mii_name='ElevenChars')))
         chk('an over-long greeting is refused',
-            _raises(lambda: build_message(sp, greeting='x' * (GREETING_MAX + 1))))
+            _raises(lambda: build_message(sp, greeting='x' * (sp_plaza.GREETING_MAX + 1))))
         chk('a Mii name the console rejects is refused too',
             _raises(lambda: build_message(sp, mii_name='a%b')))
 

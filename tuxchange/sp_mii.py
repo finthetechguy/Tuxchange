@@ -23,6 +23,7 @@ CCM_L        = 3
 PLAZA_MII_OFF = 0x36BC       # container offset inside the plaza body
 
 import lp_keys as _keys
+import sp_cec
 
 
 def apt_key(key_file=None):
@@ -88,17 +89,14 @@ def mii_crc(cfl):
     return c
 
 
-def _utf16z(b): return b.decode('utf-16-le', 'replace').split('\x00', 1)[0]
-
-
 def parse_cfl(cfl):
     return {
         'version':     cfl[0x00],
         'flags':       cfl[0x01],
         'mii_id':      struct.unpack_from('<I', cfl, 0x0C)[0],
-        'creator_mac': ':'.join('%02x' % c for c in cfl[0x10:0x16]),
-        'mii_name':    _utf16z(cfl[0x1A:0x2E]),
-        'author_name': _utf16z(cfl[0x48:0x5C]),
+        'creator_mac': sp_cec.macstr(cfl[0x10:0x16]),
+        'mii_name':    sp_cec.decode_utf16_name(cfl[0x1A:0x2E]),
+        'author_name': sp_cec.decode_utf16_name(cfl[0x48:0x5C]),
         'crc':         struct.unpack_from('>H', cfl, 0x5E)[0],
         'crc_ok':      struct.unpack_from('>H', cfl, 0x5E)[0] == mii_crc(cfl),
     }
@@ -222,7 +220,6 @@ def _selftest():
     else:
         skip('apt_key() == keyscrambler(slot0x31 KeyX, KeyY)', 'no aes_keys.txt')
 
-    import sp_cec
     cases = [('2DS',    'mii_message_a'),
              ('2DS XL', 'mii_message_b')]
     for label, entry in cases:

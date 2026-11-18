@@ -4,12 +4,10 @@ import struct, os, hmac, hashlib
 
 import sp_cec, sp_cecvalid
 import lp_keys as _keys, sp_mii, sp_smdh
+from sp_cecvalid import ENVELOPE_LEN, HDR_LEN, TRAILER_LEN, MAX_EXHEADERS
 
-ENVELOPE_LEN = 0x14
-HDR_LEN      = 0x70
 BODY_LEN     = 0x7280          # the expansion build; the base title used 0x60F0
-TRAILER_LEN  = 0x20
-PLAZA_TITLE  = 0x00020800
+PLAZA_TITLE  = sp_cec.PLAZA_CEC_TITLE_ID
 INFO_TEXT    = "You've got company!"
 CEC_ICON_DIM = 40              # the CEC icon is 40x40 RGB565 = 0xC80 bytes
 
@@ -203,7 +201,6 @@ def build_body(mii_cfl, greeting='Sent from Linux', title_id=0x0004000000000000,
 
 
 EXH_ICON, EXH_INFO_TEXT = 2, 4
-MAX_EXHEADERS = 16
 
 
 def exheader_icon(icon=None):
@@ -266,11 +263,7 @@ def build_envelope(body, cec_title_id, key=None, ex_headers=None, message_id=Non
     struct.pack_into('<Q', h, 0x20, message_id)
     h[0x34] = flags
     h[0x35] = send_mode
-    struct.pack_into('<I', h, 0x60, when.tm_year)
-    h[0x64] = when.tm_mon; h[0x65] = when.tm_mday
-    h[0x66] = (when.tm_wday + 1) % 7              # console stores 0=Sunday
-    h[0x67] = when.tm_hour; h[0x68] = when.tm_min; h[0x69] = when.tm_sec
-    struct.pack_into('<H', h, 0x6A, 0)
+    h[0x60:0x6C] = sp_cec.pack_timestamp(when)
     h[0x6C] = 0xFF; h[0x6D] = 1
 
     container = bytes(h) + ex + body
@@ -337,6 +330,7 @@ def build_icons(dim_small=24, dim_large=48, **kw):
 
 
 def cec_object(otype, payload, flags=0xFFFF):
+    """Wrap a payload in the 0x6363 object header (builder at cecd 0x1076BA)."""
     return (b'\x63\x63' + struct.pack('<H', flags) + struct.pack('<I', otype)
             + struct.pack('<I', 0) + struct.pack('<I', len(payload)) + bytes(payload))
 

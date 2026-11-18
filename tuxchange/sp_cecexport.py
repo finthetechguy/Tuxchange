@@ -39,20 +39,12 @@ INVALID = 'invalid'
 DELIVERED = (ADDED, UNVERIFIED)
 
 
-def timestamp(when=None):
-    """A 12-byte CEC timestamp in local time, as the console's clock keeps it."""
-    when = time.time() if when is None else when
-    t = time.localtime(when)
-    return struct.pack('<IBBBBBBH', t.tm_year, t.tm_mon, t.tm_mday, (t.tm_wday + 1) % 7,
-                       t.tm_hour, t.tm_min, t.tm_sec, int((when % 1) * 1000))
-
-
 def as_received(container, when=None):
     """The message as the receiving console files it. The HMAC covers only the body, so it holds."""
     c = bytearray(container[:sp_cec.parse_header(container)['total_size']])
     c[0x36] = 1
     c[0x37] = 1
-    ts = timestamp(when)
+    ts = sp_cec.timestamp(when)
     for off in (0x48, 0x54):
         if not any(c[off:off + 12]):
             c[off:off + 12] = ts
@@ -306,6 +298,14 @@ def _selftest():
         tot += 1; ok += bool(c)
         print('  [%s] %s%s' % ('PASS' if c else 'FAIL', n, ('  %s' % (g,)) if g else ''))
 
+    ts = sp_cec.parse_timestamp(sp_cec.timestamp(1.7e9 + 0.25), 0)
+    lt = time.localtime(1.7e9)
+    chk('a CEC timestamp parses back to the local time it was made from',
+        (ts['year'], ts['month'], ts['day'], ts['weekday'], ts['hour'], ts['minute'],
+         ts['second'], ts['ms'])
+        == (lt.tm_year, lt.tm_mon, lt.tm_mday, (lt.tm_wday + 1) % 7, lt.tm_hour, lt.tm_min,
+            lt.tm_sec, 250))
+
     import hashlib, hmac
     KEY = b'K' * 32
 
@@ -315,7 +315,7 @@ def _selftest():
         struct.pack_into('<I', c, 0x10, tid)
         c[0x20:0x28] = mid
         c[0x34:0x36] = b'\x03\x03'
-        c[0x60:0x6C] = timestamp(1.6e9)
+        c[0x60:0x6C] = sp_cec.timestamp(1.6e9)
         c[-0x20:] = hmac.new(key, c[HDR_LEN:-0x20], hashlib.sha256).digest()
         return bytes(c)
 
@@ -355,8 +355,8 @@ def _selftest():
         got = open(os.path.join(cec, '00020800', INBOX, sp_store.message_filename(a)),
                    'rb').read()
         chk('it is filed as unopened and new', got[0x36:0x38] == b'\x01\x01')
-        chk('with the time it was received', got[0x48:0x54] == timestamp(1.7e9)
-            and got[0x54:0x60] == timestamp(1.7e9))
+        chk('with the time it was received', got[0x48:0x54] == sp_cec.timestamp(1.7e9)
+            and got[0x54:0x60] == sp_cec.timestamp(1.7e9))
         chk('and everything else unchanged', got[:0x36] == a[:0x36] and got[0x60:] == a[0x60:])
         chk('the same message is not delivered twice', f.deliver(a) == DUPLICATE)
         chk('a title with no inbox there is refused', f.deliver(msg(0x00030600, b'C' * 8)) == NO_BOX)
@@ -372,7 +372,7 @@ def _selftest():
             and fields['max_message_size'] == 0x800)
         info = open(os.path.join(cec, '00020800', 'MBoxInfo____'), 'rb').read()
         chk('MBoxInfo records the arrival', info[0x40:0x42] == b'\x01\x01'
-            and info[0x44:0x50] == timestamp(1.8e9))
+            and info[0x44:0x50] == sp_cec.timestamp(1.8e9))
         chk('a message over the size limit is refused',
             f.deliver(msg(0x00020800, b'D' * 8, 0x900)) == TOO_BIG)
         chk('a dry run changes nothing', f.deliver(msg(0x00020800, b'E' * 8), dry_run=True)

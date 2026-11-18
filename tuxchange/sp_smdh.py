@@ -2,6 +2,8 @@
 """Plaza body regions A and B: the featured title's SMDH (metadata + icons)."""
 import struct
 
+import sp_cec
+
 REGION_A_OFF, REGION_A_LEN = 0x0000, 0x2038
 REGION_B_OFF, REGION_B_LEN = 0x2038, 0x1680
 TITLES_OFF, TITLE_STRIDE, N_LANG = 0x30, 0x200, 16
@@ -9,9 +11,6 @@ SHORT_LEN, LONG_LEN, PUB_LEN = 0x80, 0x100, 0x80
 SMALL_ICON_OFF, SMALL_ICON_DIM = 0x0000, 24
 LARGE_ICON_OFF, LARGE_ICON_DIM = 0x0480, 48
 NO_TITLE = 0xFFFFFFFFFFFFFFFF
-
-
-def _utf16z(b): return b.decode('utf-16-le', 'replace').split('\x00', 1)[0]
 
 
 def _morton8(i):
@@ -31,9 +30,9 @@ def parse_region_a(body):
     titles = []
     for i in range(N_LANG):
         b = TITLES_OFF + i * TITLE_STRIDE
-        titles.append({'short': _utf16z(a[b:b + SHORT_LEN]),
-                       'long': _utf16z(a[b + SHORT_LEN:b + SHORT_LEN + LONG_LEN]),
-                       'publisher': _utf16z(a[b + SHORT_LEN + LONG_LEN:b + TITLE_STRIDE])})
+        titles.append({'short': sp_cec.decode_utf16_name(a[b:b + SHORT_LEN]),
+                       'long': sp_cec.decode_utf16_name(a[b + SHORT_LEN:b + SHORT_LEN + LONG_LEN]),
+                       'publisher': sp_cec.decode_utf16_name(a[b + SHORT_LEN + LONG_LEN:b + TITLE_STRIDE])})
     return {'title_id': tid,
             'has_title': tid not in (0, NO_TITLE),
             'category_ok': ((tid >> 32) >> 14) == 0x10,
@@ -123,7 +122,6 @@ def validate_region_a(body):
 
 
 def _selftest():
-    import sp_cec
     ok = tot = skipped = 0
 
     def chk(name, cond, got=''):
