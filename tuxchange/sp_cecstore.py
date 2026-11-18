@@ -3,6 +3,7 @@
 import os, struct, hashlib
 
 import sp_cec
+import lp_keys
 import sp_cecvalid
 import sp_savefs
 
@@ -349,7 +350,7 @@ def _selftest():
             b = m['raw']; hh_ = sp_cec.parse_header(b)
             body = b[hh_['header_size']:hh_['header_size'] + hh_['body_size']]
             tag = b[hh_['header_size'] + hh_['body_size']:hh_['total_size']]
-            good += tag == _h.new(sp_build.plaza_hmac_key(), body, _hh.sha256).digest()
+            good += tag == _h.new(lp_keys.plaza_hmac_key(), body, _hh.sha256).digest()
         chk('every Plaza message from the filesystem verifies its HMAC',
             good == len(pl) and good >= 1, '%d/%d' % (good, len(pl)))
         chk('scan_any routes a SAVE image to the filesystem reader',
@@ -363,7 +364,7 @@ def _selftest():
         chk('MBoxInfo yields Mii Plaza\'s name', pl.get('name') == 'StreetPass Mii Plaza',
             repr(pl.get('name')))
         chk('MBoxInfo +0x10 IS the HMAC key we brute-forced from code.bin',
-            pl.get('hmac_key') == sp_build.plaza_hmac_key())
+            pl.get('hmac_key') == lp_keys.plaza_hmac_key())
         chk('every title has a name', all(v['name'] for v in md.values()))
         chk('every title has a 32-byte key field', all(len(v['hmac_key'] or b'') == 32
                                                        for v in md.values()))

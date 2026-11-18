@@ -7,7 +7,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import sp_parse, sp_ccmp, sp_yy, sp_yysession
 import sp_mii, sp_smdh, sp_cec, sp_build
 import sp_probe_tx as T
-from streetpass_ccmp_key import derive_ccmp_key
+from sp_ccmp import derive_ccmp_key
+import lp_keys
 
 DATA_DURATION = 0x002C               # 44 us -- the value on all 108 captured bulk frames
 # Per-pass diagnostics, bounded so a peer flooding authenticated frames cannot exhaust memory.
@@ -1029,11 +1030,6 @@ def build_obj_11(token8, services):
     return sp_build.cec_object(0x11, tlv, flags=0xFFFF)
 
 
-def plaza_hmac_key():
-    """Mii Plaza's message HMAC key, from your console's CEC store via tuxchange.keys."""
-    import lp_keys
-    return lp_keys.plaza_hmac_key()
-
 GREETING_OFF = 0x3F70
 GREETING_LEN = 0x22            # UTF-16LE, 16 chars + NUL
 
@@ -1099,7 +1095,7 @@ def reseal(obj5, log=None):
     if tot - (hs + bs) != 0x20:
         raise ValueError('unexpected trailer size %d' % (tot - (hs + bs)))
     old = bytes(b[tag_off:tag_off + 0x20])
-    new = _hmac.new(plaza_hmac_key(), body, _hashlib.sha256).digest()
+    new = _hmac.new(lp_keys.plaza_hmac_key(), body, _hashlib.sha256).digest()
     b[tag_off:tag_off + 0x20] = new
     if log:
         log('  RESEALED trailer: %s -> %s' % (old.hex()[:24] + '..', new.hex()[:24] + '..'))

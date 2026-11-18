@@ -1,16 +1,26 @@
 #!/usr/bin/env python3
-"""802.11 CCMP (AES-CCM) decrypt/encrypt for StreetPass data frames."""
-import struct, os, sys
+"""802.11 CCMP (AES-CCM) for StreetPass data frames, and the link key it runs under."""
+import hashlib, hmac, struct, os, sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import sp_aes
+import lp_keys
 
 # pycryptodome is faster. sp_aes is the standard-library fallback.
 try:
     from Crypto.Cipher import AES
-    HAVE_PYCRYPTO = True
 except ImportError:                                     # pragma: no cover - environment-dependent
-    AES = None
-    HAVE_PYCRYPTO = False
+    try:
+        from Cryptodome.Cipher import AES
+    except ImportError:
+        AES = None
+HAVE_PYCRYPTO = AES is not None
+
+
+def ecb_encrypt(key, block):
+    """One AES-128 block."""
+    if HAVE_PYCRYPTO:
+        return AES.new(key, AES.MODE_ECB).encrypt(block)
+    return sp_aes.aes_ecb_encrypt(key, block)
 
 
 def _ccm_decrypt(key, nonce, aad, ct, mic):
@@ -93,6 +103,26 @@ def encrypt(key, mpdu_hdr_plus_ccmphdr, plaintext):
     nonce, aad = _nonce_aad(h, mpdu_hdr_plus_ccmphdr, pn6)
     ct, mic = _ccm_encrypt(key, nonce, aad, plaintext)
     return mpdu_hdr_plus_ccmphdr + ct + mic
+
+
+def derive_ccmp_key(consoleid_host, consoleid_client, mac_host, mac_client, *, dev=False,
+                    keyslot_2e_normalkey=None, key_y_2e=None, key_x_2e=None, key17=None,
+                    key_file=None):
+    """The StreetPass CCMP link key for one pair of consoles."""
+    assert len(consoleid_host) == 8 and len(consoleid_client) == 8
+    assert len(mac_host) == 6 and len(mac_client) == 6
+    if key17 is None:
+        key17 = lp_keys.cecd_hmac_key(dev=dev, explicit=key_file)
+    block = consoleid_host + consoleid_client + mac_host + mac_client
+    ctr = hmac.new(key17, block, hashlib.sha1).digest()[:16]
+    if keyslot_2e_normalkey is None:
+        if key_y_2e is not None:
+            key_x = key_x_2e if key_x_2e is not None else lp_keys.slot(0x2E, 'X', key_file)
+            keyslot_2e_normalkey = lp_keys.keyscrambler(key_x, key_y_2e)
+        else:
+            keyslot_2e_normalkey = lp_keys.normalkey_2e(key_file)
+    return ecb_encrypt(keyslot_2e_normalkey, ctr)   # AES-CTR of zero block == ECB(ctr)
+
 
 if __name__ == "__main__":
     key = os.urandom(16)

@@ -14,6 +14,7 @@ import os, sys, struct
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import sp_plugin as P, sp_build, sp_cec, sp_mii, sp_smdh
+import lp_keys
 
 TITLE_ID = sp_build.PLAZA_TITLE
 GAME = 'StreetPass Mii Plaza'
@@ -427,7 +428,7 @@ def _selftest():
     chk('a body read back out of a full message parses', parse_body(mb)['greeting']
         == 'Hello, world!')
     chk('its HMAC is the Plaza key\'s', msg[-0x20:] == hmac.new(
-        sp_build.plaza_hmac_key(), mb, hashlib.sha256).digest())
+        lp_keys.plaza_hmac_key(), mb, hashlib.sha256).digest())
 
     chk('a base-build body is refused with a reason',
         raises(lambda: parse_body(b'\x00' * 0x60F0), P.PluginParseError))

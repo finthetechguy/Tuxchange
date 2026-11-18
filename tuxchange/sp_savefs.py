@@ -2,6 +2,8 @@
 """Reader for the 3DS "SAVE" inner filesystem (the inner FAT of a DISA container)."""
 import struct
 
+import lp_keys
+
 SAVE_MAGIC = b'SAVE'
 DIR_ENTRY = 0x28
 FILE_ENTRY = 0x30
@@ -182,7 +184,7 @@ def _selftest():
         chk('it is 396 bytes and starts with the hh magic',
             len(d) == 396 and d[:2] == b'hh', '%d %r' % (len(d), d[:2]))
 
-    import sp_cec, sp_build
+    import sp_cec
     plaza = [f for p, f in files.items()
              if p.startswith('CEC/00020800/') and f['name'].startswith('_')]
     chk('Mii Plaza box messages found', len(plaza) >= 1, str(len(plaza)))
@@ -193,7 +195,7 @@ def _selftest():
             h = sp_cec.parse_header(m)
             body = m[h['header_size']:h['header_size'] + h['body_size']]
             tag = m[h['header_size'] + h['body_size']:h['total_size']]
-            if tag == hmac.new(sp_build.plaza_hmac_key(), body, hashlib.sha256).digest():
+            if tag == hmac.new(lp_keys.plaza_hmac_key(), body, hashlib.sha256).digest():
                 good += 1
         except Exception:
             pass

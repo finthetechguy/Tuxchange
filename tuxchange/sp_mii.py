@@ -2,14 +2,7 @@
 """CFPB Mii container: unwrap, edit, re-wrap."""
 import struct
 
-try:
-    from Crypto.Cipher import AES as _AES
-    def _ecb(key, block): return _AES.new(key, _AES.MODE_ECB).encrypt(block)
-    HAVE_PYCRYPTO = True
-except ImportError:                                          # pragma: no cover
-    import sp_aes
-    def _ecb(key, block): return sp_aes.aes_ecb_encrypt(key, block)
-    HAVE_PYCRYPTO = False
+from sp_ccmp import ecb_encrypt as _ecb
 
 MAGIC_CFPB   = b'CFPB'
 MAGIC_CFPN   = b'CFPN'
@@ -212,9 +205,9 @@ def _selftest():
 
     if _keys.have_aes_keys():
         try:
-            from streetpass_ccmp_key import keyscrambler
             kx = _keys.slot(0x31, 'X'); ky = _keys.slot(0x31, 'Y')
-            chk('apt_key() == keyscrambler(slot0x31 KeyX, KeyY)', keyscrambler(kx, ky) == apt_key())
+            chk('apt_key() == keyscrambler(slot0x31 KeyX, KeyY)',
+                _keys.keyscrambler(kx, ky) == apt_key())
         except Exception as e:
             chk('apt_key() re-derivation', False, repr(e))
     else:

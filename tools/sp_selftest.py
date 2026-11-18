@@ -6,7 +6,7 @@ import os as _os, sys as _sys
 _sys.path.insert(0, _os.path.join(
     _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))), 'tuxchange'))
 import lp_keys, sp_ccmp, sp_cec
-from streetpass_ccmp_key import derive_ccmp_key
+from sp_ccmp import derive_ccmp_key
 
 OK = True
 def check(cond, label, extra=""):

@@ -10,11 +10,6 @@ BODY_LEN     = 0x7280          # the expansion build; the base title used 0x60F0
 PLAZA_TITLE  = sp_cec.PLAZA_CEC_TITLE_ID
 INFO_TEXT    = "You've got company!"
 CEC_ICON_DIM = 40              # the CEC icon is 40x40 RGB565 = 0xC80 bytes
-
-
-def plaza_hmac_key(key_file=None):
-    """Mii Plaza's message HMAC key, read from your console's CEC store."""
-    return _keys.plaza_hmac_key(key_file)
 O81_SLOTS    = 24              # the 0x81 payload is 196 B = 4 + 24*8
 
 OFF_PRESENT, OFF_MII, OFF_ADDR = 0x36B8, 0x36BC, 0x375C
@@ -537,7 +532,7 @@ def _selftest():
     body = b[h['header_size']:h['header_size'] + h['body_size']]
     tag = b[h['header_size'] + h['body_size']:h['total_size']]
     chk('HMAC-SHA256 trailer verifies',
-        tag == hmac.new(plaza_hmac_key(), body, hashlib.sha256).digest())
+        tag == hmac.new(_keys.plaza_hmac_key(), body, hashlib.sha256).digest())
 
     pl = sp_cec.parse_plaza_body(body)
     chk('body parses with no problems', not pl['problems'], str(pl['problems']))
@@ -879,7 +874,7 @@ def _selftest():
     bd3 = fresh[ENVELOPE_LEN:][hh3['header_size']:hh3['header_size'] + hh3['body_size']]
     tg3 = fresh[ENVELOPE_LEN:][hh3['header_size'] + hh3['body_size']:hh3['total_size']]
     chk('the HMAC still verifies after the id change',
-        tg3 == _h2.new(plaza_hmac_key(), bd3, _hh2.sha256).digest())
+        tg3 == _h2.new(_keys.plaza_hmac_key(), bd3, _hh2.sha256).digest())
     chk('set_message_id works on a bare container too',
         sp_cec.parse_header(set_message_id(bare)[ENVELOPE_LEN:])['cec_title_id'] == PLAZA_TITLE)
 

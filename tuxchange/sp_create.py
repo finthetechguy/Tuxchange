@@ -15,6 +15,7 @@ import os, sys, json, base64, argparse
 
 import sp_plugin as P
 import sp_store
+import lp_keys
 
 
 def daemon_call(store, cmd, **kw):
@@ -345,7 +346,7 @@ def _selftest():
             [e['type'] for e in ex] == [2, 4] and h['send_mode'] == 0)
         import hmac, hashlib
         chk('signed with the Plaza key', msg[-0x20:] == hmac.new(
-            sp_build.plaza_hmac_key(), body, hashlib.sha256).digest())
+            lp_keys.plaza_hmac_key(), body, hashlib.sha256).digest())
         chk('the default Mii is the store\'s own, as `seed` makes it',
             v['mii']['mii_id'] == sp_plaza.default_values(store)['mii']['mii_id'])
 

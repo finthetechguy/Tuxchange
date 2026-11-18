@@ -11,6 +11,7 @@ import os, sys, json, struct, hashlib, argparse
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import sp_build, sp_cec, sp_store, sp_mii
+import lp_keys
 
 
 
@@ -125,7 +126,7 @@ def seed(store, store_path=None, replace=False, log=print, **kw):
     store_path = store_path or store.root
     msg = build_message(store_path, **kw)
     container = msg[sp_build.ENVELOPE_LEN:] if msg[:2] == b'\x61\x61' else msg
-    meta = dict(name='StreetPass Mii Plaza', key=sp_build.plaza_hmac_key(),
+    meta = dict(name='StreetPass Mii Plaza', key=lp_keys.plaza_hmac_key(),
                 origin='authored:%s' % os.path.basename(__file__))
     if replace:
         n = store.replace_outbox(container, **meta)
@@ -239,7 +240,7 @@ def _selftest():
         import hmac as _h
         body = c[h['header_size']:h['header_size'] + h['body_size']]
         chk('the HMAC trailer verifies under the plaza key',
-            _h.new(sp_build.plaza_hmac_key(), body, hashlib.sha256).digest()
+            _h.new(lp_keys.plaza_hmac_key(), body, hashlib.sha256).digest()
             == c[h['header_size'] + h['body_size']:h['total_size']])
         cfl, mac_ok = sp_mii.read_plaza_mii(body)
         fields = sp_mii.parse_cfl(cfl)
