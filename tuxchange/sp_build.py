@@ -398,11 +398,14 @@ def set_message_id(message, message_id=None):
     return bytes(b)
 
 
-def build_outbox(message, console_id=None, cec_title_id=None, send_mode=None):
-    """-> the objects a session sends: 0x21, 0x23, 0x31, 0x33, 0x81, then one object per message."""
+def build_outbox(message, console_id=None, cec_title_id=None, send_mode=None, allow_empty=False):
+    """-> the objects a session sends: 0x21, 0x23, 0x31, 0x33, 0x81, then one object per message.
+
+    With `allow_empty`, no messages gives empty lists and a count-0 0x81: a receive-only offer.
+    """
     import random
     given = [message] if isinstance(message, (bytes, bytearray)) else list(message)
-    if not given:
+    if not given and not allow_empty:
         raise ValueError('build_outbox needs at least one message')
     # One object and one ee entry per title, matching cecd's own list builder.
     groups = []                                   # [(title, [container, ...])]
@@ -813,6 +816,13 @@ def _selftest():
                 struct.unpack_from('<I', mixed[2][0x10:], 0x2C)[0] == 0x0008C500)
             chk('an envelope will not mix titles', _raises(lambda: envelope([t1, mk7])))
         chk('an empty message list is rejected', _raises(lambda: build_outbox([], console_id=1)))
+
+    empty = build_outbox([], console_id=1, allow_empty=True)
+    chk('a receive-only offer is the five control objects and no envelope',
+        [object_type(o) for o in empty] == [0x21, 0x23, 0x31, 0x33, 0x81])
+    chk('its 0x31 and 0x33 lists are empty and its 0x81 counts nothing',
+        parse_ee_list(empty[2][0x10:]) == [] and parse_ee_list(empty[3][0x10:]) == []
+        and struct.unpack_from('<I', empty[4], 0x10)[0] == 0)
 
     kx = bytes(range(32))
     gb = bytes(range(256)) * 4

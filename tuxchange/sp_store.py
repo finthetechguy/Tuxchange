@@ -329,6 +329,7 @@ class Store:
             m = {}
         m.setdefault('keyed_titles', [])
         m.setdefault('origins', {})
+        m.setdefault('receive_titles', [])
         legacy = [k for k in m['origins'] if '/' not in k]
         if legacy:
             for k in legacy:
@@ -461,6 +462,28 @@ class Store:
             return None
         k = open(p, 'rb').read()[0x10:0x30]
         return k if len(k) == 0x20 else None
+
+    @_locked
+    def receive_titles(self):
+        """-> the registered titles enabled to receive, whether or not their outbox holds anything."""
+        on = set(self._load_meta()['receive_titles'])
+        return [t for t in self.titles() if '%08x' % t in on]
+
+    @_locked
+    def set_receive(self, tid, on=True):
+        """Enable or disable receiving for a registered title. -> whether it is now enabled."""
+        if on and tid not in self.titles():
+            raise ValueError('title %08X is not registered in this store' % tid)
+        m = self._load_meta()
+        key = '%08x' % tid
+        had = key in m['receive_titles']
+        if on and not had:
+            m['receive_titles'].append(key)
+        elif not on and had:
+            m['receive_titles'].remove(key)
+        if had != bool(on):
+            self._save_meta(m)
+        return bool(on)
 
     @_locked
     def title_name(self, tid):
@@ -601,8 +624,9 @@ class Store:
         self._write_mboxlist([t for t in self.titles() if t != tid])
         m = self._load_meta()
         key = '%08x' % tid
-        if key in m['keyed_titles']:
-            m['keyed_titles'].remove(key)
+        if key in m['keyed_titles'] or key in m['receive_titles']:
+            m['keyed_titles'] = [k for k in m['keyed_titles'] if k != key]
+            m['receive_titles'] = [k for k in m['receive_titles'] if k != key]
             self._save_meta(m)
         return n
 
@@ -901,6 +925,27 @@ def _selftest():
         chk('and both damaged files were kept in quarantine/',
             len(dm2.quarantined) == 2
             and all(os.path.exists(q[2]) for q in dm2.quarantined))
+
+        sr = Store(os.path.join(tmp, 'recv'))
+        chk('a fresh store receives for no title', sr.receive_titles() == [])
+        chk('an unregistered title cannot be enabled to receive',
+            _raises(lambda: sr.set_receive(0x00020800)))
+        sr.add_title(0x00020800)
+        sr.add_title(0x00030600)
+        sr.set_receive(0x00020800)
+        chk('a registered title with an empty outbox can be enabled to receive',
+            sr.receive_titles() == [0x00020800] and sr.messages(0x00020800) == [])
+        chk('the setting survives reopening the store',
+            Store(os.path.join(tmp, 'recv')).receive_titles() == [0x00020800])
+        sr.set_receive(0x00030600)
+        sr.set_receive(0x00020800, False)
+        chk('it can be turned off per title', sr.receive_titles() == [0x00030600])
+        chk('turning off a title that is not enabled is not an error',
+            sr.set_receive(0x00020800, False) is False)
+        sr.remove_title(0x00030600)
+        sr.add_title(0x00030600)
+        chk('removing a title forgets that it received',
+            sr.receive_titles() == [])
 
         import lp_corpus as corpus
         src = corpus.path('console_nand') or ''
