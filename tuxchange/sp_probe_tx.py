@@ -15,7 +15,7 @@ SERVICES_MIIPLAZA = [(MIIPLAZA, 0x00, b'')]
 SERVICES_FULL = [
     (0x00141000, 0x30, b''), (0x0007ad00, 0x30, b''), (0x00051600, 0x10, b''),
     (0x0008c500, 0x30, b''), (0x0012ec00, 0x30, b''), (0x00030b00, 0x30, b''),
-    (0x00020500, 0x32, b'\x00' * 6), (0x0007c800, 0x30, b''), (0x00053f00, 0x30, b''),
+    (0x00020500, 0x32, b'\xff' * 6), (0x0007c800, 0x30, b''), (0x00053f00, 0x30, b''),
     (0x00030600, 0x30, b''), (0x001a0400, 0x10, b''), (0x00020800, 0x00, b''),
 ]
 
@@ -482,6 +482,8 @@ def selftest():
     chk('broadcast probe: service round-trips',
         inf['services'] and inf['services'][0]['titleID'] == '00020800', inf['services'])
     chk('broadcast probe is recognised as StreetPass', is_streetpass_probe(p))
+    chk('Letter Box is declared with all-ones trailing bytes, as a console declares it',
+        dict((t, tr) for t, _f, tr in SERVICES_FULL)[0x00020500] == b'\xff' * 6)
     pf = sp_parse.build_probe(A, tok, SERVICES_FULL, seq=7)
     inf2 = probe_info(pf)
     chk('12-service probe round-trips', len(inf2['services'] or []) == 12, len(inf2['services'] or []))
