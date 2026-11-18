@@ -4,7 +4,7 @@ form generated from a plugin's schema, and Save / Edit against the daemon.
 Plugin code runs here, in the GUI process, as you. The daemon is only ever sent the body
 the plugin built (sp_create.put -> the daemon's outbox_put).
 """
-import os, base64
+import os, base64, threading
 
 import gi
 gi.require_version('Gtk', '4.0')
@@ -20,8 +20,7 @@ SPIN_MAX = 10_000_000
 
 
 def run_async(fn, on_done=None):
-    import threading
-
+    """Run `fn` off the UI thread; hand the result (or the exception) back on the UI thread."""
     def worker():
         try:
             r = fn()

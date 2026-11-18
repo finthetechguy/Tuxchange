@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """A GTK4 / libadwaita front end for Tuxchange."""
-import os, sys, json, time, base64, threading, subprocess, argparse, re
+import os, sys, json, time, base64, subprocess, argparse, re
 
 import gi
 gi.require_version('Gtk', '4.0')
@@ -12,6 +12,7 @@ sys.path.insert(0, os.path.join(
 import sp_relay                                            # noqa: E402
 import sp_store                                            # noqa: E402
 import sp_plugin_gui                                       # noqa: E402
+from sp_plugin_gui import run_async                         # noqa: E402
 
 APP_ID = 'org.tuxchange.Tuxchange'
 UNIT = 'tuxchange.service'
@@ -85,18 +86,6 @@ def wireless_ifaces():
     rank = {'active': 0, 'mixed': 1}
     out.sort(key=lambda t: (rank.get(t[2], 2), t[1] != 'ath9k', t[0]))
     return out
-
-
-def run_async(fn, on_done=None):
-    """Run `fn` off the UI thread; hand the result (or the exception) back on the UI thread."""
-    def worker():
-        try:
-            r = fn()
-        except Exception as e:                             # noqa: BLE001 - surfaced in the UI
-            r = e
-        if on_done is not None:
-            GLib.idle_add(on_done, r)
-    threading.Thread(target=worker, daemon=True).start()
 
 
 def human_secs(s):
