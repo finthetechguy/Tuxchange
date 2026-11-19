@@ -105,6 +105,30 @@ class KeyConflict(ValueError):
     """A title was offered an HMAC key different from the one it already has."""
 
 
+class InboxFull(ValueError):
+    """A title's inbox has no room for what arrived, so none of it was filed."""
+
+
+def plan_inbound(entries, room):
+    """Retail-style admission of a peer's offer, decided per title as cecd's planner does.
+
+    `entries` are (title, bytes, messages) in the peer's order; `room(title)` gives that
+    title's (free bytes, free slots). A title is admitted only if everything it declares fits,
+    so a full title is refused while the others go ahead. -> {title: (bytes, messages)} for
+    each admitted title; any title not in it is refused.
+    """
+    want = {}
+    for tid, size, count in entries:
+        b, n = want.get(tid, (0, 0))
+        want[tid] = (b + size, n + count)
+    admitted = {}
+    for tid, (size, count) in want.items():
+        free_bytes, free_slots = room(tid)
+        if size <= free_bytes and count <= free_slots:
+            admitted[tid] = (size, count)
+    return admitted
+
+
 class StoreBusy(RuntimeError):
     """Another process (normally the daemon) holds the store."""
 
@@ -511,8 +535,9 @@ class Store:
         return container, tid
 
     @_locked
-    def add_message(self, container, box='inbox', name=None, key=None, origin=None):
-        """File one bare 0x6060 container."""
+    def add_message(self, container, box='inbox', name=None, key=None, origin=None, evict=True):
+        """File one bare 0x6060 container. An inbox drops its oldest to make room unless `evict`
+        is False."""
         if container[:2] != b'\x60\x60':
             raise ValueError('add_message takes a bare 0x6060 container; unwrap the envelope first')
         container, tid = self._checked(container, key)
@@ -522,7 +547,7 @@ class Store:
             self._make_title_dirs(tid)
         p = os.path.join(self._box_dir(tid, box), message_filename(container))
         _write_private(p, container)
-        self.last_evicted = self._trim_inbox(tid, p) if box == 'inbox' else 0
+        self.last_evicted = self._trim_inbox(tid, p) if box == 'inbox' and evict else 0
         self._write_boxinfo(tid, box)
         if origin is not None:
             m = self._load_meta()
@@ -549,6 +574,44 @@ class Store:
             if c[0x20:0x28] != keep:
                 n += bool(self.remove_message(t, b, c))
         return n
+
+    @_locked
+    def inbox_room(self, tid):
+        """-> (free bytes, free slots) left in a title's inbox under the limits BoxInfo declares."""
+        msgs = self.messages(tid, 'inbox')
+        used = sum(len(c) for _t, _b, c in msgs)
+        return max(0, DEFAULT_MAX_BYTES - used), max(0, DEFAULT_MAX_MESSAGES - len(msgs))
+
+    @_locked
+    def file_inbound(self, containers, origin=None):
+        """File one title's arrivals in its inbox together, evicting nothing.
+
+        -> (paths, [(container, why)] for each malformed one). Raises InboxFull, filing
+        nothing, when the well-formed ones do not all fit in the room left.
+        """
+        good, bad = [], []
+        for c in containers:
+            try:
+                good.append(self._checked(c, None))
+            except ValueError as e:
+                bad.append((c, str(e)))
+        if len({t for _c, t in good}) > 1:
+            raise ValueError('file_inbound files one title at a time')
+        if good:
+            tid = good[0][1]
+            held = {c[0x20:0x28]: len(c) for _t, _b, c in self.messages(tid, 'inbox')}
+            new = {}
+            for c, _t in good:
+                new[c[0x20:0x28]] = len(c)
+            slots = sum(1 for mid in new if mid not in held)
+            size = sum(n - held.get(mid, 0) for mid, n in new.items())
+            free_bytes, free_slots = self.inbox_room(tid)
+            if slots > free_slots or size > free_bytes:
+                raise InboxFull('%08X inbox has %d slot(s) and %d B free; %d message(s) need '
+                                '%d slot(s) and %d B' % (tid, free_slots, free_bytes, len(new),
+                                                         slots, size))
+        paths = [self.add_message(c, 'inbox', origin=origin, evict=False) for c, _t in good]
+        return paths, bad
 
     def _trim_inbox(self, tid, keep):
         """Hold a title's inbox to the limits BoxInfo declares, dropping the oldest. -> dropped."""
@@ -770,6 +833,48 @@ def _selftest():
         chk('an inbox stops at its byte limit', used <= DEFAULT_MAX_BYTES, used)
         chk('and still holds the newest message',
             12 in {int.from_bytes(c[0x20:0x28], 'little') for _t, _b, c in big.messages(box='inbox')})
+        cap = Store(os.path.join(tmp, 'capacity'))
+        TA, TB = 0x00030600, 0x00020800
+        for i in range(1, DEFAULT_MAX_MESSAGES - 1):
+            cap.add_message(_synthetic(TA, i), 'inbox', origin='air:test')
+        chk('the room left counts slots and bytes',
+            cap.inbox_room(TA) == (DEFAULT_MAX_BYTES - 0x200 * (DEFAULT_MAX_MESSAGES - 2), 2)
+            and cap.inbox_room(TB) == (DEFAULT_MAX_BYTES, DEFAULT_MAX_MESSAGES),
+            (cap.inbox_room(TA), cap.inbox_room(TB)))
+        plan = plan_inbound([(TA, 0x600, 3), (TB, 0x600, 3)], cap.inbox_room)
+        chk('a title with too few slots is refused and the other admitted',
+            plan == {TB: (0x600, 3)}, plan)
+        chk('an exact fit in slots is admitted',
+            plan_inbound([(TA, 0x400, 2)], cap.inbox_room) == {TA: (0x400, 2)})
+        fb = cap.inbox_room(TA)[0]
+        chk('a title over its free bytes is refused, even with slots free',
+            plan_inbound([(TA, fb + 1, 1)], cap.inbox_room) == {})
+        chk('an exact fit in bytes is admitted',
+            plan_inbound([(TA, fb, 1)], cap.inbox_room) == {TA: (fb, 1)})
+        chk('two entries for one title are admitted or refused together',
+            plan_inbound([(TA, 0x200, 2), (TA, 0x200, 1)], cap.inbox_room) == {})
+        before = {c[0x20:0x28] for _t, _b, c in cap.messages(TA, 'inbox')}
+        three = [_synthetic(TA, 100 + i) for i in range(3)]
+        chk('arrivals that do not fit are refused whole',
+            _raises(lambda: cap.file_inbound(three, origin='air:test'), InboxFull)
+            and {c[0x20:0x28] for _t, _b, c in cap.messages(TA, 'inbox')} == before)
+        chk('and no unread message is dropped for them', before <= {
+            c[0x20:0x28] for _t, _b, c in cap.messages(TA, 'inbox')} and cap.last_evicted == 0)
+        paths, bad = cap.file_inbound(three[:2], origin='air:test')
+        chk('an exact fit is filed', len(paths) == 2 and not bad and cap.inbox_room(TA)[1] == 0)
+        chk('a message already held takes no new slot',
+            cap.file_inbound(three[:1], origin='air:test')[0] != [])
+        chk('a full title refuses even one more',
+            _raises(lambda: cap.file_inbound(three[2:], origin='air:test'), InboxFull))
+        cap.remove_message(TA, 'inbox', three[0])
+        chk('and admits it once a message is read and removed',
+            plan_inbound([(TA, 0x200, 1)], cap.inbox_room) == {TA: (0x200, 1)}
+            and len(cap.file_inbound(three[2:], origin='air:test')[0]) == 1)
+        junk = bytearray(_synthetic(TB, 7)); junk[4:8] = b'\xff\xff\xff\x7f'
+        paths, bad = cap.file_inbound([_synthetic(TB, 8), bytes(junk)], origin='air:test')
+        chk('a malformed arrival is reported and the rest filed', len(paths) == 1 and len(bad) == 1)
+        chk('arrivals for two titles are not filed as one',
+            _raises(lambda: cap.file_inbound([_synthetic(TA, 9), _synthetic(TB, 9)])))
         held = Store(os.path.join(tmp, 'held'), exclusive=True)
         try:
             Store(held.root, exclusive=True)
