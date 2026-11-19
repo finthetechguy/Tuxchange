@@ -281,7 +281,7 @@ def build_ee_list(entries):
 
 
 def parse_ee_list(ee):
-    """-> [{'title', 'mode', 'flags', 'code', 'size'}] for each entry of an `ee` record."""
+    """-> [{'title', 'mode', 'flags', 'code', 'size', 'count'}] for each entry of an `ee` record."""
     if len(ee) < 0x2C or ee[0:2] != b'ee':
         raise ValueError('not an ee record')
     count = struct.unpack_from('<I', ee, 8)[0]
@@ -290,11 +290,28 @@ def parse_ee_list(ee):
         o = 0x2C + i * 0x20
         out.append({'title': struct.unpack_from('<I', ee, o)[0], 'mode': ee[o + 4],
                     'flags': ee[o + 5], 'code': struct.unpack_from('<H', ee, o + 6)[0],
-                    'size': struct.unpack_from('<I', ee, o + 8)[0]})
+                    'size': struct.unpack_from('<I', ee, o + 8)[0],
+                    'count': struct.unpack_from('<I', ee, o + 0x0C)[0]})
     return out
 
 
-VERDICT_ADMIT = 1
+VERDICT_ADMIT, VERDICT_REFUSE = 1, 2
+
+
+def set_verdict_codes(obj, codes):
+    """-> the 0x6363 list object `obj` with each entry's code set from {title: code}.
+    Entries for titles not in `codes`, and their order, are left as they are."""
+    b = bytearray(obj)
+    ee = b[0x10:]
+    if len(ee) < 0x2C or ee[0:2] != b'ee':
+        raise ValueError('not an ee list object')
+    count = struct.unpack_from('<I', ee, 8)[0]
+    for i in range(min(count, (len(ee) - 0x2C) // 0x20)):
+        o = 0x10 + 0x2C + i * 0x20
+        tid = struct.unpack_from('<I', b, o)[0]
+        if tid in codes:
+            struct.pack_into('<H', b, o + 6, codes[tid])
+    return bytes(b)
 
 
 def object_type(obj):
@@ -889,6 +906,16 @@ def _selftest():
     def _msg(tid, n=1):
         return envelope([unwrap(build_envelope(bytes(0x40 + 4 * i), tid, key=b'k' * 32))[0]
                          for i in range(n)])
+
+    mt = build_outbox([_msg(0x00030600), _msg(0x00020800, 2)], console_id=1)
+    t0, t1 = [e['title'] for e in parse_ee_list(mt[3][0x10:])]
+    coded = set_verdict_codes(mt[3], {t1: VERDICT_REFUSE})
+    got = parse_ee_list(coded[0x10:])
+    chk('a verdict code is set per title, keeping the order and the rest of each entry',
+        [(e['title'], e['code']) for e in got] == [(t0, VERDICT_ADMIT), (t1, VERDICT_REFUSE)]
+        and coded[:0x10 + 0x2C + 0x20 + 6] == mt[3][:0x10 + 0x2C + 0x20 + 6]
+        and coded[0x10 + 0x2C + 0x20 + 8:] == mt[3][0x10 + 0x2C + 0x20 + 8:])
+    chk('the entry count is read back', [e['count'] for e in parse_ee_list(mt[2][0x10:])] == [1, 2])
 
     def _verdict(codes):
         e = [(t, 3, 0x100, 1) for t, _c in codes]

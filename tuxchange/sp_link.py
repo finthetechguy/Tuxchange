@@ -195,6 +195,8 @@ class Link:
                                            msgid=a.fresh_msgid, consoleid=a.fresh_consoleid)
         # hook(link, peer_mac, peer_services) -> (services, outbox) or None.
         self.peer_hook = None
+        # hook(link, offer_entries) -> {title: verdict code} for our 0x33, or None.
+        self.offer_hook = None
         self.declined = None
         self.declined_peers = set()
         self.advert = None
@@ -452,15 +454,21 @@ class Link:
             if sorted(offered) != sorted(ours):
                 self.log('  *** OFFER MISMATCH: the console offers %s, declared %s.'
                          % (['%08X' % t for t in offered], ['%08X' % t for t in ours]))
-        if not self.a.mirror_offer or otype != 0x32:
+        if otype != 0x32:
             return
+        if self.a.mirror_offer:
+            i33 = object_index(sess.outbox, 0x33)
+            if i33 is None:
+                self.log('  cannot align our 0x33: no 0x33 object in the outbox')
+                return
+            new = reorder_offer_object(sess.outbox[i33], obj[0x10:], self.log)
+            if new:
+                sess.outbox[i33] = new
+        if getattr(self, 'offer_hook', None) is not None:
+            self.apply_inbound_plan(obj, sess)
         i33 = object_index(sess.outbox, 0x33)
-        if i33 is None:
-            self.log('  cannot align our 0x33: no 0x33 object in the outbox')
-            return
-        new = reorder_offer_object(sess.outbox[i33], obj[0x10:], self.log)
-        if new:
-            sess.outbox[i33] = new
+        if self.a.mirror_offer and i33 is not None:
+            new = sess.outbox[i33]
             ee = new[0x10:]
             if len(ee) >= 0x2C and ee[0:2] == b'ee':
                 cnt = struct.unpack_from('<I', ee, 8)[0]
@@ -472,6 +480,36 @@ class Link:
                     self.log('  OUR object 0x33 AS SENT entry %d: title %08X send_mode=%d '
                              'flags=%d size=%#x  code=%d (%s)'
                              % (i, tid, mode, hf, size, code, self.EE_CODE.get(code, '?')))
+
+    def apply_inbound_plan(self, offer, sess):
+        """Ask the offer hook which of the console's titles we can take, and say so in our 0x33."""
+        i33 = object_index(sess.outbox, 0x33)
+        if i33 is None:
+            self.log('  no 0x33 in the outbox to carry our verdict')
+            return
+        old = sess.outbox[i33]
+        if i33 < sess.idx_tx or (sess.role == 'send' and sess.tx_obj is old):
+            self.log('  the console\'s offer came after our 0x33 went out; it admits all it lists')
+            return
+        try:
+            entries = sp_build.parse_ee_list(offer[0x10:])
+            codes = self.offer_hook(self, entries)
+        except Exception as e:
+            self.log('  offer hook failed (%s: %s); our 0x33 goes unchanged' % (type(e).__name__, e))
+            return
+        if not codes:
+            return
+        try:
+            new = sp_build.set_verdict_codes(old, codes)
+        except ValueError as e:
+            self.log('  could not set our verdict (%s); our 0x33 goes unchanged' % e)
+            return
+        sess.outbox[i33] = new
+        if sess.repeat_obj is old:
+            sess.repeat_obj = new
+        refused = [t for t, c in codes.items() if c != sp_build.VERDICT_ADMIT]
+        self.log('  our verdict on its offer: admitting %d title(s), refusing %d %s'
+                 % (len(codes) - len(refused), len(refused), ['%08X' % t for t in refused]))
 
     def apply_title_verdict(self, verdict, sess):
         """Send only what the console's 0x34 admitted: our 0x81 and the envelopes, together."""
@@ -1806,6 +1844,7 @@ def title_verdict_checks(chk):
         EE_CODE = Link.EE_CODE
         on_object_received = Link.on_object_received
         apply_title_verdict = Link.apply_title_verdict
+        apply_inbound_plan = Link.apply_inbound_plan
 
         def __init__(self, outbox):
             self.lines, self.services, self.outbox = [], [], list(outbox)
@@ -1870,6 +1909,40 @@ def title_verdict_checks(chk):
     _L4, s4, _sent4, o4, _p4 = run([(T1, 2), (T2, 1), (T3, 1)], repeat=True)
     chk('a repeated 0x81 repeats the rebuilt list, not the original',
         s4.repeat_obj is s4.outbox[i81] and s4.repeat_obj != o4[i81])
+
+    def offered(at, mirror=True):
+        objs = sp_build.build_outbox([msg(T1), msg(T2, 2), msg(T3)])
+        L = _L(objs)
+        L.a.mirror_offer = mirror
+        seen = []
+        L.offer_hook = lambda link, ents: (seen.append(ents), {
+            e['title']: sp_build.VERDICT_REFUSE if e['title'] == T2 else sp_build.VERDICT_ADMIT
+            for e in ents})[1]
+        s = sp_yysession.YYSession(lambda *a: True, L.log, objs)
+        s.idx_tx = at
+        o32 = sp_build.cec_object(0x32, sp_build.build_ee_list(
+            [(T3, 3, 0x200, 1), (T2, 3, 0x400, 2), (T1, 3, 0x200, 1)]))
+        L.on_object_received(0, o32, s)
+        return L, s, objs, seen
+
+    i33 = object_index(sp_build.build_outbox([msg(T1)]), 0x33)
+    L5, s5, o5, seen5 = offered(i33)
+    got = sp_build.parse_ee_list(s5.outbox[i33][0x10:])
+    chk('our 0x33 answers the console\'s offer in its order, refusing per title',
+        [(e['title'], e['code']) for e in got]
+        == [(T3, 1), (T2, sp_build.VERDICT_REFUSE), (T1, 1)], got)
+    chk('the offer hook sees each entry\'s size and message count',
+        [(e['title'], e['size'], e['count']) for e in seen5[0]]
+        == [(T3, 0x200, 1), (T2, 0x400, 2), (T1, 0x200, 1)])
+    chk('and the refusal is logged', any('refusing 1' in m for m in L5.lines))
+    L6, s6, o6, seen6 = offered(i33 + 1)
+    chk('an offer that arrives after our 0x33 went out sets no verdict',
+        not seen6 and {e['code'] for e in sp_build.parse_ee_list(s6.outbox[i33][0x10:])} == {1}
+        and any('after our 0x33 went out' in m for m in L6.lines))
+    _L7, s7, o7, _seen7 = offered(i33, mirror=False)
+    chk('without mirroring the codes still land on our own entries',
+        [e['code'] for e in sp_build.parse_ee_list(s7.outbox[i33][0x10:])]
+        == [1, sp_build.VERDICT_REFUSE, 1])
 
 
 def attempt_checks(chk):
