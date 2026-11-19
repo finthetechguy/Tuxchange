@@ -230,10 +230,12 @@ class YYSession:
                 self._pump_send()
             return True
 
-        # A non-zero seq on an empty buffer is the peer resending its last END, so repeat the ACK.
-        if y['payload_len'] > 0 and not self.rx_buf and y['seq'] > 0 and self.role != 'recv':
+        # Data with no SYN since the last object is the peer resending it, because it missed our
+        # final ACK: from a non-zero seq when it resends the tail, from 0 when it resends it all.
+        if (y['payload_len'] > 0 and not self.rx_buf and self.role != 'recv'
+                and (y['seq'] > 0 or self.received)):
             self.stats['dup_tails'] += 1
-            self.log('  peer repeated the tail of object %d (seq %#x); re-ACKing %d B'
+            self.log('  peer repeated object %d from seq %#x; re-ACKing %d B'
                      % (len(self.received) - 1, y['seq'], self.rx_done_len))
             if f & sp_yy.URG:
                 self._emit(sp_yy.ACK, 0, self.rx_done_len)
@@ -1217,6 +1219,20 @@ def _selftest():
     chk('so the message the peer sends after its 0x81 arrives',
         len(r1.received) == 2 and r1.received[1][:2] == b'aa', len(r1.received))
     chk('and the peer FIN ends it at once', r1.done)
+    sent_before = len(r1.received)
+    rs = []
+    r1.send_yy = lambda f, sq, a, p=b'': rs.append((f, sq, a)) or True
+    r1.done = False
+    letter = b'aa\x00\x00' + struct.pack('<I', 3000) + bytes(2992)
+    r1.on_frame(sp_yy.parse(build_yy_frame(sp_yy.SYN, 0, 0)))
+    for fl, sq, chunk in segment(letter):
+        r1.on_frame(sp_yy.parse(build_yy_frame(fl, sq, 0, chunk)))
+    for fl, sq, chunk in segment(letter):
+        r1.on_frame(sp_yy.parse(build_yy_frame(fl, sq, 0, chunk)))
+    chk('an object resent from seq 0 without a new SYN is not filed twice',
+        len(r1.received) == sent_before + 1, len(r1.received) - sent_before)
+    chk('and the resend is answered with the full length again',
+        rs[-1] == (sp_yy.ACK, 0, len(letter)), rs[-1])
     r2, _d2 = receive_only(0.05, fin=False)
     chk('a lingering session without a FIN stays open while the peer is active', not r2.done)
     time.sleep(0.1)
