@@ -14,6 +14,10 @@ DATA_DURATION = 0x002C               # 44 us -- the value on all 108 captured bu
 # Per-pass diagnostics, bounded so a peer flooding authenticated frames cannot exhaust memory.
 HISTORY_MAX = 4096
 LOG_LINES_MAX = 20000
+# Waiting role: how many of a console's probes to answer before it takes one, and the shortest
+# gap between two link-BSS answers to its directed-probe bursts.
+WAIT_ANSWERS = 4
+LINK_REPLY_GAP = 0.05
 
 
 def ccmp_header(pn):
@@ -51,6 +55,8 @@ class Pcap:
 class Link:
     IDLE, ENGAGED, REPLIED, LINKBSS, SYNSENT, DONE = range(6)
     STATE_NAME = {0: 'IDLE', 1: 'ENGAGED', 2: 'REPLIED', 3: 'LINKBSS', 4: 'SYNSENT', 5: 'DONE'}
+    role = 'lead'
+    t_first_obj = t_first_msg = None
 
     def __init__(self, a):
         self.a = a
@@ -216,6 +222,17 @@ class Link:
         self.retune_proven = False
         self.next_hop = 0.0
         self.pcap = Pcap(a.pcap) if a.pcap else None
+        # 'lead': we probe, the console hosts the link and we open each object (cecd role 2).
+        # 'wait': the console probes, we host the link and answer each of its objects (role 1).
+        self.role = getattr(a, 'role', None) or 'lead'
+        if self.role not in ('lead', 'wait'):
+            raise ValueError('unknown role %r' % self.role)
+        self.attempt_records = []
+        self.t_linked = self.t_first_obj = self.t_first_msg = None
+        self.wait_answers = 0
+        self.last_link_reply = 0.0
+        self.wait_verdict = None
+        self.answered_81 = False
 
     def log(self, msg, level=1):
         line = '[%8.3f] %s' % (time.time() - self.t0, msg)
@@ -291,17 +308,19 @@ class Link:
     normalkey_2e = None          # keyslot 0x2E's normal key
 
     def derive_keys(self):
-        """Both role orderings. The host-first one is listed first and used for transmission."""
+        """Both role orderings. The one for whoever hosts the link is first and used to transmit."""
         self.keys = []
         if not (self.peer and self.peer_token):
             return
         me, them = bytes(self.src), bytes(self.peer)
         mine, theirs = self.token, self.peer_token
         kw = {'key17': self.key17, 'keyslot_2e_normalkey': self.normalkey_2e}
-        self.keys.append(('host=console (expected)',
+        self.keys.append(('host=console',
                           derive_ccmp_key(theirs, mine, them, me, **kw)))
         self.keys.append(('host=us',
                           derive_ccmp_key(mine, theirs, me, them, **kw)))
+        if self.role == 'wait':
+            self.keys.reverse()
         self.log('  derived %d candidate keys' % len(self.keys))
         if self.private:
             for lbl, k in self.keys:
@@ -330,6 +349,11 @@ class Link:
         self.session = None
         self.rx_pn = {}
         self.t_engaged = self.pending_poll = self.linkbss_giveup = self.t_first_poll = None
+        self.t_linked = self.t_first_obj = self.t_first_msg = None
+        self.wait_answers = 0
+        self.last_link_reply = 0.0
+        self.wait_verdict = None
+        self.answered_81 = False
 
     def on_probe_response(self, f, mpdu, inf):
         """The console engaged us. Reply with the action frame, then the directed probe."""
@@ -339,11 +363,24 @@ class Link:
         if mac in self.declined_peers:
             self.log('  probe response from %s, declined earlier this pass, ignoring' % mac, 2)
             return
+        if not self.engage(mac, inf, 'CONSOLE ENGAGED'):
+            return
+        for _ in range(2):
+            self.send(sp_parse.build_action(self.src, self.peer, seq=self.next_seq()),
+                      rate=11.0, noack=False, what='action cat-0x7f')
+        self.pending_poll = time.time() + self.a.poll_delay
+        self.linkbss_giveup = None
+        self.polls = 0
+        self.t_first_poll = None
+        self.setstate(self.REPLIED)
+
+    def engage(self, mac, inf, what):
+        """Start an attempt with this console: narrow what we serve it and derive the keys."""
         self.reset_attempt()
         self.peer = self.last_peer = T.macbytes(mac)
         self.peer_token = bytes.fromhex(inf['token']) if inf.get('token') else None
         self.t_engaged = time.time()
-        self.log('  *** CONSOLE ENGAGED: %s' % mac)
+        self.log('  *** %s: %s' % (what, mac))
         self.log('      token %s   DS=ch%s   %d services'
                  % (inf.get('token'), inf.get('ds'), len(inf.get('services') or [])))
         # The broadcast probe declares everything held. From here, narrow to what this console has.
@@ -356,21 +393,171 @@ class Link:
                 self.log('      peer hook failed (%s: %s)' % (type(e).__name__, e))
             if not picked:
                 self.decline_peer(mac)
-                return
+                return False
             self.services, self.outbox = picked
             self.log('      serving %d title(s), %d object(s)'
                      % (len(self.services), len(self.outbox)))
             self.log_our_lists()
         self.setstate(self.ENGAGED)
         self.derive_keys()
-        for _ in range(2):
-            self.send(sp_parse.build_action(self.src, self.peer, seq=self.next_seq()),
-                      rate=11.0, noack=False, what='action cat-0x7f')
-        self.pending_poll = time.time() + self.a.poll_delay
-        self.linkbss_giveup = None
-        self.polls = 0
-        self.t_first_poll = None
-        self.setstate(self.REPLIED)
+        return True
+
+    def tsf(self):
+        return int((time.time() - self.t0) * 1e6)
+
+    def on_console_probe(self, f, inf):
+        """Waiting role: answer a console's StreetPass probe so that it leads the exchange."""
+        mac = f['addr2']
+        if not inf or not inf.get('token') or mac in self.declined_peers:
+            return
+        if self.state == self.ENGAGED and self.peer and mac == T.macstr(self.peer):
+            # It may have missed our answer; answer its next probes too, a few times.
+            if self.wait_answers < WAIT_ANSWERS:
+                self.answer_probe(inf)
+            return
+        if self.state != self.IDLE:
+            return
+        if not self.engage(mac, inf, 'CONSOLE PROBING, answering as the link host'):
+            return
+        self.answer_probe(inf)
+
+    def answer_probe(self, inf):
+        ch = inf.get('ds') or self.channels[self.chan_idx]
+        self.wait_answers += 1
+        self.send(sp_parse.build_probe_response(self.src, self.peer, self.token, self.services,
+                                                ch, seq=self.next_seq(), tsf=self.tsf()),
+                  rate=1.0, noack=False, what='probe response')
+
+    def on_peer_action(self, f):
+        if not self.peer or f['addr2'] != T.macstr(self.peer):
+            return
+        if self.state == self.ENGAGED:
+            self.log('  the console took our answer: action frame after %.0f ms'
+                     % ((time.time() - self.t_engaged) * 1000))
+            self.setstate(self.REPLIED)
+
+    def on_directed_probe(self, f):
+        """Waiting role: the console asks for our link BSS. Announce it, and wait for its SYN."""
+        if not self.peer or f['addr2'] != T.macstr(self.peer) or self.state < self.ENGAGED:
+            return
+        now = time.time()
+        # It sends its directed probes in bursts; one answer per burst is what a console sends.
+        if now - self.last_link_reply < LINK_REPLY_GAP:
+            return
+        self.last_link_reply = now
+        ch = self.channels[self.chan_idx]
+        self.send(sp_parse.build_link_bss_response(self.src, self.peer, ch, seq=self.next_seq(),
+                                                   tsf=self.tsf()),
+                  rate=1.0, noack=False, what='link BSS response')
+        if self.state >= self.LINKBSS:
+            return
+        self.t_linked = now
+        self.log('  *** LINK BSS ANNOUNCED by us to %s, %.0f ms after we answered its probe'
+                 % (f['addr2'], (now - self.t_engaged) * 1000))
+        self.setstate(self.LINKBSS)
+        if object_index(self.outbox, 0x31) is None:
+            # Nothing chosen for this console, so answer as a receive-only peer.
+            self.outbox = list(self.outbox) + sp_build.build_outbox([], allow_empty=True)
+        self.session = sp_yysession.YYSession(self.send_yy, self.log, [],
+                                              on_received=self.on_object_received)
+        self.session.linger = self.a.wait_linger
+        self.session.verdict_hold = 0
+
+    def answer_object(self, otype, obj, sess):
+        """Waiting role: queue cecd role 1's reply to each object the console opens."""
+        def ours(t):
+            i = object_index(self.outbox, t)
+            return self.outbox[i] if i is not None else None
+        replies = []
+        if otype == 0x41:
+            replies = [retype(build_obj_41(self.src), 0x42)]
+        elif otype == 0x43:
+            replies = [sp_build.cec_object(0x43, OBJ_43_PAYLOAD, flags=0x0000)]
+        elif otype == 0x11:
+            replies = [retype(build_obj_11(self.token, self.services), 0x12)]
+        elif otype == 0x21:
+            replies = [retype(ours(0x21), 0x22)]
+        elif otype == 0x23:
+            replies = [sp_build.cec_object(0x24, struct.pack('<I', 2))]
+        elif otype == 0x31:
+            replies = [retype(ours(0x31), 0x32)]
+            self.wait_verdict = self.verdict_on(obj)
+        elif otype == 0x33:
+            if self.wait_verdict is None:
+                self.log('  the console sent its verdict before its offer; answering with an '
+                         'empty one')
+                self.wait_verdict = retype(empty_offer_object(self.log), 0x34)
+            self.take_verdict(obj, sess)
+            replies = [self.wait_verdict]
+        elif otype == 0x81:
+            if self.answered_81:
+                self.log('  the console repeated its 0x81; ours already went')
+                return
+            self.answered_81 = True
+            i81 = object_index(self.outbox, 0x81)
+            replies = list(self.outbox[i81:])
+            self.log('  answering its 0x81 with ours and %d message(s)' % (len(replies) - 1))
+        elif otype == 0xF2:
+            self.log('  the console sent 0xF2: it went back to scanning')
+            return
+        else:
+            self.log('  no role-1 answer for object type 0x%02X' % otype)
+            return
+        sess.outbox.extend(replies)
+        self.log('  answering 0x%02X with %s'
+                 % (otype, ', '.join('0x%02X' % sp_build.object_type(r) for r in replies
+                                     if sp_build.object_type(r) is not None) or 'messages'), 2)
+
+    def verdict_on(self, offer):
+        """Our 0x34: the console's own 0x31 entries, in its order, each with our code."""
+        v = mirror_offer_object(offer[0x10:], self.log, otype=0x34)
+        if v is None:
+            return retype(empty_offer_object(self.log), 0x34)
+        if self.offer_hook is not None:
+            try:
+                codes = self.offer_hook(self, sp_build.parse_ee_list(offer[0x10:]))
+                if codes:
+                    v = sp_build.set_verdict_codes(v, codes)
+            except Exception as e:
+                self.log('  offer hook failed (%s: %s); admitting everything it offers'
+                         % (type(e).__name__, e))
+        return v
+
+    def take_verdict(self, verdict, sess):
+        """The console's 0x33 says which of our titles it takes; cut our 0x81 to those."""
+        try:
+            new, admitted, refused = sp_build.apply_verdict(self.outbox, verdict)
+        except ValueError as e:
+            self.log('  could not apply its verdict (%s); our list goes unchanged' % e)
+            return
+        self.outbox = new
+        sess.admitted, sess.refused = admitted, refused
+        self.log('  verdict applied: sending %d title(s) %s, withholding %d refused %s'
+                 % (len(admitted), ['%08X' % t for t in admitted],
+                    len(refused), ['%08X' % t for t in refused]))
+
+    def note_attempt(self, outcome):
+        """Keep one record per engagement, for comparing the two roles."""
+        if self.t_engaged is None and self.state == self.IDLE:
+            return
+        sess = self.session
+        got = list(getattr(sess, 'received', None) or [])
+        types = [sp_build.object_type(o) for o in got]
+        verdict_type = 0x34 if self.role == 'lead' else 0x33
+        negotiated = verdict_type in types
+        manifest = bool(getattr(sess, 'peer_sent_manifest', lambda: False)())
+
+        def ms(t):
+            return None if t is None or self.t_engaged is None \
+                else round((t - self.t_engaged) * 1000, 1)
+        self.attempt_records.append({
+            'role': self.role, 'peer': T.macstr(self.peer) if self.peer else None,
+            'outcome': outcome, 'state': self.STATE_NAME[self.state],
+            'link_ms': ms(self.t_linked), 'first_object_ms': ms(self.t_first_obj),
+            'first_message_ms': ms(self.t_first_msg),
+            'negotiated': negotiated, 'silent': negotiated and not manifest,
+            'sent': len(getattr(sess, 'delivered', None) or []),
+            'received': len(got)})
 
     def on_link_bss(self, f, mpdu, inf):
         """Handle the second probe response, which has PRIVACY set."""
@@ -388,6 +575,7 @@ class Link:
                      'would have missed it' % (self.polls, (time.time() - self.t_first_poll) * 1000))
         self.pending_poll = None
         self.linkbss_giveup = None
+        self.t_linked = time.time()
         self.setstate(self.LINKBSS)
         self.send_syn()
 
@@ -426,13 +614,18 @@ class Link:
 
     def on_object_received(self, idx, obj, sess):
         """Decode the console's list objects, mirroring its 0x32 if asked."""
+        now = time.time()
+        if self.t_first_obj is None:
+            self.t_first_obj = now
+        if obj[0:2] == b'aa' and self.t_first_msg is None:
+            self.t_first_msg = now
         if len(obj) < 0x10 or obj[0:2] != b'cc':
             return
         otype = struct.unpack_from('<I', obj, 4)[0]
         ee = obj[0x10:]
-        if otype in (0x32, 0x34) and len(ee) >= 0x2C and ee[0:2] == b'ee':
+        if otype in (0x31, 0x32, 0x33, 0x34) and len(ee) >= 0x2C and ee[0:2] == b'ee':
             count = struct.unpack_from('<I', ee, 8)[0]
-            whose = 'its own offer' if otype == 0x32 else 'ITS VERDICT on our list'
+            whose = 'its own offer' if otype in (0x31, 0x32) else 'ITS VERDICT on our list'
             for i in range(min(count, (len(ee) - 0x2C) // 0x20)):
                 e = ee[0x2C + i * 0x20:]
                 tid, mode, hflags, code, size = (struct.unpack_from('<I', e, 0)[0], e[4], e[5],
@@ -442,8 +635,11 @@ class Link:
                          'size=%#x  code=%d (%s)'
                          % (otype, whose, i, tid, mode, hflags, size, code,
                             self.EE_CODE.get(code, '?')))
-                if otype == 0x34 and code == 2:
+                if otype in (0x33, 0x34) and code == 2:
                     self.log('  *** the console REFUSED title %08X.' % tid)
+        if self.role == 'wait':
+            self.answer_object(otype, obj, sess)
+            return
         if otype == 0x34:
             self.apply_title_verdict(obj, sess)
         if otype == 0x32 and len(ee) >= 0x2C and ee[0:2] == b'ee':
@@ -548,7 +744,8 @@ class Link:
         pn = self.tx_pn.get(key, 1)
         self.tx_pn[key] = pn + 1
         pt = sp_yysession.build_yy_frame(flags, seq, ack, payload)
-        mpdu = build_encrypted_data(key, self.src, self.peer, self.peer, pn, pt,
+        bssid = self.src if self.role == 'wait' else self.peer
+        mpdu = build_encrypted_data(key, self.src, self.peer, bssid, pn, pt,
                                     seq=self.next_seq())
         # 11 Mbps saves most of the airtime and keeps CCK link margin.
         return self.send(mpdu, rate=self.a.yy_rate, noack=False,
@@ -631,6 +828,8 @@ class Link:
         self.events.append({'t': time.time() - self.t0, 'kind': 'decrypted',
                             'from': f['addr2'], 'yy': sp_yy.describe(y) if y else None})
         if self.session and y:
+            if self.role == 'wait' and self.state < self.SYNSENT:
+                self.setstate(self.SYNSENT)
             self.session.on_frame(y)
             if self.session.done:
                 self.session_finished()
@@ -645,8 +844,8 @@ class Link:
             return
         self.log('  the console acknowledged objects but never sent its own 0x81 list, so '
                  'it stored none of them (a silent send); re-advertising so it can re-engage')
+        self.abandon_attempt('silent')
         self.session = None
-        self.abandon_attempt()
 
     def drain(self):
         """Discard frames already queued on the socket (received before a retune)."""
@@ -711,6 +910,9 @@ class Link:
                 self.chan_locked = True
                 self.log('  LOCKED to channel %d (the console is here now)'
                          % self.channels[self.chan_idx])
+        if self.role == 'wait':
+            self.on_console_probe(f, inf)
+            return
         if self.a.reactive and self.state == self.IDLE:
             if time.time() - getattr(self, '_last_react', 0) >= self.a.min_gap:
                 self._last_react = time.time()
@@ -844,6 +1046,13 @@ class Link:
             if f['type'] == 2 and len(mpdu) > 1 and (mpdu[1] & 0x40):
                 self.on_protected(f, mpdu)
                 continue
+            if self.role == 'wait' and f['type'] == 0 and f['addr1'] == me:
+                if f['subtype'] == 4:
+                    self.on_directed_probe(f)
+                    continue
+                if f['subtype'] == 13:
+                    self.on_peer_action(f)
+                    continue
             if f['type'] == 0 and f['subtype'] == 5:
                 inf = T.probe_info(mpdu)
                 cap = struct.unpack_from('<H', mpdu, 34)[0] if len(mpdu) >= 36 else 0
@@ -905,7 +1114,7 @@ class Link:
                 if self.stop_check is not None and self.stop_check(self):
                     self.log('  pass ended early: stopping')
                     break
-                if self.state in (self.IDLE,) and time.time() >= nxt:
+                if self.role == 'lead' and self.state == self.IDLE and time.time() >= nxt:
                     self.send(sp_parse.build_probe(self.src, self.token, self.services,
                                                    seq=self.next_seq()),
                               rate=1.0, noack=True, what='broadcast probe')
@@ -917,19 +1126,27 @@ class Link:
                     self.setstate(self.IDLE)
                 if self.session and (time.time() - self.session.last_activity) < 3.0:
                     self.t_engaged = time.time()      # transfer in progress: do not time it out
+                if self.role == 'wait' and self.state == self.ENGAGED and self.t_engaged \
+                        and time.time() - self.t_engaged > self.a.wait_patience:
+                    self.log('  the console did not take our answer in %.1f s, listening again'
+                             % self.a.wait_patience)
+                    self.abandon_attempt('no action frame')
                 if self.state in (self.REPLIED, self.LINKBSS, self.SYNSENT) and self.t_engaged \
                         and time.time() - self.t_engaged > self.a.attempt_timeout:
                     self.log('  attempt timed out after %.1f s in state %s, re-advertising'
                              % (self.a.attempt_timeout, self.STATE_NAME[self.state]))
-                    self.abandon_attempt()
+                    self.abandon_attempt('timed out in %s' % self.STATE_NAME[self.state])
                     nxt = 0.0
+            if self.t_engaged is not None:
+                self.note_attempt('done' if self.state == self.DONE else 'pass ended')
             after, _ = T.read_tx_counters(self.a.iface)
             return self.verdict(before, after, csrc)
         finally:
             self.close()
 
-    def abandon_attempt(self):
+    def abandon_attempt(self, why='abandoned'):
         """Drop the current engagement and go back to advertising."""
+        self.note_attempt(why)
         self.setstate(self.IDLE)
         self.reset_attempt()
 
@@ -1221,8 +1438,14 @@ def reorder_offer_object(our_33, console_ee, log):
     return obj
 
 
-def mirror_offer_object(ee_src, log):
-    """Build our type-0x33 by mirroring the list the console just offered in its 0x32."""
+def retype(obj, otype):
+    """The same 0x6363 object under another type number."""
+    return obj[:4] + struct.pack('<I', otype) + obj[8:]
+
+
+def mirror_offer_object(ee_src, log, otype=0x33):
+    """Build our verdict by mirroring the list the console just offered (0x33 from its 0x32,
+    or 0x34 from its 0x31 when it leads)."""
     ee = bytearray(ee_src)
     if len(ee) < 0x2C or ee[0:2] != b'\x65\x65':
         log('  cannot mirror: source is not an ee record')
@@ -1232,11 +1455,11 @@ def mirror_offer_object(ee_src, log):
         off = 0x2C + i * 32 + 6
         if off < len(ee):
             ee[off] = 0x01                      # the 0x31 -> 0x33 phase flag
-    obj = (b'\x63\x63\xff\xff' + struct.pack('<I', 0x33) + struct.pack('<I', 0)
+    obj = (b'\x63\x63\xff\xff' + struct.pack('<I', otype) + struct.pack('<I', 0)
            + struct.pack('<I', len(ee)) + bytes(ee))
     titles = [struct.unpack_from('<I', ee, 0x2C + i * 32)[0] for i in range(count)]
-    log('  MIRRORED 0x33 from the console offer: count=%d titles=%s (%d B)'
-        % (count, ['%08X' % t for t in titles], len(obj)))
+    log('  MIRRORED 0x%02X from the console offer: count=%d titles=%s (%d B)'
+        % (otype, count, ['%08X' % t for t in titles], len(obj)))
     return obj
 
 
@@ -1362,7 +1585,7 @@ def _sim_args(**over):
         full_sequence=False, greeting=None, fresh_mii=False, mii_name=None, author_name=None,
         from_scratch=False, forward=None, keep_msgid=False, title_id=None, title_name=None,
         hits=0, population=0, hat=0, pet=0, dream=0, hobby=0, birthday=None, colour=0,
-        gender=0, bubble=0)
+        gender=0, bubble=0, role='lead', wait_patience=2.0, wait_linger=2.0)
     a.update(over)
     return argparse.Namespace(**a)
 
@@ -1513,6 +1736,174 @@ def simulate(verbose=1, peer_hook=None, out=None, link_at=0.60):
         chk('a finish after the console sent its list is DONE', L.state == Link.DONE,
             Link.STATE_NAME[L.state])
     print('\n  %d/%d simulation checks passed' % (ok, tot))
+    return 0 if ok == tot else 1
+
+
+class _LeadingConsole:
+    """A scripted console in cecd role 2: it probes, takes a host's answer and opens each object."""
+
+    def __init__(self, mac, token, us, our_tok, services, outbox, key, refuse=()):
+        self.mac, self.token, self.us, self.svc = mac, token, us, services
+        self.key, self.refuse = key, set(refuse)
+        self.queue = deque()
+        self.pn, self.seq = 1, 100
+        self.saw = []
+        self.received_types = []
+        self.sess = sp_yysession.YYSession(self.send_yy, lambda m: None, outbox,
+                                           on_received=self.on_received)
+        self.sess.verdict_hold = 0
+        self.queue.append(_rt(sp_parse.build_probe(mac, token, services, seq=self.next())))
+
+    def next(self):
+        self.seq += 1
+        return self.seq
+
+    def send_yy(self, flags, seq, ack, payload=b''):
+        mpdu = build_encrypted_data(self.key, self.mac, self.us, self.us, self.pn,
+                                    sp_yysession.build_yy_frame(flags, seq, ack, payload),
+                                    seq=self.next())
+        self.pn += 1
+        self.queue.append(_rt(mpdu))
+        return True
+
+    def on_received(self, idx, obj, sess):
+        t = sp_build.object_type(obj)
+        self.received_types.append(t if t is not None else obj[:2].decode('latin-1'))
+        if t == 0x32:
+            # Its verdict on our list, in our order, refusing what it was told to.
+            ee = bytearray(obj[0x10:])
+            for i in range(struct.unpack_from('<I', ee, 8)[0]):
+                o = 0x2C + i * 0x20
+                code = 2 if struct.unpack_from('<I', ee, o)[0] in self.refuse else 1
+                struct.pack_into('<H', ee, o + 6, code)
+            i33 = object_index(sess.outbox, 0x33)
+            sess.outbox[i33] = sp_build.cec_object(0x33, bytes(ee))
+
+    def hear(self, mpdu):
+        f = T.parse_mpdu(mpdu)
+        if not f or f['addr1'] != T.macstr(self.mac):
+            return
+        if f['type'] == 0 and f['subtype'] == 5:
+            cap = struct.unpack_from('<H', mpdu, 34)[0]
+            self.saw.append('link' if cap & 0x10 else 'answer')
+            if cap & 0x10:
+                if self.saw.count('link') == 1:
+                    self.sess.start_send()
+                return
+            for _ in range(2):
+                self.queue.append(_rt(sp_parse.build_action(self.mac, self.us, seq=self.next())))
+            for _ in range(3):
+                self.queue.append(_rt(sp_parse.build_directed_probe(self.mac, self.us,
+                                                                    seq=self.next())))
+        elif f['type'] == 2:
+            y = sp_yy.parse(sp_ccmp.decrypt(self.key, mpdu))
+            self.sess.on_frame(y)
+
+
+class _ConsoleSock:
+    def __init__(self, console):
+        self.c = console
+        self.sent = []
+
+    def fileno(self):
+        return 0
+
+    def send(self, b):
+        self.sent.append(b)
+        self.c.hear(b[T.rt_len(b):])
+        return len(b)
+
+    def recv(self, n):
+        if not self.c.queue:
+            raise BlockingIOError()
+        return self.c.queue.popleft()
+
+    def ready(self):
+        self.c.sess.poll(0.2)
+        return bool(self.c.queue)
+
+    def close(self):
+        pass
+
+
+def simulate_wait(verbose=1):
+    """-> 0 if the waiting role carries a whole exchange that a scripted console leads."""
+    CON, CON_TOK = T.macbytes('96:58:cb:11:22:33'), bytes.fromhex('0011223344556677')
+    US, US_TOK = 'ba:ae:6e:44:55:66', '8899aabbccddeeff'
+    T1, T2, T3 = 0x00020800, 0x00030600, 0x0008C500
+
+    def msg(tid):
+        return sp_build.envelope([sp_build.unwrap(sp_build.build_envelope(
+            bytes(0x40), tid, key=b'k' * 32))[0]])
+
+    a = _sim_args(mac=US, token=US_TOK, verbose=verbose, role='wait', wait_linger=0.3)
+    L = Link(a)
+    L.key17, L.normalkey_2e = b'TuxchangeSelfTest', bytes(range(16))
+    services = [(T1, 0x30, b''), (T2, 0x30, b''), (T3, 0x30, b'')]
+    ours = [build_obj_41(L.src), sp_build.cec_object(0x43, OBJ_43_PAYLOAD, flags=0x0000),
+            build_obj_11(L.token, services)] + sp_build.build_outbox([msg(T1), msg(T2)])
+    L.peer_hook = lambda link, mac, svc: (services, list(ours))
+    host_key = derive_ccmp_key(L.token, CON_TOK, L.src, CON, key17=L.key17,
+                               keyslot_2e_normalkey=L.normalkey_2e)
+    theirs = [build_obj_41(CON), sp_build.cec_object(0x43, OBJ_43_PAYLOAD, flags=0x0000),
+              build_obj_11(CON_TOK, services)] + sp_build.build_outbox([msg(T3)])
+    con = _LeadingConsole(CON, CON_TOK, L.src, L.token, services, theirs, host_key,
+                          refuse=(T2,))
+    L.sock = _ConsoleSock(con)
+    real_select = select.select
+    select.select = lambda r, w, x, t=0: ((r if r and r[0].ready() else []), [], [])
+    try:
+        end = time.time() + 4.0
+        while time.time() < end and L.state != Link.DONE:
+            L.pump(min(end, time.time() + 0.2))
+            L.session and L.session.poll(a.yy_idle)
+    finally:
+        select.select = real_select
+    if L.t_engaged is not None:
+        L.note_attempt('done' if L.state == Link.DONE else 'sim ended')
+
+    ok = tot = 0
+
+    def chk(n, c, g=''):
+        nonlocal ok, tot
+        tot += 1
+        ok += bool(c)
+        print('  [%s] %s%s' % ('PASS' if c else 'FAIL', n, ('  %s' % (g,)) if g else ''))
+
+    chk('sent no probe of its own', not any('probe' in w and 'response' not in w
+                                            for w, _m in L.sent_frames), L.sent)
+    ans = [m for w, m in L.sent_frames if w == 'probe response']
+    chk('answered the console probe once it was heard', len(ans) == 1, len(ans))
+    if ans:
+        inf = T.probe_info(ans[0])
+        chk('the answer carries our token and hosts the BSS',
+            inf and inf.get('token') == US_TOK and ans[0][16:22] == L.src
+            and struct.unpack_from('<H', ans[0], 34)[0] == 0x0002)
+    chk('one link-BSS answer to a burst of directed probes',
+        L.sent.get('link BSS response') == 1 and con.saw == ['answer', 'link'], con.saw)
+    chk('transmits under the host=us key', L.keys and L.keys[0][0] == 'host=us'
+        and L.keys[0][1] == host_key)
+    want = [0x42, 0x43, 0x12, 0x22, 0x24, 0x32, 0x34, 0x81, 'aa']
+    chk("answered each of the console's objects as role 1 does",
+        con.received_types == want, con.received_types)
+    got = con.sess.received
+    v34 = next((o for o in got if sp_build.object_type(o) == 0x34), None)
+    chk('our 0x34 lists the titles of its 0x31, admitted',
+        v34 is not None and [(e['title'], e['code']) for e in
+                             sp_build.parse_ee_list(v34[0x10:])] == [(T3, 1)])
+    o81 = next((o for o in got if sp_build.object_type(o) == 0x81), None)
+    chk('its 0x33 refusal cut our 0x81 to the admitted title',
+        o81 is not None and struct.unpack_from('<II', o81, 0x10) == (1, T1))
+    chk('only the admitted message went', [sp_build.unwrap(o) and struct.unpack_from(
+        '<I', o, 0x08)[0] for o in got if o[:2] == b'aa'] == [T1])
+    chk('received its message', any(o[:2] == b'aa' for o in L.session.received)
+        if L.session else False)
+    chk('finished the pass', L.state == Link.DONE, Link.STATE_NAME[L.state])
+    rec = L.attempt_records[-1] if L.attempt_records else {}
+    chk('recorded the attempt for the role comparison',
+        rec.get('role') == 'wait' and rec.get('negotiated') and not rec.get('silent')
+        and rec.get('link_ms') is not None and rec.get('first_message_ms') is not None, rec)
+    print('\n  %d/%d waiting-role simulation checks passed' % (ok, tot))
     return 0 if ok == tot else 1
 
 
@@ -1849,6 +2240,7 @@ def title_verdict_checks(chk):
         def __init__(self, outbox):
             self.lines, self.services, self.outbox = [], [], list(outbox)
             self.a = argparse.Namespace(mirror_offer=False)
+            self.role, self.t_first_obj, self.t_first_msg = 'lead', None, None
 
         def log(self, m, level=1):
             self.lines.append(m)
@@ -2114,6 +2506,14 @@ def build_parser():
     ap.add_argument('--linkbss-patience', type=float, default=3.0,
                     help='seconds to keep asking the link BSS before giving up.')
     ap.add_argument('--attempt-timeout', type=float, default=6.0)
+    ap.add_argument('--role', choices=('lead', 'wait'), default='lead',
+                    help='lead (default): we probe and open each object. wait (experimental): '
+                         'stay quiet, answer a console\'s probe and let it lead the exchange')
+    ap.add_argument('--wait-patience', type=float, default=2.0,
+                    help='wait role: seconds for the console to take our probe answer')
+    ap.add_argument('--wait-linger', type=float, default=2.0,
+                    help='wait role: seconds to stay open after our last object, for the '
+                         "console's remaining messages or its FIN")
     ap.add_argument('--reactive', action='store_true', default=True,
                     help='answer a console probe immediately (default on)')
     ap.add_argument('--no-reactive', dest='reactive', action='store_false')
@@ -2220,7 +2620,9 @@ def main():
     if a.simulate:
         rc = simulate(a.verbose)
         print('\n  -- a console that never brings up its link BSS --')
-        return rc | simulate(a.verbose, link_at=None)
+        rc |= simulate(a.verbose, link_at=None)
+        print('\n  -- the console leads and we wait --')
+        return rc | simulate_wait(a.verbose)
     if a.replay:
         return replay(a.replay)
     return Link(a).run()

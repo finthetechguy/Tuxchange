@@ -323,8 +323,9 @@ def object_type(obj):
 
 def apply_verdict(objects, verdict):
     """-> (objects, admitted, refused) with the 0x81 and the envelopes after it cut to the verdict."""
-    if object_type(verdict) != 0x34:
-        raise ValueError('not a 0x34 verdict')
+    # The waiting side's verdict is 0x34; the leading side's is 0x33.
+    if object_type(verdict) not in (0x33, 0x34):
+        raise ValueError('not a 0x33/0x34 verdict')
     entries = parse_ee_list(verdict[0x10:])
     admitted = list(dict.fromkeys(e['title'] for e in entries if e['code'] == VERDICT_ADMIT))
     i81 = next((i for i, o in enumerate(objects) if object_type(o) == 0x81), None)

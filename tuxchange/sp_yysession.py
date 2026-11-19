@@ -113,6 +113,9 @@ class YYSession:
         # The titles the peer's 0x34 admitted and refused.
         self.admitted = self.refused = None
         self.send_at = None             # deferred start_send(), driven by poll()
+        # Seconds to stay open with nothing left to send. A waiting side answers objects as they
+        # arrive, so an empty outbox does not mean the peer is finished.
+        self.linger = 0.0
         self.stats = {'sent_objects': 0, 'recv_objects': 0, 'tx_frames': 0, 'rx_frames': 0,
                       'resends': 0, 'dup_tails': 0, 'syn_resends': 0, 'gaps': 0,
                       'short_holds': 0, 'manifest_repeats': 0, 'refused': 0,
@@ -126,6 +129,8 @@ class YYSession:
     def start_send(self):
         """Open a connection to send our next object (we are the initiator)."""
         if self.idx_tx >= len(self.outbox):
+            if self.linger:
+                return False
             self.log('  all %d objects sent' % len(self.outbox))
             self.done = True
             return False
@@ -356,6 +361,14 @@ class YYSession:
     def poll(self, idle_timeout=0.4):
         """Break the alternation deadlock when the peer has nothing to send."""
         if self.done:
+            return False
+        if (self.linger and self.role is None and self.send_at is None
+                and self.idx_tx >= len(self.outbox)
+                and (self.peer_fin or time.time() - self.last_activity > self.linger)):
+            self.log('  all %d objects sent and the peer %s'
+                     % (len(self.outbox), 'sent its FIN' if self.peer_fin
+                        else 'has been quiet for %.1f s' % self.linger))
+            self.done = True
             return False
         if self.send_at is not None:
             if time.time() < self.send_at:

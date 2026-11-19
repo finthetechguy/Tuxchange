@@ -74,11 +74,16 @@ def build_probe(src_mac, token8, services, seq=0):
     ies  = b'\x00\x20' + b'Nintendo_3DS_continuous_scan_000'
     ies += b'\x01\x08' + bytes.fromhex('82848b0c12961824')   # rates  1,2,5.5,6,9,11,12,18
     ies += b'\x32\x04' + bytes.fromhex('3048606c')           # ext    24,36,48,54
+    return hdr + ies + _service_ie(token8, services)
+
+
+def _service_ie(token8, services):
+    """The Nintendo vendor IE: the enabled titles, then the token."""
     svc = b''.join(struct.pack('>I', t) + bytes([f]) + bytes(tr) for t, f, tr in services)
     tlv  = struct.pack('<H', (len(svc) << 8) | (1 << 4) | 1) + svc
     tlv += struct.pack('<H', (8 << 8) | (0xF << 4) | 0) + bytes(token8)
     vend = NIN_OUI + b'\x01' + tlv
-    return hdr + ies + b'\xdd' + bytes([len(vend)]) + vend
+    return b'\xdd' + bytes([len(vend)]) + vend
 
 
 def parse_vendor_ie(data):
@@ -233,3 +238,35 @@ def build_action(src_mac, dst_mac, seq=0, duration=0x00d5, tail=b'\x00\x00'):
     hdr = (b'\xd0\x00' + struct.pack('<H', duration) + bytes(dst_mac) + bytes(src_mac)
            + bytes(dst_mac) + struct.pack('<H', (seq & 0xFFF) << 4))
     return hdr + b'\x7f' + NIN_OUI + bytes(tail)
+
+
+def _probe_response(src_mac, dst_mac, seq, tsf, capability, ies):
+    hdr = (b'\x50\x00\x00\x00' + bytes(dst_mac) + bytes(src_mac) + bytes(src_mac)
+           + struct.pack('<H', (seq & 0xFFF) << 4))
+    fixed = struct.pack('<QHH', tsf & 0xFFFFFFFFFFFFFFFF, 100, capability)
+    return hdr + fixed + ies
+
+
+def _ibss_ies(channel):
+    return (b'\x01\x08' + bytes.fromhex('82848b0c12961824')
+            + b'\x03\x01' + bytes([channel & 0xFF]) + b'\x06\x02\x00\x00'
+            + b'\x32\x04' + bytes.fromhex('3048606c'))
+
+
+def build_probe_response(src_mac, dst_mac, token8, services, channel, seq=0, tsf=0):
+    """The probe response a console sends to engage a peer whose StreetPass probe it heard.
+
+    The sender hosts the link: the BSSID is its own MAC and the capability is IBSS.
+    """
+    ies = b'\x00\x20' + b'Nintendo_3DS_continuous_scan_000' + _ibss_ies(channel)
+    return _probe_response(src_mac, dst_mac, seq, tsf, 0x0002,
+                           ies + _service_ie(token8, services))
+
+
+LINK_BSS_TAIL = bytes.fromhex('dd070050f202000100' 'dd0b00037f0101020100000a00')
+
+
+def build_link_bss_response(src_mac, dst_mac, channel, seq=0, tsf=0):
+    """The host's answer to a directed probe: its encrypted link BSS is up (IBSS | PRIVACY)."""
+    return _probe_response(src_mac, dst_mac, seq, tsf, 0x0012,
+                           b'\x00\x00' + _ibss_ies(channel) + LINK_BSS_TAIL)
