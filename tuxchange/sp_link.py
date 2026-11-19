@@ -56,7 +56,7 @@ class Link:
     IDLE, ENGAGED, REPLIED, LINKBSS, SYNSENT, DONE = range(6)
     STATE_NAME = {0: 'IDLE', 1: 'ENGAGED', 2: 'REPLIED', 3: 'LINKBSS', 4: 'SYNSENT', 5: 'DONE'}
     role = 'lead'
-    t_first_obj = t_first_msg = None
+    t_attempt = t_first_obj = t_first_msg = None
 
     def __init__(self, a):
         self.a = a
@@ -228,7 +228,7 @@ class Link:
         if self.role not in ('lead', 'wait'):
             raise ValueError('unknown role %r' % self.role)
         self.attempt_records = []
-        self.t_linked = self.t_first_obj = self.t_first_msg = None
+        self.t_attempt = self.t_linked = self.t_first_obj = self.t_first_msg = None
         self.wait_answers = 0
         self.last_link_reply = 0.0
         self.wait_verdict = None
@@ -349,7 +349,7 @@ class Link:
         self.session = None
         self.rx_pn = {}
         self.t_engaged = self.pending_poll = self.linkbss_giveup = self.t_first_poll = None
-        self.t_linked = self.t_first_obj = self.t_first_msg = None
+        self.t_attempt = self.t_linked = self.t_first_obj = self.t_first_msg = None
         self.wait_answers = 0
         self.last_link_reply = 0.0
         self.wait_verdict = None
@@ -379,7 +379,7 @@ class Link:
         self.reset_attempt()
         self.peer = self.last_peer = T.macbytes(mac)
         self.peer_token = bytes.fromhex(inf['token']) if inf.get('token') else None
-        self.t_engaged = time.time()
+        self.t_engaged = self.t_attempt = time.time()
         self.log('  *** %s: %s' % (what, mac))
         self.log('      token %s   DS=ch%s   %d services'
                  % (inf.get('token'), inf.get('ds'), len(inf.get('services') or [])))
@@ -433,7 +433,7 @@ class Link:
             return
         if self.state == self.ENGAGED:
             self.log('  the console took our answer: action frame after %.0f ms'
-                     % ((time.time() - self.t_engaged) * 1000))
+                     % ((time.time() - self.t_attempt) * 1000))
             self.setstate(self.REPLIED)
 
     def on_directed_probe(self, f):
@@ -453,7 +453,7 @@ class Link:
             return
         self.t_linked = now
         self.log('  *** LINK BSS ANNOUNCED by us to %s, %.0f ms after we answered its probe'
-                 % (f['addr2'], (now - self.t_engaged) * 1000))
+                 % (f['addr2'], (now - self.t_attempt) * 1000))
         self.setstate(self.LINKBSS)
         if object_index(self.outbox, 0x31) is None:
             # Nothing chosen for this console, so answer as a receive-only peer.
@@ -548,8 +548,8 @@ class Link:
         manifest = bool(getattr(sess, 'peer_sent_manifest', lambda: False)())
 
         def ms(t):
-            return None if t is None or self.t_engaged is None \
-                else round((t - self.t_engaged) * 1000, 1)
+            return None if t is None or self.t_attempt is None \
+                else round((t - self.t_attempt) * 1000, 1)
         self.attempt_records.append({
             'role': self.role, 'peer': T.macstr(self.peer) if self.peer else None,
             'outcome': outcome, 'state': self.STATE_NAME[self.state],
@@ -1077,8 +1077,8 @@ class Link:
             self.log('  %s from %s -> %s' % (f['name'], f['addr2'], f['addr1']), 2)
 
     def run(self):
-        self.log('  interface %s  channels %s  our MAC %s'
-                 % (self.a.iface, self.channels, T.macstr(self.src)))
+        self.log('  interface %s  channels %s  our MAC %s  role %s'
+                 % (self.a.iface, self.channels, T.macstr(self.src), self.role))
         self.log('  our token %s   services %s'
                  % (self.token.hex(), ['%08x' % s[0] for s in self.services]))
         if self.a.pcap:
@@ -1106,43 +1106,47 @@ class Link:
             self.next_hop = time.time() + self.a.dwell
             before, csrc = T.read_tx_counters(self.a.iface)
 
-            deadline = time.time() + self.a.secs
-            nxt = 0.0
-            while time.time() < deadline and self.state != self.DONE:
-                if self.tick_hook is not None:
-                    self.tick_hook(self)
-                if self.stop_check is not None and self.stop_check(self):
-                    self.log('  pass ended early: stopping')
-                    break
-                if self.role == 'lead' and self.state == self.IDLE and time.time() >= nxt:
-                    self.send(sp_parse.build_probe(self.src, self.token, self.services,
-                                                   seq=self.next_seq()),
-                              rate=1.0, noack=True, what='broadcast probe')
-                    nxt = time.time() + self.a.probe_interval
-                self.pump(min(deadline, nxt if self.state == self.IDLE else time.time() + 0.2))
-                if self.state != self.IDLE and not self.t_engaged:
-                    self.log('  in state %s with no engagement in flight, resetting to IDLE'
-                             % self.STATE_NAME[self.state])
-                    self.setstate(self.IDLE)
-                if self.session and (time.time() - self.session.last_activity) < 3.0:
-                    self.t_engaged = time.time()      # transfer in progress: do not time it out
-                if self.role == 'wait' and self.state == self.ENGAGED and self.t_engaged \
-                        and time.time() - self.t_engaged > self.a.wait_patience:
-                    self.log('  the console did not take our answer in %.1f s, listening again'
-                             % self.a.wait_patience)
-                    self.abandon_attempt('no action frame')
-                if self.state in (self.REPLIED, self.LINKBSS, self.SYNSENT) and self.t_engaged \
-                        and time.time() - self.t_engaged > self.a.attempt_timeout:
-                    self.log('  attempt timed out after %.1f s in state %s, re-advertising'
-                             % (self.a.attempt_timeout, self.STATE_NAME[self.state]))
-                    self.abandon_attempt('timed out in %s' % self.STATE_NAME[self.state])
-                    nxt = 0.0
-            if self.t_engaged is not None:
-                self.note_attempt('done' if self.state == self.DONE else 'pass ended')
+            self.serve(time.time() + self.a.secs)
             after, _ = T.read_tx_counters(self.a.iface)
             return self.verdict(before, after, csrc)
         finally:
             self.close()
+
+    def serve(self, deadline):
+        """The listening loop: advertise or wait, and drive any engagement until the deadline."""
+        nxt = 0.0
+        while time.time() < deadline and self.state != self.DONE:
+            if self.tick_hook is not None:
+                self.tick_hook(self)
+            if self.stop_check is not None and self.stop_check(self):
+                self.log('  pass ended early: stopping')
+                break
+            advertising = self.role == 'lead' and self.state == self.IDLE
+            if advertising and time.time() >= nxt:
+                self.send(sp_parse.build_probe(self.src, self.token, self.services,
+                                               seq=self.next_seq()),
+                          rate=1.0, noack=True, what='broadcast probe')
+                nxt = time.time() + self.a.probe_interval
+            self.pump(min(deadline, nxt if advertising else time.time() + 0.2))
+            if self.state != self.IDLE and not self.t_engaged:
+                self.log('  in state %s with no engagement in flight, resetting to IDLE'
+                         % self.STATE_NAME[self.state])
+                self.setstate(self.IDLE)
+            if self.session and (time.time() - self.session.last_activity) < 3.0:
+                self.t_engaged = time.time()      # transfer in progress: do not time it out
+            if self.role == 'wait' and self.state == self.ENGAGED and self.t_engaged \
+                    and time.time() - self.t_engaged > self.a.wait_patience:
+                self.log('  the console did not take our answer in %.1f s, listening again'
+                         % self.a.wait_patience)
+                self.abandon_attempt('no action frame')
+            if self.state in (self.REPLIED, self.LINKBSS, self.SYNSENT) and self.t_engaged \
+                    and time.time() - self.t_engaged > self.a.attempt_timeout:
+                self.log('  attempt timed out after %.1f s in state %s, re-advertising'
+                         % (self.a.attempt_timeout, self.STATE_NAME[self.state]))
+                self.abandon_attempt('timed out in %s' % self.STATE_NAME[self.state])
+                nxt = 0.0
+        if self.t_engaged is not None:
+            self.note_attempt('done' if self.state == self.DONE else 'pass ended')
 
     def abandon_attempt(self, why='abandoned'):
         """Drop the current engagement and go back to advertising."""
@@ -1698,6 +1702,11 @@ def simulate(verbose=1, peer_hook=None, out=None, link_at=0.60):
     chk('sent 2 action frames', L.sent.get('action cat-0x7f') == 2, L.sent.get('action cat-0x7f'))
     chk('sent the directed probe', L.sent.get('directed probe', 0) >= 1, L.sent.get('directed probe'))
     chk('sent exactly one encrypted SYN', L.sent.get('YY SYN') == 1, L.sent.get('YY SYN'))
+    L.t_engaged = time.time()
+    L.note_attempt('sim')
+    rec = L.attempt_records[-1]
+    chk('the attempt record times the link from the start of the attempt',
+        rec['role'] == 'lead' and rec['link_ms'] is not None and 0 <= rec['link_ms'] < 3000, rec)
 
     syn = [m for w, m in L.sent_frames if w == 'YY SYN']
     chk('our transmitted SYN is exactly one frame', len(syn) == 1)
@@ -1853,14 +1862,9 @@ def simulate_wait(verbose=1):
     real_select = select.select
     select.select = lambda r, w, x, t=0: ((r if r and r[0].ready() else []), [], [])
     try:
-        end = time.time() + 4.0
-        while time.time() < end and L.state != Link.DONE:
-            L.pump(min(end, time.time() + 0.2))
-            L.session and L.session.poll(a.yy_idle)
+        L.serve(time.time() + 4.0)
     finally:
         select.select = real_select
-    if L.t_engaged is not None:
-        L.note_attempt('done' if L.state == Link.DONE else 'sim ended')
 
     ok = tot = 0
 
