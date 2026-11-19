@@ -558,29 +558,132 @@ class PeerBook:
         return h in set(self.peers.get(mac.lower(), {}).get('received', []))
 
 
-def select_for_peer(store, peer_titles, book=None, mac=None, max_titles=None, log=None):
-    """-> [container] to serve this peer, newest first."""
-    want = {t for t in peer_titles}
-    out, seen_titles, seen_ids = [], set(), set()
-    for tid, box, c in sorted(store.messages(box='outbox'),
-                              key=lambda r: sp_cec.parse_header(r[2])['created']['text'],
-                              reverse=True):
-        if tid not in want:
+OUTBOX_SELECT = ('all', 'retail')
+RETAIL_BATCH_BYTES = 0x19000
+RETAIL_BATCH_MORE = 0x40
+STREETPASS_BIT = 1
+
+
+def retail_gate(container):
+    """-> why cecd would keep this message out of its own StreetPass offer, or None."""
+    h = sp_cec.parse_header(container)
+    if not h['field_6c']:
+        return 'zero count'
+    if not h['field_34'] & STREETPASS_BIT and h['send_mode'] != 1:
+        return 'SpotPass only'
+    return None
+
+
+def retail_batch(containers):
+    """One mailbox's messages, in box order -> (batch id or None, [offered], {id: reason}).
+
+    As cecd builds its offer: the first message with a non-zero +0x6C fixes the batch (+0x18),
+    the first message from there that passes every gate leads it, and later members of the
+    same batch follow within RETAIL_BATCH_BYTES. Batch 0 carries only its leader.
+    """
+    anchor = next((i for i, c in enumerate(containers) if retail_gate(c) != 'zero count'), None)
+    batch = (None if anchor is None
+             else sp_cec.parse_header(containers[anchor])['field_18'])
+    offered, left, size = [], {}, 0
+    for i, c in enumerate(containers):
+        h = sp_cec.parse_header(c)
+        why = retail_gate(c)
+        if why is None and h['field_18'] != batch:
+            why = 'other batch'
+        if why is None and offered:
+            if batch == 0:
+                why = 'batch 0 sends one'
+            elif size + h['total_size'] > RETAIL_BATCH_BYTES:
+                why = 'over the batch size'
+            elif len(offered) > RETAIL_BATCH_MORE:
+                why = 'over the batch count'
+        if why:
+            left[c[0x20:0x28]] = why
             continue
+        offered.append(c)
+        size += h['total_size']
+    return (batch if offered else None), offered, left
+
+
+def _box_order(c):
+    # The store keeps no OBIndex, so creation order stands in for the console's append order.
+    return (sp_cec.parse_header(c)['created']['text'], c[0x20:0x28])
+
+
+def retail_plan(store, titles=None, log=None):
+    """-> {title: {'batch', 'offered': [container], 'left_out': {id: reason}}} under
+    retail selection, after the relay's own gates."""
+    plan = {}
+    want = None if titles is None else set(titles)
+    for tid in store.titles():
+        if want is not None and tid not in want:
+            continue
+        held = [c for _t, _b, c in store.messages(tid, 'outbox')
+                if _servable_here(store, tid, c, log)]
+        if not held:
+            continue
+        batch, offered, left = retail_batch(sorted(held, key=_box_order))
+        plan[tid] = {'batch': batch, 'offered': offered, 'left_out': left}
+    return plan
+
+
+def describe_plan(plan):
+    """A retail plan -> what the control socket and the log show of it."""
+    out = {}
+    for tid, p in plan.items():
+        reasons = {}
+        for why in p['left_out'].values():
+            reasons[why] = reasons.get(why, 0) + 1
+        out['%08X' % tid] = {'batch': None if p['batch'] is None else '%08x' % p['batch'],
+                             'offered': len(p['offered']), 'left_out': reasons}
+    return out
+
+
+def _servable_here(store, tid, c, log=None):
+    mid = c[0x20:0x28]
+    if sp_cecvalid.hmac_status(c, store.title_key(tid)) == sp_cecvalid.INVALID:
+        if log:
+            log('  NOT serving %08X/%s: it is malformed or fails its title HMAC'
+                % (tid, mid.hex()))
+        return False
+    if store.is_from_air(mid, 'outbox'):
+        if log:
+            log('  NOT serving %08X/%s: it came from a console over the air, and this relay '
+                'only exchanges its own data' % (tid, mid.hex()))
+        return False
+    return True
+
+
+def select_for_peer(store, peer_titles, book=None, mac=None, max_titles=None, log=None,
+                    mode='all'):
+    """-> [container] to serve this peer.
+
+    'all' offers every message of each declared title, newest first. 'retail' offers one
+    batch per title as a console's cecd would choose it (see retail_batch).
+    """
+    if mode not in OUTBOX_SELECT:
+        raise ValueError('outbox selection is one of %s, got %r' % (OUTBOX_SELECT, mode))
+    want = {t for t in peer_titles}
+    if mode == 'retail':
+        plan = retail_plan(store, want, log)
+        if log:
+            for tid, d in describe_plan(plan).items():
+                if d['left_out']:
+                    log('  retail selection for %s: batch %s, offering %d, leaving out %s'
+                        % (tid, d['batch'], d['offered'],
+                           ', '.join('%d %s' % (n, w) for w, n in sorted(d['left_out'].items()))))
+        rows = [(tid, c) for tid, p in plan.items() for c in p['offered']]
+    else:
+        rows = [(tid, c) for tid, _b, c in sorted(store.messages(box='outbox'),
+                                                  key=lambda r: sp_cec.parse_header(r[2])['created']['text'],
+                                                  reverse=True)
+                if tid in want and _servable_here(store, tid, c, log)]
+    out, seen_titles, seen_ids = [], set(), set()
+    for tid, c in rows:
         mid = c[0x20:0x28]
         if mid in seen_ids:
             continue
         seen_ids.add(mid)
-        if sp_cecvalid.hmac_status(c, store.title_key(tid)) == sp_cecvalid.INVALID:
-            if log:
-                log('  NOT serving %08X/%s: it is malformed or fails its title HMAC'
-                    % (tid, mid.hex()))
-            continue
-        if store.is_from_air(mid, box):
-            if log:
-                log('  NOT serving %08X/%s: it came from a console over the air, and this relay '
-                    'only exchanges its own data' % (tid, mid.hex()))
-            continue
         if book is not None and mac is not None:
             if book.came_from(mac, mid) or book.already_sent(mac, mid):
                 continue
@@ -1555,6 +1658,7 @@ class Relay:
             'iface_failures': self.iface_failures,
             'passes': self.passes,
             'role': getattr(self.a, 'role', 'lead'),
+            'outbox_select': self.outbox_select(),
             'store': self.a.store,
             **self._store_counts(),
             'filtered': len(self.book.snapshot()['filter']),
@@ -1568,6 +1672,8 @@ class Relay:
             return {'titles': ['%08X' % t for t in self.store.titles()],
                     'messages': len(held),
                     'servable': len(serv),
+                    'retail_selection': (describe_plan(retail_plan(self.store))
+                                         if self.outbox_select() == 'retail' else None),
                     # By set difference, because older stored messages have no provenance tag.
                     'held_but_never_served': len({c[0x20:0x28] for _t, _b, c in held}
                                                  - {c[0x20:0x28] for c in serv})}
@@ -1576,7 +1682,9 @@ class Relay:
         """Everything the GUI needs to draw the Outbox and Inbox tabs, in one round trip."""
         with self.lock:
             serv = {c[0x20:0x28] for c in self.servable()}
-            out = {'titles': [], 'max_titles': sp_store.MBOXLIST_MAX}
+            plan = retail_plan(self.store)
+            out = {'titles': [], 'max_titles': sp_store.MBOXLIST_MAX,
+                   'outbox_select': self.outbox_select()}
             receiving = set(self.store.receive_titles())
             for t in self.store.titles():
                 ms = []
@@ -1589,6 +1697,8 @@ class Relay:
                         'send_mode': h['send_mode'], 'flags': h['field_34'],
                         'origin': (self.store.origin(mid, box) or {}).get('source'),
                         'servable': mid in serv,
+                        'retail_left_out': (plan[t]['left_out'].get(mid) if t in plan
+                                            and box == 'outbox' else None),
                         'hmac': {True: 'verified', False: 'FAILED',
                                  None: 'no key'}[self.store.verify(t, c)],
                     })
@@ -1596,6 +1706,7 @@ class Relay:
                     'title': '%08X' % t, 'name': self.store.title_name(t),
                     'has_key': self.store.title_key(t) is not None,
                     'receive': t in receiving,
+                    'retail': describe_plan({t: plan[t]})['%08X' % t] if t in plan else None,
                     'messages': ms,
                 })
             return out
@@ -1618,10 +1729,13 @@ class Relay:
         except (OSError, ValueError):
             return []
 
+    def outbox_select(self):
+        return getattr(self.a, 'outbox_select', 'all') or 'all'
+
     def servable(self):
         """Every message this relay could offer to a console that declared every title."""
         with self.lock:                      # RLock: describe_store() already holds it
-            return select_for_peer(self.store, self.store.titles())
+            return select_for_peer(self.store, self.store.titles(), mode=self.outbox_select())
 
     @staticmethod
     def peer_titles(peer_services):
@@ -1721,7 +1835,8 @@ class Relay:
                                     self.book.wait(mac)))
         titles = self.peer_titles(peer_services)
         with self.lock:
-            picked = select_for_peer(self.store, titles, self.book, mac, log=self.log)
+            picked = select_for_peer(self.store, titles, self.book, mac, log=self.log,
+                                     mode=self.outbox_select())
             held = ['%08X' % sp_cec.parse_header(c)['cec_title_id']
                     for _t, _b, c in self.store.messages(box='outbox')]
             receiving = set(self.store.receive_titles())
@@ -2667,7 +2782,9 @@ def _selftest():
             chk('Tomodachi Life\'s two messages both come out',
                 len(select_for_peer(st, [0x0008C500])) == 2,
                 len(select_for_peer(st, [0x0008C500])))
-            st3 = sp_store.Store(os.path.join(tmp, 'store3'))
+            chk('under retail selection they are one, as the console offers them itself',
+                len(select_for_peer(st, [0x0008C500], mode='retail')) == 1)
+            st3 =sp_store.Store(os.path.join(tmp, 'store3'))
             inbound = [c for _t, _b, c in st.messages(0x00030600)][0]
             st3.add_message(inbound, 'inbox', key=st.title_key(0x00030600),
                             origin='air:96:58:cb:00:11:22')
@@ -3672,6 +3789,103 @@ def _selftest():
             _raises(lambda: sp_build.unwrap(whole + b'\x00' * 4)))
         chk('a runt too short to hold a header is rejected, not crashed',
             _raises(lambda: sp_build.unwrap(b'\x61\x61\x00\x00')))
+
+        RT, rtk = 0x00141000, b't' * 32
+        seq = iter(range(1000))
+
+        def _rm(batch=0, mask=3, mode=0, count=0xFF, body=0x40, tid=RT):
+            m = bytearray(sp_build.build_envelope(
+                bytes(body), tid, key=rtk, ex_headers=[], message_id=0x7700 + next(seq),
+                when=time.gmtime(1.7e9 + next(seq)), send_mode=mode, flags=mask)
+                [sp_build.ENVELOPE_LEN:])
+            struct.pack_into('<I', m, 0x18, batch)
+            m[0x6C] = count
+            return bytes(m)
+
+        def _ids(cs):
+            return [c[0x20:0x28] for c in cs]
+
+        chk('retail: a message with a zero +0x6C is not offered',
+            retail_gate(_rm(count=0)) == 'zero count' and retail_gate(_rm(count=1)) is None)
+        chk('retail: the SpotPass-only bit keeps a message out of the StreetPass offer',
+            retail_gate(_rm(mask=2, mode=3)) == 'SpotPass only'
+            and retail_gate(_rm(mask=1, mode=3)) is None)
+        chk('retail: except a send-mode-1 placeholder, which is offered anyway',
+            retail_gate(_rm(mask=2, mode=1)) is None and retail_gate(_rm(mask=0, mode=1)) is None)
+        a1, b1, a2, a3 = _rm(batch=7), _rm(batch=9), _rm(batch=7), _rm(batch=7, mask=2, mode=3)
+        bt, off, left = retail_batch([a1, b1, a2, a3])
+        chk('retail: one batch per title, and all its eligible members together',
+            bt == 7 and _ids(off) == _ids([a1, a2])
+            and left == {b1[0x20:0x28]: 'other batch', a3[0x20:0x28]: 'SpotPass only'},
+            (bt, len(off), sorted(left.values())))
+        z, a4 = _rm(batch=9, count=0), _rm(batch=7)
+        bt, off, left = retail_batch([z, a4, _rm(batch=9)])
+        chk('retail: the first message with a non-zero count fixes the batch',
+            bt == 7 and _ids(off) == _ids([a4]) and left[z[0x20:0x28]] == 'zero count')
+        bt, off, left = retail_batch([_rm(batch=5, mask=2, mode=3), _rm(batch=7)])
+        chk('retail: a SpotPass-only first message still fixes the batch, as cecd does',
+            bt is None and off == [] and sorted(left.values()) == ['SpotPass only', 'other batch'])
+        z1, z2 = _rm(batch=0), _rm(batch=0)
+        bt, off, left = retail_batch([z1, z2])
+        chk('retail: batch 0 offers only its first message',
+            bt == 0 and _ids(off) == _ids([z1]) and left == {z2[0x20:0x28]: 'batch 0 sends one'})
+        big = [_rm(batch=3, body=0x9000) for _ in range(3)]
+        bt, off, left = retail_batch(big)
+        chk('retail: a batch stops at 0x19000 bytes',
+            _ids(off) == _ids(big[:2]) and list(left.values()) == ['over the batch size'])
+        many = [_rm(batch=4) for _ in range(RETAIL_BATCH_MORE + 3)]
+        chk('retail: and at %d messages' % (RETAIL_BATCH_MORE + 1),
+            len(retail_batch(many)[1]) == RETAIL_BATCH_MORE + 1)
+
+        rst = sp_store.Store(os.path.join(tmp, 'retail'))
+        rst.add_title(RT, hmac_key=rtk)
+        rst.add_title(LETTERS, hmac_key=rtk)
+        zc = _rm(batch=1, count=0, mask=2, mode=3)
+        q1, q2, q3 = _rm(batch=1), _rm(batch=2), _rm(batch=1)
+        ph, lt = _rm(mask=2, mode=1, tid=LETTERS), _rm(mask=2, mode=3, tid=LETTERS)
+        for c in (zc, q1, q2, q3, ph, lt):
+            rst.add_message(c, 'outbox', origin='/operator/dump.bin')
+        everything = select_for_peer(rst, [RT, LETTERS])
+        chk('the default selection still offers everything queued, as before',
+            set(_ids(everything)) == set(_ids([zc, q1, q2, q3, ph, lt])), len(everything))
+        rs = select_for_peer(rst, [RT, LETTERS], mode='retail')
+        chk('retail selection offers one batch per title and the mode-1 placeholder',
+            _ids(rs) == _ids([q1, q3, ph]), [c[0x20:0x28].hex() for c in rs])
+        chk('an unknown selection mode is refused',
+            _raises(lambda: select_for_peer(rst, [RT], mode='some')))
+        brs = PeerBook(os.path.join(tmp, 'retail.json'))
+        brs.record('11:22:33:44:55:77', sent_ids=[q1[0x20:0x28]])
+        chk('retail selection still skips what this peer already has',
+            _ids(select_for_peer(rst, [RT], brs, '11:22:33:44:55:77', mode='retail'))
+            == _ids([q3]))
+        chk('the plan says which batch goes and why the rest stays',
+            describe_plan(retail_plan(rst)) == {
+                '%08X' % RT: {'batch': '00000001', 'offered': 2,
+                              'left_out': {'zero count': 1, 'other batch': 1}},
+                '%08X' % LETTERS: {'batch': '00000000', 'offered': 1,
+                                   'left_out': {'SpotPass only': 1}}},
+            describe_plan(retail_plan(rst)))
+        rrt = Relay(argparse.Namespace(**{**vars(args), 'store': os.path.join(tmp, 'retail'),
+                                          'outbox_select': 'retail'}))
+        rrt.log_lines = []
+        rrt.log = rrt.log_lines.append
+        counts = rrt._store_counts()
+        chk('status reports the retail selection',
+            counts['servable'] == 3 and counts['retail_selection']['%08X' % RT]['offered'] == 2,
+            counts)
+        ds = rrt.describe_store()
+        why = {m['id']: m['retail_left_out'] for t in ds['titles'] for m in t['messages']}
+        chk('and the store view marks each message left out, with its reason',
+            ds['outbox_select'] == 'retail' and why[q2[0x20:0x28].hex()] == 'other batch'
+            and why[lt[0x20:0x28].hex()] == 'SpotPass only' and why[q1[0x20:0x28].hex()] is None)
+        rrt.peer_hook(nl, 'DE:AD:BE:EF:02:01',
+                      [{'titleID': '%08x' % RT}, {'titleID': '%08x' % LETTERS}])
+        chk('a retail relay serves a peer the selected batch',
+            sorted((d['title'], d['mode']) for d in rrt._detail.values())
+            == [('%08X' % LETTERS, 1), ('%08X' % RT, 0), ('%08X' % RT, 0)], rrt._detail)
+        chk('and logs what it left out',
+            any('retail selection for %08X: batch 00000001, offering 2' % RT in m
+                for m in rrt.log_lines), rrt.log_lines[-4:])
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     print('\n%d/%d checks passed' % (ok, tot))
@@ -3739,6 +3953,10 @@ def main():
     run.add_argument('--hook-timeout', type=float, default=10.0, metavar='SECONDS',
                      help='kill an event hook that runs longer than this (default 10)')
     run.add_argument('--start-paused', action='store_true')
+    run.add_argument('--outbox-select', choices=OUTBOX_SELECT, default='all',
+                     help='all: offer every queued message of a title the peer declares; '
+                          'retail: offer one batch per title, by the rules a console applies '
+                          'to its own outbox (for imported queues)')
     run.add_argument('--role', choices=('lead', 'wait', 'alternate'), default='lead',
                      help='handshake role. lead (default): we probe and the console answers. '
                           'wait (experimental): we stay quiet and answer the console\'s probe, '
