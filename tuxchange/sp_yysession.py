@@ -1183,6 +1183,46 @@ def _selftest():
     chk('a window wider than retail still stops at the first window boundary',
         w7.s.tx_seq == WINDOW, w7.s.tx_seq)
 
+    def receive_only(linger, fin):
+        """We lead with only our 0x81; the peer answers with its 0x81 and then a message."""
+        out = []
+        o81 = b'cc\x00\x00' + struct.pack('<III', 0x81, 0, 4) + bytes(4)
+        r = YYSession(lambda f, sq, a, p=b'': out.append((f, sq, a, p)) or True,
+                      lambda m, l=1: None, [o81])
+        r.linger = linger
+
+        def give(flags, seq=0, ack=0, payload=b''):
+            r.on_frame(sp_yy.parse(build_yy_frame(flags, seq, ack, payload)))
+
+        def peer_object(obj):
+            give(sp_yy.SYN)
+            give(sp_yy.ACK)
+            give(sp_yy.ACK | sp_yy.PSH | sp_yy.URG, payload=obj)
+
+        r.start_send()
+        give(sp_yy.SYN | sp_yy.ACK)
+        give(sp_yy.ACK, ack=len(o81))
+        peer_object(b'cc\x00\x00' + struct.pack('<III', 0x81, 0, 12) + bytes(12))
+        done_after_81 = r.done
+        peer_object(b'aa\x00\x00' + struct.pack('<I', 64) + bytes(56))
+        if fin:
+            give(sp_yy.FIN)
+        r.poll()
+        return r, done_after_81
+
+    r0, d0 = receive_only(0.0, fin=False)
+    chk('without a linger, the session ends at the peer 0x81 (the old behaviour)', d0)
+    r1, d1 = receive_only(2.0, fin=True)
+    chk('with a linger, an empty outbox does not end it at the peer 0x81', not d1)
+    chk('so the message the peer sends after its 0x81 arrives',
+        len(r1.received) == 2 and r1.received[1][:2] == b'aa', len(r1.received))
+    chk('and the peer FIN ends it at once', r1.done)
+    r2, _d2 = receive_only(0.05, fin=False)
+    chk('a lingering session without a FIN stays open while the peer is active', not r2.done)
+    time.sleep(0.1)
+    r2.poll()
+    chk('and ends once the peer has been quiet for the linger', r2.done)
+
     print('\n%d/%d checks passed' % (ok, tot))
     return 0 if ok == tot else 1
 

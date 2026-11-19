@@ -460,7 +460,7 @@ class Link:
             self.outbox = list(self.outbox) + sp_build.build_outbox([], allow_empty=True)
         self.session = sp_yysession.YYSession(self.send_yy, self.log, [],
                                               on_received=self.on_object_received)
-        self.session.linger = self.a.wait_linger
+        self.session.linger = self.a.linger
         self.session.verdict_hold = 0
 
     def answer_object(self, otype, obj, sess):
@@ -784,6 +784,8 @@ class Link:
                     self.log('  --manifest-repeat %d: sending %s after our 0x81 (object %d)'
                              % (n, ('a synthesised 0xF2 SCAN probe, %d B' % len(obj))
                                 if islot < 0 else 'our 0x%02X (object %d)' % (rt, islot), i81))
+            # The console's messages can follow its 0x81 after ours has run out.
+            self.session.linger = self.a.linger
             self.session.start_send()
         else:
             self.send_yy(sp_yy.SYN, 0, 0)
@@ -1589,7 +1591,7 @@ def _sim_args(**over):
         full_sequence=False, greeting=None, fresh_mii=False, mii_name=None, author_name=None,
         from_scratch=False, forward=None, keep_msgid=False, title_id=None, title_name=None,
         hits=0, population=0, hat=0, pet=0, dream=0, hobby=0, birthday=None, colour=0,
-        gender=0, bubble=0, role='lead', wait_patience=2.0, wait_linger=2.0)
+        gender=0, bubble=0, role='lead', wait_patience=2.0, linger=2.0)
     a.update(over)
     return argparse.Namespace(**a)
 
@@ -1845,7 +1847,7 @@ def simulate_wait(verbose=1):
         return sp_build.envelope([sp_build.unwrap(sp_build.build_envelope(
             bytes(0x40), tid, key=b'k' * 32))[0]])
 
-    a = _sim_args(mac=US, token=US_TOK, verbose=verbose, role='wait', wait_linger=0.3)
+    a = _sim_args(mac=US, token=US_TOK, verbose=verbose, role='wait', linger=0.3)
     L = Link(a)
     L.key17, L.normalkey_2e = b'TuxchangeSelfTest', bytes(range(16))
     services = [(T1, 0x30, b''), (T2, 0x30, b''), (T3, 0x30, b'')]
@@ -2515,9 +2517,9 @@ def build_parser():
                          'stay quiet, answer a console\'s probe and let it lead the exchange')
     ap.add_argument('--wait-patience', type=float, default=2.0,
                     help='wait role: seconds for the console to take our probe answer')
-    ap.add_argument('--wait-linger', type=float, default=2.0,
-                    help='wait role: seconds to stay open after our last object, for the '
-                         "console's remaining messages or its FIN")
+    ap.add_argument('--linger', type=float, default=2.0,
+                    help='seconds to stay open after our last object, for the console\'s '
+                         'remaining messages or its FIN')
     ap.add_argument('--reactive', action='store_true', default=True,
                     help='answer a console probe immediately (default on)')
     ap.add_argument('--no-reactive', dest='reactive', action='store_false')
