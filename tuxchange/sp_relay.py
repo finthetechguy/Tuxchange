@@ -1554,6 +1554,7 @@ class Relay:
             'exchange_gap_s': self.exchange_gap,
             'iface_failures': self.iface_failures,
             'passes': self.passes,
+            'role': getattr(self.a, 'role', 'lead'),
             'store': self.a.store,
             **self._store_counts(),
             'filtered': len(self.book.snapshot()['filter']),
@@ -1773,6 +1774,13 @@ class Relay:
         return {e['title']: sp_build.VERDICT_ADMIT if e['title'] in admitted
                 else sp_build.VERDICT_REFUSE for e in entries}
 
+    def pass_role(self):
+        """The handshake role for this pass. 'alternate' interleaves the two, for comparing them."""
+        role = getattr(self.a, 'role', 'lead') or 'lead'
+        if role == 'alternate':
+            return ('lead', 'wait')[(max(self.passes, 1) - 1) % 2]
+        return role
+
     def one_pass(self):
         """One listening window: engage whoever answers, exchange, file what we got."""
         import sp_link
@@ -1784,7 +1792,8 @@ class Relay:
         argv = ['--iface', self.a.iface, '--channel', self.a.channel,
                 '--mac', mac, '--secs', str(self.a.window),
                 '--full-sequence', '--mirror-offer', '--verbose', str(self.a.verbose),
-                '--yy-rate', str(getattr(self.a, 'yy_rate', 11.0))]
+                '--yy-rate', str(getattr(self.a, 'yy_rate', 11.0)),
+                '--role', self.pass_role()]
         if self.run_logs():
             argv += ['--log', os.path.join(runs, 'relay_%d.log' % stamp)]
         argv += recovery_argv(self.a)
@@ -1821,6 +1830,7 @@ class Relay:
             self.hooks.fire('error', error=self.last_error)
             return False
         self.iface_failures = 0
+        trial = {'role': link.role, 'attempts': list(link.attempt_records)}
         peer = link.peer or link.last_peer
         peer = sp_link.T.macstr(peer) if peer else None
         got = []
@@ -1872,7 +1882,8 @@ class Relay:
                                  'sent': [detail.get(m, {}) for m in self._pending_sent],
                                  'refused': [detail.get(m, {}) for m in withheld],
                                  'received': got_detail,
-                                 'declined': ['%08X' % t for t in self._inbound_refused]})
+                                 'declined': ['%08X' % t for t in self._inbound_refused],
+                                 **trial})
             self.log('  exchanged with %s: %d of ours acknowledged, %d refused by title, '
                      'received %d (store now holds %d)'
                      % (peer, len(self._pending_sent), len(withheld), len(got),
@@ -1885,7 +1896,7 @@ class Relay:
         if self._declined or self.book.is_blocked(peer):
             return False
         self.book.note_attempt(peer)
-        self.note_encounter({'peer': peer, 'result': 'engaged but nothing moved'})
+        self.note_encounter({'peer': peer, 'result': 'engaged but nothing moved', **trial})
         self.log('  %s engaged but nothing moved; backing off %.0f s before trying it again'
                  % (peer, self.book.retry))
         return False
@@ -2703,6 +2714,14 @@ def _selftest():
         chk('the identity is stable across restarts',
             r.fixed_identity() == Relay(args).fixed_identity(), r.fixed_identity())
         chk('and it is not rotating unless asked', r.next_identity() == r.identity)
+        chk('the handshake role is lead unless asked', r.pass_role() == 'lead')
+        ralt = Relay(argparse.Namespace(**{**vars(args), 'role': 'alternate'}))
+        roles = []
+        for n in range(1, 5):
+            ralt.passes = n
+            roles.append(ralt.pass_role())
+        chk('--role alternate interleaves the two roles pass by pass',
+            roles == ['lead', 'wait', 'lead', 'wait'], roles)
         args2 = argparse.Namespace(**{**vars(args), 'rotate_identity': True})
         r2 = Relay(args2)
         chk('--rotate-identity gives a different MAC each time',
@@ -3720,6 +3739,10 @@ def main():
     run.add_argument('--hook-timeout', type=float, default=10.0, metavar='SECONDS',
                      help='kill an event hook that runs longer than this (default 10)')
     run.add_argument('--start-paused', action='store_true')
+    run.add_argument('--role', choices=('lead', 'wait', 'alternate'), default='lead',
+                     help='handshake role. lead (default): we probe and the console answers. '
+                          'wait (experimental): we stay quiet and answer the console\'s probe, '
+                          'so it leads. alternate: switch every pass, to compare the two')
     run.add_argument('--yy-rate', type=float, default=11.0, metavar='MBPS',
                      help='802.11b rate for the encrypted payload frames (default 11, what two '
                           'real consoles use to each other). Pass 1 for more link margin.')
