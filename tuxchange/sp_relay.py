@@ -1702,6 +1702,7 @@ class Relay:
         """Called the instant a console engages: choose what to serve this console."""
         import sp_link
         self._pending_sent, self._detail, self._declined = [], {}, None
+        self._reserved, self._inbound_refused = None, []
         if self.book.is_blocked(mac):
             r = self._decline(link, 'blocked',
                               '  %s is on the denylist; refusing to exchange with it' % mac)
@@ -1723,7 +1724,12 @@ class Relay:
             held = ['%08X' % sp_cec.parse_header(c)['cec_title_id']
                     for _t, _b, c in self.store.messages(box='outbox')]
             receiving = set(self.store.receive_titles())
-        inbound = [t for t in dict.fromkeys(titles) if t in receiving]
+            full = [t for t in dict.fromkeys(titles)
+                    if t in receiving and 0 in self.store.inbox_room(t)]
+        inbound = [t for t in dict.fromkeys(titles) if t in receiving and t not in full]
+        if full:
+            self.log('  inbox full for %s; not asking %s for them'
+                     % (['%08X' % t for t in full], mac))
         if not picked and not inbound:
             r = self._decline(link, 'nothing to serve',
                               '  nothing to serve %s (it declares %s; our outbox holds %s)'
@@ -1750,6 +1756,23 @@ class Relay:
                         for c, mid in zip(picked, ids)}
         return services, objects
 
+    def offer_hook(self, link, entries):
+        """Admit each title of the console's offer only if its inbox can hold all of it."""
+        with self.lock:
+            admitted = sp_store.plan_inbound([(e['title'], e['size'], e['count']) for e in entries],
+                                             self.store.inbox_room)
+        self._reserved = admitted
+        self._inbound_refused = list(dict.fromkeys(e['title'] for e in entries
+                                                   if e['title'] not in admitted))
+        for t in self._inbound_refused:
+            free_bytes, free_slots = self.store.inbox_room(t)
+            want = [(e['size'], e['count']) for e in entries if e['title'] == t]
+            self.log('  refusing %08X: it offers %d message(s), %d B, and its inbox has %d '
+                     'slot(s), %d B free' % (t, sum(n for _b, n in want), sum(b for b, _n in want),
+                                            free_slots, free_bytes))
+        return {e['title']: sp_build.VERDICT_ADMIT if e['title'] in admitted
+                else sp_build.VERDICT_REFUSE for e in entries}
+
     def one_pass(self):
         """One listening window: engage whoever answers, exchange, file what we got."""
         import sp_link
@@ -1771,6 +1794,7 @@ class Relay:
             argv += ['--pcap', os.path.join(runs, 'relay_%d.pcap' % stamp)]
         a = sp_link.build_parser().parse_args(argv)
         self._pending_sent, self._declined = [], None
+        self._reserved, self._inbound_refused = None, []
         link = sp_link.Link(a)
         link.tick_hook = self.tick
         # The broadcast probe must advertise every title held. The peer hook narrows it later.
@@ -1779,6 +1803,7 @@ class Relay:
         if held:
             link.services = [(t,) + known.get(t, (0x30, b'')) for t in held]
         link.peer_hook = self.peer_hook
+        link.offer_hook = self.offer_hook
         link.stop_check = self.stop_check
         try:
             rc = link.run()
@@ -1817,7 +1842,7 @@ class Relay:
             d = detail.get(m)
             if d:
                 sent_modes.setdefault(int(d['title'], 16), set()).add(d.get('mode'))
-        got_detail = []
+        got_detail, arrived = [], {}
         for obj in (getattr(sess, 'received', None) or []):
             if obj[:2] != b'\x61\x61':
                 continue
@@ -1834,18 +1859,8 @@ class Relay:
                              'send of that title did not complete'
                              % (tid, c[0x20:0x28].hex(), peer or '?'))
                     continue
-                try:
-                    # Filed in the inbox with its origin, which keeps it from being offered to a console.
-                    with self.lock:
-                        self.store.add_message(c, 'inbox', origin='air:%s' % (peer or '?'))
-                        if self.store.last_evicted:
-                            self.log('  inbox full: dropped the %d oldest message(s) for %08X'
-                                     % (self.store.last_evicted, tid))
-                except ValueError as e:
-                    self.log('  could not file a message from %s: %s' % (peer or '?', e))
-                    continue
-                got.append(c[0x20:0x28])
-                got_detail.append({'title': '%08X' % tid, 'bytes': len(c)})
+                arrived.setdefault(tid, []).append(c)
+        got.extend(self.file_arrivals(arrived, peer, got_detail))
         if not peer:
             return False
         self.last_peer = peer
@@ -1856,7 +1871,8 @@ class Relay:
             self.note_encounter({'peer': peer, 'result': 'exchanged',
                                  'sent': [detail.get(m, {}) for m in self._pending_sent],
                                  'refused': [detail.get(m, {}) for m in withheld],
-                                 'received': got_detail})
+                                 'received': got_detail,
+                                 'declined': ['%08X' % t for t in self._inbound_refused]})
             self.log('  exchanged with %s: %d of ours acknowledged, %d refused by title, '
                      'received %d (store now holds %d)'
                      % (peer, len(self._pending_sent), len(withheld), len(got),
@@ -1873,6 +1889,41 @@ class Relay:
         self.log('  %s engaged but nothing moved; backing off %.0f s before trying it again'
                  % (peer, self.book.retry))
         return False
+
+    def file_arrivals(self, arrived, peer, got_detail):
+        """File each title's arrivals whole, within what our 0x33 admitted and the room left now.
+        -> the ids filed."""
+        got, src = [], peer or '?'
+        for tid, cs in arrived.items():
+            size = sum(len(c) for c in cs)
+            if self._reserved is not None:
+                if tid not in self._reserved:
+                    self.log('  not filing %d message(s) for %08X from %s: we refused that title'
+                             % (len(cs), tid, src))
+                    continue
+                r_bytes, r_count = self._reserved[tid]
+                if len(cs) > r_count or size > r_bytes:
+                    self.log('  not filing %d message(s), %d B, for %08X from %s: it offered '
+                             'only %d, %d B' % (len(cs), size, tid, src, r_count, r_bytes))
+                    continue
+            try:
+                # Filed in the inbox with its origin, which keeps it from being offered to a console.
+                with self.lock:
+                    _paths, bad = self.store.file_inbound(cs, origin='air:%s' % src)
+            except sp_store.InboxFull as e:
+                self.log('  not filing %d message(s) from %s: %s' % (len(cs), src, e))
+                continue
+            except ValueError as e:
+                self.log('  could not file messages from %s: %s' % (src, e))
+                continue
+            rejected = {id(c) for c, _why in bad}
+            for c, why in bad:
+                self.log('  could not file a message from %s: %s' % (src, why))
+            for c in cs:
+                if id(c) not in rejected:
+                    got.append(c[0x20:0x28])
+                    got_detail.append({'title': '%08X' % tid, 'bytes': len(c)})
+        return got
 
     def request_stop(self, why):
         """Ask the main loop to wind down. Safe from a signal handler: it only sets fields."""
@@ -3482,6 +3533,73 @@ def _selftest():
         chk('or sent that title in another mode', not reciprocated(plaza0, {PLAZA: {3}}))
         chk('and is filed once our own mode-0 send of that title completed',
             reciprocated(plaza0, {PLAZA: {0}}))
+
+        rcap = Relay(argparse.Namespace(**{**vars(args), 'store': os.path.join(tmp, 'capacity')}))
+        for t in (LETTERS, MARIO):
+            rcap.store.add_title(t, hmac_key=rk)
+            rcap.store.set_receive(t)
+        cap_n = sp_store.DEFAULT_MAX_MESSAGES
+        for i in range(cap_n - 1):
+            rcap.store.add_message(sp_build.unwrap(_wire(LETTERS, 3, 0x9000 + i))[0], 'inbox',
+                                   origin='air:test')
+        unread = {c[0x20:0x28] for _t, _b, c in rcap.store.messages(LETTERS, 'inbox')}
+
+        def _offer(*titles_counts):
+            out = []
+            for t, n in titles_counts:
+                cs = [sp_build.unwrap(_wire(t, 3, (t << 8) + 0x100 + i))[0] for i in range(n)]
+                out.append((t, cs))
+            return out, [{'title': t, 'size': sum(len(c) for c in cs), 'count': len(cs)}
+                         for t, cs in out]
+
+        quiet_cap = []
+        rcap.log = quiet_cap.append
+        offer, ents = _offer((LETTERS, 2), (MARIO, 2))
+        codes = rcap.offer_hook(None, ents)
+        chk('a title short of slots is refused while the other is admitted',
+            codes == {LETTERS: sp_build.VERDICT_REFUSE, MARIO: sp_build.VERDICT_ADMIT}, codes)
+        chk('and the refusal is logged with the room left',
+            any('refusing %08X' % LETTERS in m and '1 slot(s)' in m for m in quiet_cap))
+        env_m = sp_build.envelope(offer[1][1])
+        multi_got = [sp_build.unwrap(env_m)]
+        got_detail = []
+        filed = rcap.file_arrivals({LETTERS: offer[0][1], MARIO: multi_got[0]}, 'aa:bb', got_detail)
+        chk('only the admitted title is filed, both messages of its envelope',
+            len(filed) == 2 and {d['title'] for d in got_detail} == {'%08X' % MARIO}
+            and len(rcap.store.messages(MARIO, 'inbox')) == 2)
+        chk('and the full title keeps every unread message',
+            {c[0x20:0x28] for _t, _b, c in rcap.store.messages(LETTERS, 'inbox')} == unread)
+        chk('the encounter can say which titles we declined', rcap._inbound_refused == [LETTERS])
+
+        offer, ents = _offer((LETTERS, 1))
+        chk('an exact fit is admitted', rcap.offer_hook(None, ents)
+            == {LETTERS: sp_build.VERDICT_ADMIT})
+        extra = sp_build.unwrap(_wire(LETTERS, 3, 0x9999))[0]
+        chk('more than the title offered is not filed',
+            rcap.file_arrivals({LETTERS: offer[0][1] + [extra]}, 'aa:bb', []) == []
+            and len(rcap.store.messages(LETTERS, 'inbox')) == cap_n - 1)
+        rcap.store.add_message(extra, 'inbox', origin='/an/import')
+        quiet_cap.clear()
+        chk('room taken after the offer is honoured at commit, evicting nothing',
+            rcap.file_arrivals({LETTERS: offer[0][1]}, 'aa:bb', []) == []
+            and unread <= {c[0x20:0x28] for _t, _b, c in rcap.store.messages(LETTERS, 'inbox')}
+            and any('inbox has 0 slot(s)' in m for m in quiet_cap), quiet_cap)
+        got_full = rcap.peer_hook(nl, 'DE:AD:BE:EF:02:01', [{'titleID': '%08x' % LETTERS}])
+        chk('a peer offering only a full title is not engaged',
+            got_full is None and rcap._declined == 'nothing to serve')
+        got_part = rcap.peer_hook(nl, 'DE:AD:BE:EF:02:02',
+                                  [{'titleID': '%08x' % t} for t in (LETTERS, MARIO)])
+        chk('and a full title is not asked for beside one with room',
+            got_part is not None and [t for t, _f, _tr in got_part[0]] == [MARIO])
+        rcap.store.remove_message(LETTERS, 'inbox', extra)
+        chk('once a message is removed the title is admitted again',
+            rcap.offer_hook(None, ents) == {LETTERS: sp_build.VERDICT_ADMIT}
+            and len(rcap.file_arrivals({LETTERS: offer[0][1]}, 'aa:bb', [])) == 1
+            and rcap.store.inbox_room(LETTERS)[1] == 0)
+        rcap._reserved = None
+        chk('with no verdict of ours on record, arrivals are held only to the room left',
+            rcap.file_arrivals({MARIO: [sp_build.unwrap(_wire(MARIO, 3, 0x4242))[0]]},
+                               'aa:bb', []) != [])
 
         r4 = Relay(argparse.Namespace(**{**vars(args), 'store': os.path.join(tmp, 'keep'),
                                          'keep_runs': 3}))

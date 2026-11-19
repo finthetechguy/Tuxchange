@@ -569,6 +569,8 @@ class EncountersPage(Page):
                 for it in items:
                     ex.add_row(row('%s  %s' % (label, it.get('title', '?')),
                                    human_bytes(it.get('bytes', 0))))
+            for t in e.get('declined') or []:
+                ex.add_row(row('Declined  %s' % t, 'inbox full'))
             if not sent and not got:
                 ex.add_row(row(res_txt, 'nothing was transferred'))
             g.add(ex)
