@@ -619,10 +619,14 @@ class StorePage(Page):
                 ex.add_row(mr)
             g = self._groups[-1]
             g.add(ex)
+        self.footer(st)
         self.restore_open(was_open)
 
     def header(self, st, titles):
         raise NotImplementedError
+
+    def footer(self, st):
+        pass
 
     def decorate_title(self, ex, t):
         pass
@@ -695,6 +699,29 @@ class InboxPage(StorePage):
     def decorate_message(self, mr, t, m):
         mr.add_suffix(icon_button('user-trash-symbolic', 'Delete this received message',
                                   lambda: self.app.remove_message(t['title'], m['id'], 'inbox')))
+
+    def footer(self, st):
+        g = self.group('Receive only',
+                       'Titles here can send CEC data to this device, even if there is '
+                       'nothing to send to it (one-way StreetPass). Send mode-0 titles are not stored.')
+        if not st['titles']:
+            g.add(row('No titles registered', 'Import a console dump or create a message first.'))
+        for t in st['titles']:
+            sw = Gtk.Switch(active=bool(t.get('receive')), valign=Gtk.Align.CENTER)
+            sw.connect('state-set', self._receive_toggle, t)
+            r = plain_row(Adw.ActionRow, '%s   %s' % (t['title'], t['name'] or 'unknown title'),
+                          'receiving with an empty outbox' if t.get('receive')
+                          else 'receives only alongside outbox')
+            r.add_suffix(sw)
+            r.set_activatable_widget(sw)
+            g.add(r)
+
+    def _receive_toggle(self, _sw, want, t):
+        self._signature = None
+        self.app.act('set_receive', then='%s %s' % (
+            t['name'] or t['title'], 'will receive with an empty outbox' if want
+            else 'receives only alongside outbox'), title=t['title'], enabled=bool(want))
+        return False
 
 
 class DenylistPage(Page):
