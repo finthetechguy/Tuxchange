@@ -476,6 +476,7 @@ class PluginPage(Adw.NavigationPage):
         for title, value in (('Game version', ', '.join(a['versions'])),
                              ('Region', ', '.join(a['regions'])),
                              ('CEC title', ', '.join(a['title_ids'])),
+                             ('Send mode', str(a['send_mode'])),
                              ('Interface', a['interface']),
                              ('Edits existing messages', 'Yes' if a['can_edit'] else 'No'),
                              ('Author', a['author'] or 'Unknown')):

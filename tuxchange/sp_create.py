@@ -89,6 +89,7 @@ def describe(plugin, out=print):
     out('  versions   %s' % ', '.join(a['versions']))
     out('  regions    %s' % ', '.join(a['regions']))
     out('  titles     %s' % ', '.join(a['title_ids']))
+    out('  send mode  %d' % a['send_mode'])
     out('  interface  %s%s' % (a['interface'], ', can edit existing messages'
                                if a['can_edit'] else ''))
     if a['author']:

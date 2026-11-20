@@ -18,6 +18,7 @@ class Example(P.Plugin):
     title_ids = (0x00141000,)            # the game's CEC title id(s)
     versions = ('any',)                  # e.g. ('1.0', '1.1')
     regions = ('any',)                   # e.g. ('EUR', 'USA')
+    send_mode = 0                        # the send mode the game uses, or the receiver drops it
     author = 'You'
     description = 'Example, not a real game format.'
     gui = 'form'                         # None for CLI only; 'custom' to override build_page()
@@ -37,8 +38,7 @@ class Example(P.Plugin):
         body = g + struct.pack('<HBB', values['score'], values['team'],
                                values['card']['shiny']) + values['card']['console']
         body += b'\x00' * (-len(body) % 4)          # a CEC body is 4-byte aligned
-        # send_mode must be the one the game uses, or the receiver drops the message.
-        return P.BuildResult(body, info_text='Example', send_mode=0)
+        return P.BuildResult(body, info_text='Example')
 
     def parse(self, body):
         if len(body) < 0x2C:

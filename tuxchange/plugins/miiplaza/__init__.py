@@ -11,6 +11,7 @@ class MiiPlaza(P.Plugin):
     title_ids = (sp_plaza.TITLE_ID,)
     versions = ('updated (0x7280-byte body)',)
     regions = ('any',)
+    send_mode = 0
     author = 'Tuxchange'
     description = ('Your Mii card: greeting, Mii, profile, location, featured software and '
                    'history. The Mii\'s appearance comes from an imported Mii. Only messages '
@@ -41,7 +42,7 @@ class MiiPlaza(P.Plugin):
         except ValueError as e:
             raise P.PluginError(str(e))
         return P.BuildResult(body, info_text=sp_build.INFO_TEXT, icon=sp_build.cec_icon(),
-                             send_mode=0, name=sp_plaza.GAME)
+                             name=sp_plaza.GAME)
 
     def parse(self, body):
         try:

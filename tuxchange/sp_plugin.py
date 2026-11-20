@@ -24,6 +24,7 @@ API_VERSION = 1
 HERE = os.path.dirname(os.path.abspath(__file__))
 BUILTIN_DIR = os.path.join(HERE, 'plugins')
 IMAGE_FILE_MAX = 16 << 20
+SEND_MODES = (0, 1, 2, 3)
 
 # The 16 SMDH / CEC language slots, in order.
 LANGUAGES = ('Japanese', 'English', 'French', 'German', 'Italian', 'Spanish',
@@ -508,11 +509,11 @@ class BuildResult:
     title_id   CEC title id; defaults to the plugin's first title_ids entry
     info_text  ex-header type 4 text; None for none
     icon       0xC80-byte 40x40 tiled RGB565 CEC icon (ex-header type 2); None for none
-    send_mode  header +0x35, 0..3. A wrong one makes the receiver drop the message.
+    send_mode  header +0x35; defaults to the plugin's send_mode, and must match it
     name       the title's display name in the store
     """
 
-    def __init__(self, body, title_id=None, info_text=None, icon=None, send_mode=0, name=None):
+    def __init__(self, body, title_id=None, info_text=None, icon=None, send_mode=None, name=None):
         self.body = bytes(body)
         self.title_id, self.info_text, self.icon = title_id, info_text, icon
         self.send_mode, self.name = send_mode, name
@@ -539,6 +540,9 @@ class Plugin:
     title_ids = ()            # the CEC title ids this plugin writes and can edit
     versions = ('any',)       # game versions it supports, e.g. ('1.0', '1.1') or ('any',)
     regions = ('any',)        # e.g. ('EUR', 'USA') or ('any',)
+    # The send mode (header +0x35, 0..3) the game gives its messages. Required: a message
+    # with another mode is dropped by the receiver, and retail treats mode 0 differently.
+    send_mode = None
     author = ''
     description = ''
     fields = ()
@@ -588,6 +592,7 @@ class Plugin:
                 'regions': list(self.regions), 'author': self.author,
                 'description': self.description,
                 'title_ids': ['%08X' % t for t in self.title_ids],
+                'send_mode': self.send_mode,
                 'interface': 'GUI and CLI' if self.gui else 'CLI only',
                 'can_edit': self.can_edit(), 'source': self.source, 'path': self.path}
 
@@ -620,6 +625,8 @@ def check(p):
     if not p.title_ids or not all(isinstance(t, int) and 0 < t <= 0xFFFFFFFF
                                   for t in p.title_ids):
         raise PluginError('title_ids must list at least one CEC title id')
+    if type(p.send_mode) is not int or p.send_mode not in SEND_MODES:
+        raise PluginError('send_mode must be the game\'s send mode, 0..3, got %r' % (p.send_mode,))
     if not isinstance(getattr(p, 'context', None), dict):
         p.context = {}
     if p.gui not in (None, 'form', 'custom'):
@@ -771,6 +778,11 @@ def build(plugin, values):
     if r.title_id not in plugin.title_ids:
         raise PluginError('%s built a message for title %08X, which it does not declare'
                           % (plugin.id, r.title_id))
+    if r.send_mode is None:
+        r.send_mode = plugin.send_mode
+    if r.send_mode != plugin.send_mode:
+        raise PluginError('%s built a send mode %r message, but declares its game as send mode %d'
+                          % (plugin.id, r.send_mode, plugin.send_mode))
     if r.name is None:
         r.name = plugin.game
     if not r.body or len(r.body) & 3:
@@ -1001,6 +1013,7 @@ class Dummy(P.Plugin):
     title_ids = (0x00030600,)
     versions = ('1.0',)
     regions = ('EUR', 'USA')
+    send_mode = 3
     gui = %r
     fields = [
         P.Str('greeting', 'Greeting', max_len=8, default='hi'),
@@ -1020,7 +1033,7 @@ class Dummy(P.Plugin):
         m = b''.join(struct.pack('<I', e['id']) + e['mac'] for e in v['met'])
         b = (g + struct.pack('<HBBB', v['score'], v['colour'], v['shiny'], v['card']['level'])
              + v['mac'] + n + m)
-        return P.BuildResult(b + b'\\0' * (-len(b) %% 4), info_text='dummy', send_mode=3)
+        return P.BuildResult(b + b'\\0' * (-len(b) %% 4), info_text='dummy')
     def parse(self, b):
         if len(b) < 64:
             raise P.PluginParseError('too short')
@@ -1044,7 +1057,7 @@ PLUGIN = Dummy()
             fh.write('import sp_plugin as P\n'
                      'class C(P.Plugin):\n'
                      '    id = "clionly"; game = "A CLI Game"; title_ids = (0x00141000,)\n'
-                     '    gui = None\n'
+                     '    send_mode = 1; gui = None\n'
                      '    fields = [P.Int("n", "N", 0, 10)]\n'
                      '    def build(self, v): return bytes([v["n"]]) * 4\n'
                      'def make(): return C()\n')
@@ -1114,7 +1127,9 @@ PLUGIN = Dummy()
                 raises(lambda: set_text(d, dict(v), path, text), ValidationError))
 
         r = build(d, v)
-        chk('build fills in the title and name', r.title_id == 0x00030600 and r.name == 'Dummy Game')
+        chk('build fills in the title, name and declared send mode',
+            (r.title_id, r.name, r.send_mode) == (0x00030600, 'Dummy Game', 3))
+        chk('About carries the send mode', d.about()['send_mode'] == 3)
         wire = envelope(r, key=b'\x22' * 32, message_id=9, when=time.gmtime(0))
         h, ex, body = sp_cec.split_message(wire)
         chk('the envelope carries the plugin\'s send mode and info text',
@@ -1155,27 +1170,41 @@ PLUGIN = Dummy()
             all_paths)
 
         class Bad(Plugin):
-            id = 'Bad Id'; game = 'x'; title_ids = (1,)
+            id = 'Bad Id'; game = 'x'; title_ids = (1,); send_mode = 0
         chk('a bad id breaks the contract', raises(lambda: check(Bad())))
 
         class NoTitle(Plugin):
-            id = 'x'; game = 'x'
+            id = 'x'; game = 'x'; send_mode = 0
         chk('no title ids breaks the contract', raises(lambda: check(NoTitle())))
 
+        class NoMode(Plugin):
+            id = 'x'; game = 'x'; title_ids = (0x100,)
+        chk('a plugin that does not declare its send mode breaks the contract',
+            raises(lambda: check(NoMode())))
+        for bad in (4, -1, True, '0', 0.0):
+            NoMode.send_mode = bad
+            chk('send_mode = %r breaks the contract' % (bad,), raises(lambda: check(NoMode())))
+
         class Wrong(Plugin):
-            id = 'w'; game = 'w'; title_ids = (0x100,)
+            id = 'w'; game = 'w'; title_ids = (0x100,); send_mode = 0
             fields = [Int('n', 'N', 0, 10, default=11)]
         chk('a default outside its own range breaks the contract', raises(lambda: check(Wrong())))
 
         class OtherTitle(Plugin):
-            id = 'o'; game = 'o'; title_ids = (0x100,)
+            id = 'o'; game = 'o'; title_ids = (0x100,); send_mode = 0
             def build(self, v): return BuildResult(b'1234', title_id=0x200)
         chk('a body for an undeclared title is refused', raises(lambda: build(OtherTitle(), {})))
 
         class Odd(Plugin):
-            id = 'odd'; game = 'odd'; title_ids = (0x100,)
+            id = 'odd'; game = 'odd'; title_ids = (0x100,); send_mode = 0
             def build(self, v): return b'123'
         chk('an unaligned body is refused', raises(lambda: build(Odd(), {})))
+
+        class OtherMode(Plugin):
+            id = 'om'; game = 'om'; title_ids = (0x100,); send_mode = 3
+            def build(self, v): return BuildResult(b'1234', send_mode=0)
+        chk('a message in a send mode other than the declared one is refused',
+            raises(lambda: build(OtherMode(), {}), PluginError))
 
         pxs = [[rgb565(x * 5, y * 5, 128) for x in range(48)] for y in range(48)]
         pngp = os.path.join(tmp, 'icon.png')
