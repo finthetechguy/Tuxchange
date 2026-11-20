@@ -2,7 +2,7 @@
 """A CEC message store on disk, shaped like a console's."""
 import os, sys, json, stat, time, struct, base64, fcntl, functools, hashlib, tempfile, threading
 
-import sp_cec, sp_cecvalid
+import sp_cec, sp_cecvalid, sp_service
 
 MBOXLIST_MAGIC, MBOXINFO_MAGIC, BOXINFO_MAGIC = 0x6868, 0x6363, 0x6262
 # Kept outside CEC/ so the tree stays byte-comparable with a console's.
@@ -354,6 +354,7 @@ class Store:
         m.setdefault('keyed_titles', [])
         m.setdefault('origins', {})
         m.setdefault('receive_titles', [])
+        m.setdefault('service_records', {})
         legacy = [k for k in m['origins'] if '/' not in k]
         if legacy:
             for k in legacy:
@@ -508,6 +509,39 @@ class Store:
         if had != bool(on):
             self._save_meta(m)
         return bool(on)
+
+    @_locked
+    def service_template(self, tid):
+        """-> the service record set for a title to advertise when it only receives, or None."""
+        raw = self._load_meta()['service_records'].get('%08x' % tid)
+        if raw is None:
+            return None
+        try:
+            s = sp_service.from_raw(bytes.fromhex(raw))
+        except ValueError:
+            return None
+        return s if s.title == tid else None
+
+    @_locked
+    def set_service_template(self, tid, record=None):
+        """Set (a Service or its encoding) or clear (None) a title's receive-only record."""
+        if record is not None:
+            if tid not in self.titles():
+                raise ValueError('title %08X is not registered in this store' % tid)
+            s = (sp_service.from_raw(record) if isinstance(record, (bytes, bytearray))
+                 else sp_service.check(record))
+            if s.title != tid:
+                raise ValueError('the record names %08X, not %08X' % (s.title, tid))
+        m = self._load_meta()
+        key = '%08x' % tid
+        if record is None:
+            if m['service_records'].pop(key, None) is not None:
+                self._save_meta(m)
+            return None
+        if m['service_records'].get(key) != s.raw().hex():
+            m['service_records'][key] = s.raw().hex()
+            self._save_meta(m)
+        return s
 
     @_locked
     def title_name(self, tid):
@@ -687,9 +721,11 @@ class Store:
         self._write_mboxlist([t for t in self.titles() if t != tid])
         m = self._load_meta()
         key = '%08x' % tid
-        if key in m['keyed_titles'] or key in m['receive_titles']:
+        if (key in m['keyed_titles'] or key in m['receive_titles']
+                or key in m['service_records']):
             m['keyed_titles'] = [k for k in m['keyed_titles'] if k != key]
             m['receive_titles'] = [k for k in m['receive_titles'] if k != key]
+            m['service_records'].pop(key, None)
             self._save_meta(m)
         return n
 

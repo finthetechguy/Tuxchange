@@ -55,6 +55,7 @@ jobs:
           python tuxchange/sp_cecvalid.py || rc=1
           python tuxchange/sp_harvest_air.py --selftest || rc=1
           python tuxchange/sp_probe_tx.py --selftest || rc=1
+          python tuxchange/sp_service.py --selftest || rc=1
           python tuxchange/sp_aes.py --selftest || rc=1
           python tuxchange/sp_identity.py selftest || rc=1
           python tuxchange/sp_plugin.py --selftest || rc=1

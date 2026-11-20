@@ -5,7 +5,7 @@ from collections import deque
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import sp_parse, sp_ccmp, sp_yy, sp_yysession
-import sp_mii, sp_smdh, sp_cec, sp_build, sp_plaza
+import sp_mii, sp_smdh, sp_cec, sp_build, sp_plaza, sp_service
 import sp_probe_tx as T
 from sp_ccmp import derive_ccmp_key
 import lp_keys
@@ -106,10 +106,14 @@ class Link:
                 tids.append(sp_build.message_title(w))
             sm = getattr(a, 'send_mode', None)
             self.outbox = sp_build.build_outbox(wires, send_mode=sm)
-            # The service flag is per-title. Plaza's 0x00 on another title stalls the exchange.
-            known = {t: (f, tr) for t, f, tr in T.SERVICES_FULL}
             uniq = list(dict.fromkeys(tids))
-            self.services = [(t,) + known.get(t, (0x30, b'')) for t in uniq]
+            derived = sp_service.for_messages([c for w in wires for c in sp_build.unwrap(w)],
+                                              mode=sm)
+            self.services = [s for s, _why in derived]
+            known = {s.title: s for s in self.services}
+            for s, why in derived:
+                if why:
+                    self.log('    %08X: %s; advertising the bare mailbox id' % (s.title, why))
             self.log('  FORWARD %d message(s) across %d title(s) in one encounter'
                      % (len(wires), len(uniq)))
             if len(uniq) != len(tids):
@@ -117,9 +121,8 @@ class Link:
                          'one ee entry whose count field says how many (cecd 0x10BC5C)'
                          % ', '.join('%08X' % t for t in uniq if tids.count(t) > 1))
             for path, w, t in zip(paths, wires, tids):
-                flags = known.get(t, (0x30, b''))[0]
-                self.log('    %-42s %7d B  title %08X  flags=%#04x  send mode %d%s'
-                         % (os.path.basename(path), len(w), t, flags,
+                self.log('    %-42s %7d B  title %08X  service %s  send mode %d%s'
+                         % (os.path.basename(path), len(w), t, known[t],
                             sp_build.header_send_mode(w) if sm is None else sm,
                             '' if sm is None else ' (--send-mode override)'))
                 try:
@@ -1309,9 +1312,8 @@ def build_obj_41(mac, log=None):
 
 def build_obj_11(token8, services):
     """Declare our enabled titles INSIDE the link."""
-    svc = b''.join(struct.pack('>I', t) + bytes([f]) + bytes(tr) for t, f, tr in services)
-    tlv = struct.pack('<H', (len(svc) << 8) | (1 << 4) | 1) + svc
-    tlv += struct.pack('<H', (8 << 8) | (0xF << 4) | 0) + bytes(token8)
+    tlv = sp_service.tlvs(services)
+    tlv += sp_service.tlv_header(0, 0xF, 8) + bytes(token8)
     return sp_build.cec_object(0x11, tlv, flags=0xFFFF)
 
 

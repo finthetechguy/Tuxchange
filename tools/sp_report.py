@@ -153,7 +153,7 @@ def report(path):
         print(f"    services ({len(services_last['services'])}):")
         for i, s in enumerate(services_last['services']):
             tid = s['titleID']
-            extra = f"  trailing={s['trailing']}" if 'trailing' in s else ""
+            extra = f"  args={s['args']}" if s.get('args') else ""
             print(f"      [{i:2}] titleID_low=0x{tid}  flags={s['flags']}{extra}")
 
     if action:

@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Parse a monitor-mode pcap for StreetPass 802.11 frames."""
 import sys, struct, binascii
+
+import sp_service
 # scapy is only needed for reading pcaps. The frame builders work without it.
 try:
     from scapy.all import PcapReader, RadioTap, Dot11, Dot11Elt, Dot11ProbeReq, Dot11ProbeResp
@@ -55,16 +57,17 @@ def parse_vendor_tlv(body):
 
 
 def parse_services(data):
-    """Service list record: titleID_low(4) + flags(1), plus 6 trailing bytes if flags&0x02."""
-    services = []
-    i = 0
-    while i + 5 <= len(data):
-        tid = data[i:i + 4]; flags = data[i + 4]; i += 5
-        s = {'titleID': tid.hex(), 'flags': hex(flags)}
-        if flags & 0x02:
-            s['trailing'] = data[i:i + 6].hex(); i += 6
-        services.append(s)
-    return services
+    """Service list records (see sp_service) -> [{'titleID', 'flags', 'args'}], as far as
+    they are whole."""
+    return [r.describe() for r in sp_service.decode(data)[0]]
+
+
+def services_from_tlvs(recs):
+    """Every service TLV's records, in order. cecd starts another TLV of the same type when one
+    would pass 255 bytes. -> (services, problem or None)."""
+    data = b''.join(bytes(r['data']) for r in recs if (r['a'], r['b']) == (1, 1))
+    found, why = sp_service.decode(data)
+    return [r.describe() for r in found], why
 
 
 def build_probe(src_mac, token8, services, seq=0):
@@ -78,10 +81,10 @@ def build_probe(src_mac, token8, services, seq=0):
 
 
 def _service_ie(token8, services):
-    """The Nintendo vendor IE: the enabled titles, then the token."""
-    svc = b''.join(struct.pack('>I', t) + bytes([f]) + bytes(tr) for t, f, tr in services)
-    tlv  = struct.pack('<H', (len(svc) << 8) | (1 << 4) | 1) + svc
-    tlv += struct.pack('<H', (8 << 8) | (0xF << 4) | 0) + bytes(token8)
+    """The Nintendo vendor IE: the enabled titles that fit in it, then the token."""
+    kept, _dropped = sp_service.fit(services, sp_service.DISCOVERY_BYTES)
+    tlv  = sp_service.tlvs(kept)
+    tlv += sp_service.tlv_header(0, 0xF, 8) + bytes(token8)
     vend = NIN_OUI + b'\x01' + tlv
     return b'\xdd' + bytes([len(vend)]) + vend
 
@@ -98,12 +101,15 @@ def parse_vendor_ie(data):
     out['tlv'] = [{'a': r['a'], 'b': r['b'], 'len': r['len'], 'data': r['data'].hex()} for r in recs]
     if trailing:
         out['tlv_trailing'] = trailing.hex()          # non-empty => walk did not fit; treat as suspect
+    svc = [r for r in recs if (r['a'], r['b']) == (1, 1)]
+    if svc:
+        out['protocol_id'] = 0x11
+        out['svc_len'] = sum(r['len'] for r in svc)
+        out['services'], why = services_from_tlvs(svc)
+        if why:
+            out['services_problem'] = why
     for r in recs:
-        if (r['a'], r['b']) == (1, 1):
-            out['protocol_id'] = 0x11
-            out['svc_len'] = r['len']
-            out['services'] = parse_services(r['data'])
-        elif (r['a'], r['b'], r['len']) == (0, 0xF, 8):   # the record cecd_derive_ccmp_key asks for
+        if (r['a'], r['b'], r['len']) == (0, 0xF, 8):   # the record cecd_derive_ccmp_key asks for
             out['const_f008'] = 'f008'
             out['consoleID'] = r['data'].hex()
             out['consoleID_tail8'] = out['consoleID']

@@ -82,10 +82,12 @@ def probe_info(mpdu):
             info['vendor'].append(v)
             if v[:3] == sp_parse.NIN_OUI:
                 recs, _ = sp_parse.parse_vendor_tlv(v[4:])
+                if any((r['a'], r['b']) == (1, 1) for r in recs):
+                    info['services'], why = sp_parse.services_from_tlvs(recs)
+                    if why:
+                        info['services_problem'] = why
                 for r in recs:
-                    if (r['a'], r['b']) == (1, 1):
-                        info['services'] = sp_parse.parse_services(r['data'])
-                    elif (r['a'], r['b'], r['len']) == (0, 0xF, 8):
+                    if (r['a'], r['b'], r['len']) == (0, 0xF, 8):
                         info['token'] = r['data'].hex()
         i += 2 + ln
     return info
