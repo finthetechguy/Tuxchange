@@ -4,7 +4,7 @@ import contextlib, functools, os, sys, json, time, socket, stat, struct, threadi
 import base64, subprocess, queue, signal, select
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import sp_store, sp_cec, sp_cecvalid, sp_harvest_air, sp_build, sp_import
+import sp_store, sp_cec, sp_cecvalid, sp_harvest_air, sp_build, sp_import, sp_service
 
 # Like a 3DS's own MacFilter: a MAC that has completed an exchange is refused until it changes.
 # The console keeps the last 255 and never expires one; a 3DS presents a new MAC from time to time.
@@ -605,9 +605,7 @@ def retail_batch(containers):
     return (batch if offered else None), offered, left
 
 
-def _box_order(c):
-    # The store keeps no OBIndex, so creation order stands in for the console's append order.
-    return (sp_cec.parse_header(c)['created']['text'], c[0x20:0x28])
+_box_order = sp_service.box_order
 
 
 def retail_plan(store, titles=None, log=None):
@@ -1102,6 +1100,21 @@ class Control:
             r.log('  title %08X %s' % (tid, 'will receive even with nothing to send' if on
                                        else 'receives only alongside its own outbox'))
             return {'ok': True, 'title': '%08x' % tid, 'receive': on}
+        if cmd == 'set_service':
+            rec = req.get('record')
+            try:
+                tid = parse_titles([req.get('title')])[0]
+                if rec is not None and not isinstance(rec, str):
+                    raise ValueError('record must be hex text or null')
+                with r.lock:
+                    s = r.store.set_service_template(
+                        tid, None if rec is None else sp_service.parse_record_arg(rec))
+            except (ValueError, TypeError, IndexError) as e:
+                return {'ok': False, 'error': str(e) or 'set_service needs a title'}
+            r.log('  title %08X %s' % (tid, 'receives as %s' % (s,) if s is not None
+                                       else 'receives with the record its messages imply'))
+            return {'ok': True, 'title': '%08x' % tid,
+                    'record': None if s is None else s.raw().hex()}
         if cmd == 'message_remove':
             try:
                 tid = int(req['title'], 16) if isinstance(req['title'], str) else req['title']
@@ -1686,6 +1699,7 @@ class Relay:
             out = {'titles': [], 'max_titles': sp_store.MBOXLIST_MAX,
                    'outbox_select': self.outbox_select()}
             receiving = set(self.store.receive_titles())
+            local = self.local_services()
             for t in self.store.titles():
                 ms = []
                 for tid, box, c in self.store.messages(t):
@@ -1706,6 +1720,9 @@ class Relay:
                     'title': '%08X' % t, 'name': self.store.title_name(t),
                     'has_key': self.store.title_key(t) is not None,
                     'receive': t in receiving,
+                    'service': (None if t not in local else
+                                dict(local[t].service.describe(), source=local[t].source,
+                                     note=local[t].note)),
                     'retail': describe_plan({t: plan[t]})['%08X' % t] if t in plan else None,
                     'messages': ms,
                 })
@@ -1737,16 +1754,11 @@ class Relay:
         with self.lock:                      # RLock: describe_store() already holds it
             return select_for_peer(self.store, self.store.titles(), mode=self.outbox_select())
 
-    @staticmethod
-    def peer_titles(peer_services):
-        """The CEC title ids a console declared. sp_parse gives dicts of hex strings."""
-        out = []
-        for s in peer_services or []:
-            try:
-                out.append(int(s['titleID'], 16) if isinstance(s, dict) else int(s))
-            except (KeyError, ValueError, TypeError):
-                continue
-        return out
+    def local_services(self):
+        """-> {title: sp_service.Derived}: what this relay advertises, as cecd would derive it."""
+        with self.lock:
+            return sp_service.derive(self.store,
+                                     lambda t, c: _servable_here(self.store, t, c))
 
     def encounters_path(self):
         return os.path.join(self.a.store, ENCOUNTERS_FILE)
@@ -1833,16 +1845,30 @@ class Relay:
                                  'another %.0f s so the next pass can reach a different console'
                                  % (mac, self.book.retry - self.book.wait(mac),
                                     self.book.wait(mac)))
-        titles = self.peer_titles(peer_services)
+        peers = sp_service.from_parsed(peer_services)
+        titles = list(dict.fromkeys(p.title for p in peers))
         with self.lock:
-            picked = select_for_peer(self.store, titles, self.book, mac, log=self.log,
+            local = self.local_services()
+            matched = []
+            for p in peers:
+                d = local.get(p.title)
+                if d is None or p.title in matched:
+                    continue
+                why = sp_service.why_unmatched(d.service, p)
+                if why:
+                    self.log('  %08X: %s declares %s and we declare %s, which a console does '
+                             'not pair (%s)' % (p.title, mac, p, d.service, why))
+                else:
+                    matched.append(p.title)
+            sending = [t for t in matched if local[t].source == 'outbox']
+            picked = select_for_peer(self.store, sending, self.book, mac, log=self.log,
                                      mode=self.outbox_select())
             held = ['%08X' % sp_cec.parse_header(c)['cec_title_id']
                     for _t, _b, c in self.store.messages(box='outbox')]
             receiving = set(self.store.receive_titles())
-            full = [t for t in dict.fromkeys(titles)
-                    if t in receiving and 0 in self.store.inbox_room(t)]
-        inbound = [t for t in dict.fromkeys(titles) if t in receiving and t not in full]
+            full = [t for t in matched
+                    if t in receiving and not sp_service.has_room(self.store.inbox_room(t))]
+        inbound = [t for t in matched if t in receiving and t not in full]
         if full:
             self.log('  inbox full for %s; not asking %s for them'
                      % (['%08X' % t for t in full], mac))
@@ -1855,9 +1881,8 @@ class Relay:
             return r
         for i, c in enumerate(picked):
             picked[i] = sp_build.set_message_id(c)          # never a duplicate id
-        known = {t: (f, tr) for t, f, tr in sp_link.T.SERVICES_FULL}
         tids = list(dict.fromkeys([sp_build.message_title(c) for c in picked] + inbound))
-        services = [(t,) + known.get(t, (0x30, b'')) for t in tids]
+        services = [local[t].service for t in tids]
         if not picked:
             self.log('  nothing to send %s; registered to receive %s'
                      % (mac, ['%08X' % t for t in inbound]))
@@ -1921,11 +1946,13 @@ class Relay:
         self._reserved, self._inbound_refused = None, []
         link = sp_link.Link(a)
         link.tick_hook = self.tick
-        # The broadcast probe must advertise every title held. The peer hook narrows it later.
-        known = {t: (f, tr) for t, f, tr in sp_link.T.SERVICES_FULL}
-        held = [t for t in self.store.titles()]
-        if held:
-            link.services = [(t,) + known.get(t, (0x30, b'')) for t in held]
+        # The broadcast probe advertises everything the store derives. The peer hook narrows it.
+        if self.store.titles():
+            link.services = [d.service for d in self.local_services().values()]
+            _kept, dropped = sp_service.fit(link.services, sp_service.DISCOVERY_BYTES)
+            if dropped:
+                self.log('  %d service record(s) do not fit in a probe and are declared only '
+                         'inside the link: %s' % (len(dropped), ', '.join(map(str, dropped))))
         link.peer_hook = self.peer_hook
         link.offer_hook = self.offer_hook
         link.stop_check = self.stop_check
@@ -2440,6 +2467,7 @@ def _selftest():
         print('  [%s] %s%s' % ('PASS' if c else 'FAIL', n, ('  %s' % (g,)) if g else ''))
 
     tmp = tempfile.mkdtemp()
+    PLAZA_PEER = [{'titleID': '00020800', 'flags': '0x00'}]
     import lp_corpus as corpus, lp_keys as _k
     if _k.selftest_keys():
         print('  (no console keys found, so running on generated throwaway keys)')
@@ -3333,7 +3361,7 @@ def _selftest():
                 any(b['mac'] == 'de:ad:be:ef:00:01' for b in dl['blocked']), dl['blocked'])
             chk('with its reason', dl['blocked'][0]['note'] == 'test')
             chk('and the relay refuses to serve it',
-                r.peer_hook(None, 'DE:AD:BE:EF:00:01', [{'titleID': '00020800'}]) is None)
+                r.peer_hook(None, 'DE:AD:BE:EF:00:01', PLAZA_PEER) is None)
             send_command(sockp, 'unblock', mac='DE:AD:BE:EF:00:01')
             chk('unblocking clears it', not send_command(sockp, 'denylist')['blocked'])
 
@@ -3344,7 +3372,7 @@ def _selftest():
                 dl['filter'][:1])
             chk('and counted in the status', r.status()['filtered'] == len(r.book.filter))
             chk('and the relay refuses to serve it',
-                r.peer_hook(None, 'BE:EF:00:00:00:09', [{'titleID': '00020800'}]) is None)
+                r.peer_hook(None, 'BE:EF:00:00:00:09', PLAZA_PEER) is None)
             chk('one MAC can be taken out of the filter from the socket',
                 send_command(sockp, 'unfilter', mac='BE:EF:00:00:00:09')['removed'] == 1
                 and 'be:ef:00:00:00:09' not in
@@ -3501,7 +3529,8 @@ def _selftest():
             class _FakeLink:
                 src = b'\x00' * 6
                 token = b'\x00' * 8
-            svc = [{'titleID': '%08x' % t} for t in (0x0008C500, 0x00030600, 0x00020800)]
+            svc = [{'titleID': '%08x' % t, 'flags': f}
+                   for t, f in ((0x0008C500, '0x30'), (0x00030600, '0x30'), (0x00020800, '0x00'))]
             got = r3.peer_hook(_FakeLink(), 'AA:BB:CC:DD:EE:01', svc)
             chk('the peer hook serves the titles the peer declared', got is not None)
             if got:
@@ -3589,11 +3618,11 @@ def _selftest():
         rnl = Relay(argparse.Namespace(**{**vars(args), 'store': os.path.join(tmp, 'store')}))
         rnl.book.block('DE:AD:BE:EF:00:02')
         chk('declining without a link does not raise',
-            rnl.peer_hook(None, 'DE:AD:BE:EF:00:02', [{'titleID': '00020800'}]) is None)
+            rnl.peer_hook(None, 'DE:AD:BE:EF:00:02', PLAZA_PEER) is None)
         chk('and still records the reason on the relay', rnl._declined == 'blocked')
         rnl._pending_sent = [b'A' * 8]
         rnl._detail = {b'A' * 8: {'title': '00020800', 'bytes': 1}}
-        rnl.peer_hook(None, 'DE:AD:BE:EF:00:02', [{'titleID': '00020800'}])
+        rnl.peer_hook(None, 'DE:AD:BE:EF:00:02', PLAZA_PEER)
         chk("a decline drops the previous peer's pending deliveries",
             rnl._pending_sent == [] and rnl._detail == {})
 
@@ -3604,7 +3633,7 @@ def _selftest():
         rnl2.book.block('DE:AD:BE:EF:00:03')
         nl = _NoLog()
         chk('a link that cannot log is tolerated rather than crashing the hook',
-            rnl2.peer_hook(nl, 'DE:AD:BE:EF:00:03', [{'titleID': '00020800'}]) is None)
+            rnl2.peer_hook(nl, 'DE:AD:BE:EF:00:03', PLAZA_PEER) is None)
         chk('and it is still marked on that link', getattr(nl, 'declined', None) == 'blocked')
 
         LETTERS, MARIO, PLAZA = 0x00040800, 0x0010BF00, 0x00020800
@@ -3616,7 +3645,7 @@ def _selftest():
         rrx = Relay(argparse.Namespace(**{**vars(args), 'store': os.path.join(tmp, 'recv')}))
         for t in (LETTERS, MARIO, PLAZA):
             rrx.store.add_title(t, hmac_key=rk)
-        rx_peer = [{'titleID': '%08x' % t} for t in (MARIO, LETTERS)]
+        rx_peer = [{'titleID': '%08x' % t, 'flags': '0x30'} for t in (MARIO, LETTERS)]
         chk('a registered title with an empty outbox is still declined until enabled',
             rrx.peer_hook(nl, 'DE:AD:BE:EF:01:01', rx_peer) is None
             and rrx._declined == 'nothing to serve')
@@ -3645,7 +3674,8 @@ def _selftest():
                 and envelope_ids(objs_rx) == [])
             chk('and nothing is pending to credit', rrx._pending_sent == [])
         chk('a peer that does not declare the enabled title is still declined',
-            rrx.peer_hook(nl, 'DE:AD:BE:EF:01:03', [{'titleID': '%08x' % MARIO}]) is None)
+            rrx.peer_hook(nl, 'DE:AD:BE:EF:01:03',
+                          [{'titleID': '%08x' % MARIO, 'flags': '0x30'}]) is None)
         rrx.store.add_message(sp_build.unwrap(_wire(MARIO, 3, 0x5151))[0], 'outbox')
         got_mix = rrx.peer_hook(nl, 'DE:AD:BE:EF:01:04', rx_peer)
         chk('an enabled title rides alongside unrelated outbound data',
@@ -3720,11 +3750,12 @@ def _selftest():
             rcap.file_arrivals({LETTERS: offer[0][1]}, 'aa:bb', []) == []
             and unread <= {c[0x20:0x28] for _t, _b, c in rcap.store.messages(LETTERS, 'inbox')}
             and any('inbox has 0 slot(s)' in m for m in quiet_cap), quiet_cap)
-        got_full = rcap.peer_hook(nl, 'DE:AD:BE:EF:02:01', [{'titleID': '%08x' % LETTERS}])
+        got_full = rcap.peer_hook(nl, 'DE:AD:BE:EF:02:01',
+                                  [{'titleID': '%08x' % LETTERS, 'flags': '0x30'}])
         chk('a peer offering only a full title is not engaged',
             got_full is None and rcap._declined == 'nothing to serve')
         got_part = rcap.peer_hook(nl, 'DE:AD:BE:EF:02:02',
-                                  [{'titleID': '%08x' % t} for t in (LETTERS, MARIO)])
+                                  [{'titleID': '%08x' % t, 'flags': '0x30'} for t in (LETTERS, MARIO)])
         chk('and a full title is not asked for beside one with room',
             got_part is not None and [t for t, _f, _tr in got_part[0]] == [MARIO])
         rcap.store.remove_message(LETTERS, 'inbox', extra)
@@ -3879,13 +3910,52 @@ def _selftest():
             ds['outbox_select'] == 'retail' and why[q2[0x20:0x28].hex()] == 'other batch'
             and why[lt[0x20:0x28].hex()] == 'SpotPass only' and why[q1[0x20:0x28].hex()] is None)
         rrt.peer_hook(nl, 'DE:AD:BE:EF:02:01',
-                      [{'titleID': '%08x' % RT}, {'titleID': '%08x' % LETTERS}])
+                      [{'titleID': '%08x' % RT, 'flags': '0x00'},
+                       {'titleID': '%08x' % LETTERS, 'flags': '0x30'}])
         chk('a retail relay serves a peer the selected batch',
             sorted((d['title'], d['mode']) for d in rrt._detail.values())
             == [('%08X' % LETTERS, 1), ('%08X' % RT, 0), ('%08X' % RT, 0)], rrt._detail)
         chk('and logs what it left out',
             any('retail selection for %08X: batch 00000001, offering 2' % RT in m
                 for m in rrt.log_lines), rrt.log_lines[-4:])
+
+        import sp_parse
+        EV, ev = 0x00020500, sp_service.from_raw(sp_service.SIX_ARGS)
+        rsv = Relay(argparse.Namespace(**{**vars(args), 'store': os.path.join(tmp, 'svc')}))
+        rsv.log_lines = []
+        rsv.log = rsv.log_lines.append
+        rsv.store.add_title(EV, hmac_key=rk)
+        rsv.store.add_message(sp_build.unwrap(sp_build.build_envelope(
+            bytes(0x40), EV, key=rk, message_id=0x6006, send_mode=3,
+            ex_headers=[(sp_service.EXH_SERVICE, sp_service.SIX_ARGS)]))[0], 'outbox')
+        chk('discovery advertises the record the outgoing message carries',
+            [d.service for d in rsv.local_services().values()] == [ev])
+        got_ev = rsv.peer_hook(nl, 'DE:AD:BE:EF:03:01', [ev.describe()])
+        o11 = got_ev and next(o for o in got_ev[1] if sp_build.object_type(o) == 0x11)
+        chk('and the in-link 0x11 declares the same record to a peer that pairs with it',
+            got_ev is not None and got_ev[0] == [ev]
+            and sp_service.from_parsed(sp_parse.services_from_tlvs(
+                sp_parse.parse_vendor_tlv(o11[0x10:])[0])[0]) == [ev], got_ev and got_ev[0])
+        rsv.log_lines.clear()
+        chk('a peer whose arguments a console would not pair with is not served',
+            rsv.peer_hook(nl, 'DE:AD:BE:EF:03:02', [ev._replace(args=bytes(6)).describe()])
+            is None and any('not pair' in m for m in rsv.log_lines),
+            rsv.log_lines)
+        chk('nor one declaring the title at a mode that does not pair',
+            rsv.peer_hook(nl, 'DE:AD:BE:EF:03:03', [ev.with_mode(0).describe()]) is None)
+        sc_sv = Control(os.path.join(tmp, 'sv.sock'), rsv)
+        chk('set_service sets a receive-only record and refuses one for another title',
+            sc_sv.handle({'cmd': 'set_service', 'title': '00020500',
+                          'record': '00020500 31 010203'})['ok']
+            and rsv.store.service_template(EV) == (EV, 0x31, b'\x01\x02\x03')
+            and not sc_sv.handle({'cmd': 'set_service', 'title': '00020500',
+                                  'record': '0002080000'})['ok'])
+        chk('and null clears it',
+            sc_sv.handle({'cmd': 'set_service', 'title': '00020500', 'record': None})['ok']
+            and rsv.store.service_template(EV) is None)
+        chk('the store view shows each title\'s derived record and where it came from',
+            rsv.describe_store()['titles'][0]['service']['args'] == 'ff' * 6
+            and rsv.describe_store()['titles'][0]['service']['source'] == 'outbox')
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     print('\n%d/%d checks passed' % (ok, tot))
@@ -4025,7 +4095,7 @@ def main():
                                         'forget', 'seed', 'store', 'encounters', 'encounters_clear', 'denylist',
                                         'log', 'block', 'unblock', 'unfilter', 'title_remove',
                                         'message_remove', 'rotate', 'set_adapter', 'set_logs',
-                                        'set_store', 'set_receive'])
+                                        'set_store', 'set_receive', 'set_service'])
     ct.add_argument('--store', default=sp_store.default_store())
     ct.add_argument('--path', help='for `ctl import`: what to ingest')
     ct.add_argument('--replace', action='store_true',
@@ -4044,8 +4114,11 @@ def main():
     ct.add_argument('--adapter', help='for `ctl set_adapter`: the interface name')
     ct.add_argument('--logs', choices=['on', 'off'], help='for `ctl set_logs`')
     ct.add_argument('--new-store', help='for `ctl set_store`: a root-owned directory')
-    ct.add_argument('--title', help='for title_remove / message_remove / set_receive, '
-                                    '8 hex digits')
+    ct.add_argument('--title', help='for title_remove / message_remove / set_receive / '
+                                    'set_service, 8 hex digits')
+    ct.add_argument('--record', help='for `ctl set_service`: the service record --title '
+                                     'advertises while it only receives, as hex (cec id, '
+                                     'flags, arguments), or "none" to derive it again')
     ct.add_argument('--receive', choices=['on', 'off'],
                     help='for `ctl set_receive`: receive for --title even with an empty outbox')
     ct.add_argument('--id', help='for `ctl message_remove`: the message id, 16 hex digits')
@@ -4152,6 +4225,11 @@ def main():
             if not (a.title and a.receive):
                 print('ctl set_receive needs --title and --receive on|off'); return 2
             kw = {'title': a.title, 'enabled': a.receive == 'on'}
+        elif a.command == 'set_service':
+            if not (a.title and a.record):
+                print('ctl set_service needs --title and --record HEX|none'); return 2
+            kw = {'title': a.title,
+                  'record': None if a.record.lower() == 'none' else a.record}
         elif a.command == 'set_store':
             if not a.new_store:
                 print('ctl set_store needs --new-store'); return 2
