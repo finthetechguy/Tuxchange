@@ -1,5 +1,11 @@
 # Tuxchange
 
+> [!IMPORTANT]  
+> It is recommended to use [ctrpass](https://github.com/finthetechguy/ctrpass) instead.
+> It is my new Rust-based library + Linux CLI + GUI, which doesn't rely on `systemd` and Python.
+> ctrpass is also more user-friendly and provides a library for the potential of porting to other hardware.
+
+
 StreetPass a real Nintendo 3DS from a Linux device (with your own data)
 
 Walk past a 3DS with Tuxchange running and the console treats it like any other 3DS. It exchanges
@@ -136,6 +142,24 @@ for potentially supported chipsets.
 
 - [Wiki](https://github.com/finthetechguy/Tuxchange/wiki): setup, hardware, first StreetPass, CLI
   and GUI reference, troubleshooting.
+
+### Build the documentation locally
+
+From the repository root, create a documentation environment and start the live preview.
+
+```bash
+python3 -m venv .venv-docs
+. .venv-docs/bin/activate
+python -m pip install -r requirements-docs.txt
+zensical serve --dev-addr 127.0.0.1:8000
+```
+
+Open <http://127.0.0.1:8000/>. Run `zensical build --clean --strict` for a production build in
+`site/`. The documentation workflow runs the same build on pull requests.
+
+When ready to publish, select **GitHub Actions** under **Settings → Pages → Build and deployment**.
+The documentation workflow uploads and deploys its artifact on pushes to `main`. The canonical URL
+in `zensical.toml` uses the repository's default GitHub Pages path.
 
 ## Legal and ethical notes
 
